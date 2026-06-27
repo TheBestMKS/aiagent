@@ -1,0 +1,13 @@
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+build_logs/
+distrib/
+dist/
+.idea/
+*.iml
+tooling/
+!tooling/.gitkeep
+tooling/flutter/flutter/bin/cache/

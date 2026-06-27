@@ -1,0 +1,7 @@
+AI Agent v1.49
+
+ZIP integrity checked in the sandbox.
+Flutter SDK is not available in this environment, so flutter analyze/test/build were not executed here.
+
+Run on Windows:
+  build_all.bat
