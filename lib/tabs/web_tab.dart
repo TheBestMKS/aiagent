@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:webview_flutter/webview_flutter.dart' as mobile_webview;
+import 'package:webview_windows/webview_windows.dart' as win_webview;
 
 import '../controllers/agent_controller.dart';
 import '../core/app_constants.dart';
@@ -64,11 +67,16 @@ class _WebTabState extends State<WebTab> {
   final List<WebQuickAction> quickActions = [
     WebQuickAction('localhost:1234', 'http://127.0.0.1:1234')
   ];
+  final List<StreamSubscription<dynamic>> webviewSubscriptions = [];
   final ScrollController verticalScrollController = ScrollController();
+  mobile_webview.WebViewController? mobileWebViewController;
+  win_webview.WebviewController? windowsWebViewController;
   int selected = 0;
   bool loading = false;
   bool showQuickPanel = false;
   bool stateLoaded = false;
+  bool nativeWebViewReady = false;
+  String nativeWebViewError = '';
 
   WebSession get current =>
       sessions[selected.clamp(0, sessions.length - 1).toInt()];
@@ -78,7 +86,7 @@ class _WebTabState extends State<WebTab> {
     super.initState();
     widget.controller.webOpener = openFromController;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(loadState());
+      unawaited(initializeNativeWebView().then((_) => loadState()));
       final pending = widget.controller.takePendingWebUrl();
       if (pending != null) unawaited(loadUrl(pending));
     });
@@ -98,11 +106,94 @@ class _WebTabState extends State<WebTab> {
   void dispose() {
     if (widget.controller.webOpener != null) widget.controller.webOpener = null;
     unawaited(saveState());
+    for (final subscription in webviewSubscriptions) {
+      unawaited(subscription.cancel());
+    }
+    final windowsController = windowsWebViewController;
+    if (windowsController != null) unawaited(windowsController.dispose());
     for (final session in sessions) {
       session.dispose();
     }
     verticalScrollController.dispose();
     super.dispose();
+  }
+
+  Future<void> initializeNativeWebView() async {
+    if (nativeWebViewReady || nativeWebViewError.isNotEmpty) return;
+    try {
+      if (Platform.isAndroid) {
+        final controller = mobile_webview.WebViewController()
+          ..setJavaScriptMode(mobile_webview.JavaScriptMode.unrestricted)
+          ..setBackgroundColor(Colors.transparent)
+          ..setNavigationDelegate(
+            mobile_webview.NavigationDelegate(
+              onPageStarted: (url) {
+                if (!mounted) return;
+                setState(() {
+                  loading = true;
+                  current.address = url;
+                  current.addressController.text = url;
+                });
+                markStateChanged();
+              },
+              onPageFinished: (url) {
+                if (!mounted) return;
+                setState(() {
+                  loading = false;
+                  current.address = url;
+                  current.addressController.text = url;
+                });
+                markStateChanged();
+              },
+              onWebResourceError: (error) {
+                if (!mounted) return;
+                setState(() {
+                  loading = false;
+                  current.content =
+                      'Ошибка WebView: ${error.errorCode} ${error.description}';
+                });
+              },
+            ),
+          );
+        mobileWebViewController = controller;
+        nativeWebViewReady = true;
+      } else if (Platform.isWindows) {
+        final version = await win_webview.WebviewController.getWebViewVersion();
+        if (version == null || version.trim().isEmpty) {
+          nativeWebViewError =
+              'WebView2 Runtime не установлен. Используется текстовый просмотр HTML.';
+          return;
+        }
+        final controller = win_webview.WebviewController();
+        await controller.initialize();
+        await controller.setPopupWindowPolicy(
+            win_webview.WebviewPopupWindowPolicy.sameWindow);
+        webviewSubscriptions.add(controller.url.listen((url) {
+          if (!mounted || url.trim().isEmpty) return;
+          setState(() {
+            current.address = url;
+            current.addressController.text = url;
+          });
+          markStateChanged();
+        }));
+        webviewSubscriptions.add(controller.loadingState.listen((state) {
+          if (!mounted) return;
+          setState(() => loading = state == win_webview.LoadingState.loading);
+        }));
+        windowsWebViewController = controller;
+        nativeWebViewReady = true;
+      } else {
+        nativeWebViewError =
+            'На этой платформе встроенный WebView не подключен. Используется текстовый просмотр HTML.';
+      }
+    } on PlatformException catch (e) {
+      nativeWebViewError =
+          'WebView недоступен: ${e.message ?? e.code}. Используется текстовый просмотр HTML.';
+    } catch (e) {
+      nativeWebViewError =
+          'WebView недоступен: $e. Используется текстовый просмотр HTML.';
+    }
+    if (mounted) setState(() {});
   }
 
   void openFromController(String url) {
@@ -150,6 +241,9 @@ class _WebTabState extends State<WebTab> {
           .toInt();
       showQuickPanel = data['showQuickPanel'] == true;
     });
+    if (nativeWebViewReady && current.address.trim().isNotEmpty) {
+      unawaited(loadUrl(current.address));
+    }
   }
 
   Future<void> saveState() async {
@@ -185,6 +279,27 @@ class _WebTabState extends State<WebTab> {
       current.content = 'Загрузка $url ...';
     });
     markStateChanged();
+    if (!current.showSource) {
+      if (!nativeWebViewReady && nativeWebViewError.isEmpty) {
+        await initializeNativeWebView();
+      }
+      if (nativeWebViewReady) {
+        try {
+          if (Platform.isAndroid && mobileWebViewController != null) {
+            await mobileWebViewController!.loadRequest(Uri.parse(url));
+          } else if (Platform.isWindows && windowsWebViewController != null) {
+            await windowsWebViewController!.loadUrl(url);
+          }
+          widget.controller.ensureWebQuickLaunch(
+              Uri.parse(url).host.isEmpty ? url : Uri.parse(url).host, url);
+          markStateChanged();
+          return;
+        } catch (e) {
+          setState(() => current.content =
+              'WebView не смог открыть $url\n$e\n\nПробую текстовый режим...');
+        }
+      }
+    }
     try {
       final uri = Uri.parse(url);
       String text;
@@ -353,6 +468,53 @@ class _WebTabState extends State<WebTab> {
     );
   }
 
+  Widget _browserSurface() {
+    if (!current.showSource && nativeWebViewReady) {
+      final Widget webview = Platform.isAndroid &&
+              mobileWebViewController != null
+          ? mobile_webview.WebViewWidget(controller: mobileWebViewController!)
+          : Platform.isWindows && windowsWebViewController != null
+              ? win_webview.Webview(windowsWebViewController!)
+              : _textBrowserSurface();
+      return Stack(
+        children: [
+          Positioned.fill(child: webview),
+          if (loading)
+            const Positioned(
+              left: 0,
+              right: 0,
+              top: 0,
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+        ],
+      );
+    }
+    return _textBrowserSurface();
+  }
+
+  Widget _textBrowserSurface() {
+    final emptyText = nativeWebViewError.isNotEmpty
+        ? nativeWebViewError
+        : 'Введите адрес и нажмите "Открыть".';
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.all(8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+          border: Border.all(color: Theme.of(context).dividerColor),
+          borderRadius: BorderRadius.circular(8)),
+      child: Scrollbar(
+        controller: verticalScrollController,
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          controller: verticalScrollController,
+          child: SelectableText(
+              current.content.isEmpty ? emptyText : current.content),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     syncGeneratedQuickActions();
@@ -387,6 +549,11 @@ class _WebTabState extends State<WebTab> {
                           selected: selected == i,
                           onSelected: (_) {
                             setState(() => selected = i);
+                            if (nativeWebViewReady &&
+                                !current.showSource &&
+                                current.address.trim().isNotEmpty) {
+                              unawaited(loadUrl(current.address));
+                            }
                             markStateChanged();
                           },
                         ),
@@ -416,17 +583,16 @@ class _WebTabState extends State<WebTab> {
                 const SizedBox(width: 8),
                 IconButton.outlined(
                     tooltip: current.showSource ? 'Страница' : 'HTML',
-                    onPressed: current.source.isEmpty
-                        ? null
-                        : () {
-                            setState(() {
-                              current.showSource = !current.showSource;
-                              current.content = current.showSource
-                                  ? current.source
-                                  : current.rendered;
-                            });
-                            markStateChanged();
-                          },
+                    onPressed: () {
+                      setState(() {
+                        current.showSource = !current.showSource;
+                        current.content = current.showSource
+                            ? current.source
+                            : current.rendered;
+                      });
+                      markStateChanged();
+                      unawaited(loadUrl(current.addressController.text));
+                    },
                     icon: Icon(current.showSource ? Icons.web : Icons.code)),
                 const SizedBox(width: 8),
                 IconButton.outlined(
@@ -444,26 +610,28 @@ class _WebTabState extends State<WebTab> {
                     label: Text(loading ? 'Загрузка' : 'Открыть')),
               ]),
             ),
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                margin: const EdgeInsets.all(8),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                    border: Border.all(color: Theme.of(context).dividerColor),
-                    borderRadius: BorderRadius.circular(8)),
-                child: Scrollbar(
-                  controller: verticalScrollController,
-                  thumbVisibility: true,
-                  child: SingleChildScrollView(
+            Expanded(child: _browserSurface()),
+            if (DateTime.now().microsecondsSinceEpoch < 0)
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.all(8),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                      border: Border.all(color: Theme.of(context).dividerColor),
+                      borderRadius: BorderRadius.circular(8)),
+                  child: Scrollbar(
                     controller: verticalScrollController,
-                    child: SelectableText(current.content.isEmpty
-                        ? 'Введите адрес и нажмите “Открыть”. Для сайтов, которым нужен настоящий движок Chromium/WebView2, используйте кнопку открытия в браузере ОС.'
-                        : current.content),
+                    thumbVisibility: true,
+                    child: SingleChildScrollView(
+                      controller: verticalScrollController,
+                      child: SelectableText(current.content.isEmpty
+                          ? 'Введите адрес и нажмите “Открыть”. Для сайтов, которым нужен настоящий движок Chromium/WebView2, используйте кнопку открытия в браузере ОС.'
+                          : current.content),
+                    ),
                   ),
                 ),
               ),
-            ),
           ],
         ),
       );

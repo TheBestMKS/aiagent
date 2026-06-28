@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import '../core/app_constants.dart';
 import '../controllers/agent_controller.dart';
 import '../core/models.dart';
+import '../utils/html_utils.dart';
 import '../utils/path_utils.dart';
 
 class ModelProfilesDialog extends StatelessWidget {
@@ -1260,8 +1261,7 @@ class AboutProgramDialog extends StatelessWidget {
           onPressed: () async {
             await showDialog<void>(
                 context: context,
-                builder: (_) =>
-                    AutomationSettingsDialog(controller: controller));
+                builder: (_) => ScheduledRunsDialog(controller: controller));
           },
           icon: const Icon(Icons.schedule),
           label: const Text('Задачи по расписанию'),
@@ -1618,6 +1618,1445 @@ class _AutomationSettingsDialogState extends State<AutomationSettingsDialog> {
   }
 }
 
+Map<String, dynamic> _decodeMap(String raw) {
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is Map<String, dynamic>) return decoded;
+    if (decoded is Map) {
+      return decoded.map((key, value) => MapEntry(key.toString(), value));
+    }
+  } catch (_) {}
+  return <String, dynamic>{};
+}
+
+String _prettyTriggerType(String type) {
+  const labels = {
+    'message_from': 'Сообщение от адресата',
+    'message_text_match': 'Сообщение от адресата с текстом/темой',
+    'schedule_finished': 'После окончания задачи по расписанию',
+    'program_started': 'При запуске программы',
+    'message_sent': 'После отправки сообщения',
+    'program_error': 'После ошибки в программе',
+    'api_request': 'Получение запроса по API',
+  };
+  return labels[type] ?? type;
+}
+
+String _scheduleSummary(
+    AgentScheduleConfig schedule, List<AgentTriggerConfig> triggers) {
+  final data = _decodeMap(schedule.scheduleJson);
+  final parts = <String>[];
+  final once =
+      data['once'] is Map ? Map<String, dynamic>.from(data['once']) : {};
+  if (once['enabled'] == true) {
+    final date = once['date']?.toString() ?? '';
+    parts.add(date.isEmpty ? 'разово' : 'разово: $date');
+  }
+  final repeat =
+      data['repeat'] is Map ? Map<String, dynamic>.from(data['repeat']) : {};
+  for (final entry in const {
+    'yearly': 'ежегодно',
+    'monthly': 'ежемесячно',
+    'weekly': 'еженедельно',
+    'daily': 'ежедневно',
+    'hourly': 'ежечасно',
+    'minutely': 'ежеминутно',
+  }.entries) {
+    if (repeat[entry.key] == true) parts.add(entry.value);
+  }
+  final triggerIds = (data['triggerIds'] as List<dynamic>? ?? [])
+      .map((e) => e.toString())
+      .toSet();
+  if (triggerIds.isNotEmpty) {
+    final names = triggers
+        .where((trigger) => triggerIds.contains(trigger.id))
+        .map((trigger) => trigger.name)
+        .join(', ');
+    parts.add('триггеры: ${names.isEmpty ? triggerIds.join(', ') : names}');
+  }
+  return parts.isEmpty ? 'запуск не настроен' : parts.join(' • ');
+}
+
+class ApiOutputTemplatesDialog extends StatefulWidget {
+  const ApiOutputTemplatesDialog({super.key, required this.controller});
+  final AgentController controller;
+
+  @override
+  State<ApiOutputTemplatesDialog> createState() =>
+      _ApiOutputTemplatesDialogState();
+}
+
+class _ApiOutputTemplatesDialogState extends State<ApiOutputTemplatesDialog> {
+  Future<void> _edit([ApiOutputTemplate? template]) async {
+    final base = template ?? ApiOutputTemplate.telegramExample();
+    final nameController = TextEditingController(text: base.name);
+    final endpointController = TextEditingController(text: base.endpoint);
+    final headersController = TextEditingController(text: base.headersJson);
+    final bodyController = TextEditingController(text: base.bodyTemplate);
+    var method = base.method.toUpperCase();
+    var enabled = base.enabled;
+    final saved = await showDialog<ApiOutputTemplate>(
+      context: context,
+      builder: (_) => StatefulBuilder(builder: (context, setLocalState) {
+        return AlertDialog(
+          title: Text(template == null ? 'Добавить API вывод' : 'API вывод'),
+          content: SizedBox(
+            width: 720,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    value: enabled,
+                    onChanged: (value) => setLocalState(() => enabled = value),
+                    title: const Text('Включено'),
+                  ),
+                  TextField(
+                    controller: nameController,
+                    decoration: const InputDecoration(
+                        labelText: 'Название', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: endpointController,
+                    decoration: const InputDecoration(
+                        labelText: 'URL запроса', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<String>(
+                    initialValue: method,
+                    decoration: const InputDecoration(
+                        labelText: 'Метод', border: OutlineInputBorder()),
+                    items: const ['POST', 'PUT', 'PATCH', 'GET']
+                        .map((value) =>
+                            DropdownMenuItem(value: value, child: Text(value)))
+                        .toList(),
+                    onChanged: (value) {
+                      if (value != null) setLocalState(() => method = value);
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: headersController,
+                    maxLines: 4,
+                    decoration: const InputDecoration(
+                        labelText: 'Заголовки JSON',
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: bodyController,
+                    minLines: 6,
+                    maxLines: 12,
+                    decoration: const InputDecoration(
+                        labelText: 'Шаблон тела JSON, используйте {{text}}',
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: () {
+                        final example = ApiOutputTemplate.telegramExample();
+                        nameController.text = example.name;
+                        endpointController.text = example.endpoint;
+                        headersController.text = example.headersJson;
+                        bodyController.text = example.bodyTemplate;
+                        setLocalState(() => method = example.method);
+                      },
+                      icon: const Icon(Icons.telegram),
+                      label: const Text('Заполнить пример Telegram'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Отмена')),
+            FilledButton(
+              onPressed: () => Navigator.pop(
+                context,
+                ApiOutputTemplate(
+                  id: base.id,
+                  name: nameController.text.trim().isEmpty
+                      ? 'API'
+                      : nameController.text.trim(),
+                  endpoint: endpointController.text.trim(),
+                  method: method,
+                  headersJson: headersController.text.trim().isEmpty
+                      ? '{}'
+                      : headersController.text.trim(),
+                  bodyTemplate: bodyController.text,
+                  enabled: enabled,
+                ),
+              ),
+              child: const Text('Сохранить'),
+            ),
+          ],
+        );
+      }),
+    );
+    nameController.dispose();
+    endpointController.dispose();
+    headersController.dispose();
+    bodyController.dispose();
+    if (saved == null) return;
+    await widget.controller.upsertApiOutputTemplate(saved);
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('API вывод'),
+      content: SizedBox(
+        width: 820,
+        height: math.min(MediaQuery.of(context).size.height * 0.72, 620),
+        child: ListView(
+          children: [
+            for (final template in widget.controller.apiOutputTemplates)
+              ListTile(
+                leading: Icon(template.enabled
+                    ? Icons.cloud_done_outlined
+                    : Icons.cloud_off_outlined),
+                title: Text(template.name),
+                subtitle: Text('${template.method} ${template.endpoint}',
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (value) async {
+                    if (value == 'edit') await _edit(template);
+                    if (value == 'copy') {
+                      await widget.controller.upsertApiOutputTemplate(
+                        ApiOutputTemplate.fromJson({
+                          ...template.toJson(),
+                          'id': 'api_${DateTime.now().microsecondsSinceEpoch}',
+                          'name': '${template.name} copy',
+                        }),
+                      );
+                    }
+                    if (value == 'toggle') {
+                      await widget.controller.upsertApiOutputTemplate(
+                        ApiOutputTemplate.fromJson({
+                          ...template.toJson(),
+                          'enabled': !template.enabled,
+                        }),
+                      );
+                    }
+                    if (value == 'delete') {
+                      await widget.controller
+                          .deleteApiOutputTemplate(template.id);
+                    }
+                    if (mounted) setState(() {});
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'edit', child: Text('Изменить')),
+                    PopupMenuItem(value: 'copy', child: Text('Дублировать')),
+                    PopupMenuItem(
+                        value: 'toggle', child: Text('Включить/отключить')),
+                    PopupMenuDivider(),
+                    PopupMenuItem(value: 'delete', child: Text('Удалить')),
+                  ],
+                ),
+                onTap: () => _edit(template),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        OutlinedButton.icon(
+            onPressed: () => _edit(),
+            icon: const Icon(Icons.add),
+            label: const Text('Добавить')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
+      ],
+    );
+  }
+}
+
+class TriggerSettingsDialog extends StatefulWidget {
+  const TriggerSettingsDialog({super.key, required this.controller});
+  final AgentController controller;
+
+  @override
+  State<TriggerSettingsDialog> createState() => _TriggerSettingsDialogState();
+}
+
+class _TriggerSettingsDialogState extends State<TriggerSettingsDialog> {
+  Future<void> _edit([AgentTriggerConfig? trigger]) async {
+    final saved = await showDialog<AgentTriggerConfig>(
+      context: context,
+      builder: (_) =>
+          TriggerEditorDialog(controller: widget.controller, trigger: trigger),
+    );
+    if (saved == null) return;
+    await widget.controller.upsertTrigger(saved);
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Триггеры'),
+      content: SizedBox(
+        width: 820,
+        height: math.min(MediaQuery.of(context).size.height * 0.72, 620),
+        child: ListView(
+          children: [
+            for (final trigger in widget.controller.triggers)
+              ListTile(
+                leading: Icon(trigger.enabled
+                    ? Icons.bolt_outlined
+                    : Icons.power_settings_new_outlined),
+                title: Text(trigger.name),
+                subtitle: Text(_prettyTriggerType(trigger.type)),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (value) async {
+                    if (value == 'edit') await _edit(trigger);
+                    if (value == 'toggle') {
+                      await widget.controller.upsertTrigger(
+                          AgentTriggerConfig.fromJson({
+                        ...trigger.toJson(),
+                        'enabled': !trigger.enabled
+                      }));
+                    }
+                    if (value == 'delete') {
+                      await widget.controller.deleteTrigger(trigger.id);
+                    }
+                    if (mounted) setState(() {});
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'edit', child: Text('Изменить')),
+                    PopupMenuItem(
+                        value: 'toggle', child: Text('Включить/отключить')),
+                    PopupMenuDivider(),
+                    PopupMenuItem(value: 'delete', child: Text('Удалить')),
+                  ],
+                ),
+                onTap: () => _edit(trigger),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        OutlinedButton.icon(
+            onPressed: () => _edit(),
+            icon: const Icon(Icons.add),
+            label: const Text('Создать триггер')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
+      ],
+    );
+  }
+}
+
+class TriggerEditorDialog extends StatefulWidget {
+  const TriggerEditorDialog(
+      {super.key, required this.controller, this.trigger});
+  final AgentController controller;
+  final AgentTriggerConfig? trigger;
+
+  @override
+  State<TriggerEditorDialog> createState() => _TriggerEditorDialogState();
+}
+
+class _TriggerEditorDialogState extends State<TriggerEditorDialog> {
+  late final TextEditingController nameController;
+  late final TextEditingController senderController;
+  late final TextEditingController textController;
+  late final TextEditingController subjectController;
+  late final TextEditingController programController;
+  late final TextEditingController portController;
+  late final TextEditingController pathController;
+  late final TextEditingController requestTextController;
+  late String type;
+  late String matchMode;
+  late bool enabled;
+
+  @override
+  void initState() {
+    super.initState();
+    final trigger = widget.trigger;
+    final params = _decodeMap(trigger?.parametersJson ?? '{}');
+    type = trigger?.type ?? 'message_text_match';
+    matchMode = params['matchMode']?.toString() ?? 'contains';
+    enabled = trigger?.enabled ?? true;
+    nameController =
+        TextEditingController(text: trigger?.name ?? 'Новый триггер');
+    senderController =
+        TextEditingController(text: params['sender']?.toString() ?? '');
+    textController =
+        TextEditingController(text: params['text']?.toString() ?? '');
+    subjectController =
+        TextEditingController(text: params['subject']?.toString() ?? '');
+    programController =
+        TextEditingController(text: params['program']?.toString() ?? '');
+    portController =
+        TextEditingController(text: params['port']?.toString() ?? '8787');
+    pathController =
+        TextEditingController(text: params['path']?.toString() ?? '/agent');
+    requestTextController = TextEditingController(
+        text: params['requestTextPath']?.toString() ?? r'$.text');
+  }
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    senderController.dispose();
+    textController.dispose();
+    subjectController.dispose();
+    programController.dispose();
+    portController.dispose();
+    pathController.dispose();
+    requestTextController.dispose();
+    super.dispose();
+  }
+
+  Map<String, dynamic> _params() => {
+        if (senderController.text.trim().isNotEmpty)
+          'sender': senderController.text.trim(),
+        if (textController.text.trim().isNotEmpty)
+          'text': textController.text.trim(),
+        if (subjectController.text.trim().isNotEmpty)
+          'subject': subjectController.text.trim(),
+        if (programController.text.trim().isNotEmpty)
+          'program': programController.text.trim(),
+        if (type == 'message_text_match') 'matchMode': matchMode,
+        if (type == 'api_request') ...{
+          'port': int.tryParse(portController.text.trim()) ?? 8787,
+          'path': pathController.text.trim().isEmpty
+              ? '/agent'
+              : pathController.text.trim(),
+          'requestTextPath': requestTextController.text.trim().isEmpty
+              ? r'$.text'
+              : requestTextController.text.trim(),
+        }
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    const types = {
+      'message_from': 'Сообщение от адресата',
+      'message_text_match': 'Сообщение от адресата с текстом/темой',
+      'schedule_finished': 'После окончания задачи по расписанию',
+      'program_started': 'При запуске программы',
+      'message_sent': 'После отправки сообщения',
+      'program_error': 'После ошибки в программе',
+      'api_request': 'Получение запроса по API',
+    };
+    return AlertDialog(
+      title: Text(widget.trigger == null ? 'Создать триггер' : 'Триггер'),
+      content: SizedBox(
+        width: 720,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SwitchListTile(
+                value: enabled,
+                onChanged: (value) => setState(() => enabled = value),
+                title: const Text('Включен'),
+              ),
+              TextField(
+                controller: nameController,
+                decoration: const InputDecoration(
+                    labelText: 'Название', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                initialValue: type,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    labelText: 'Тип', border: OutlineInputBorder()),
+                items: types.entries
+                    .map((entry) => DropdownMenuItem(
+                        value: entry.key, child: Text(entry.value)))
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) setState(() => type = value);
+                },
+              ),
+              const SizedBox(height: 8),
+              if (type == 'message_from' || type == 'message_text_match') ...[
+                TextField(
+                  controller: senderController,
+                  decoration: const InputDecoration(
+                      labelText: 'Адресат/отправитель',
+                      border: OutlineInputBorder()),
+                ),
+                const SizedBox(height: 8),
+              ],
+              if (type == 'message_text_match') ...[
+                DropdownButtonFormField<String>(
+                  initialValue: matchMode,
+                  decoration: const InputDecoration(
+                      labelText: 'Совпадение', border: OutlineInputBorder()),
+                  items: const [
+                    DropdownMenuItem(
+                        value: 'startsWith', child: Text('начинается с')),
+                    DropdownMenuItem(
+                        value: 'contains', child: Text('содержит')),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) setState(() => matchMode = value);
+                  },
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: textController,
+                  decoration: const InputDecoration(
+                      labelText: 'Текст сообщения',
+                      border: OutlineInputBorder()),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: subjectController,
+                  decoration: const InputDecoration(
+                      labelText: 'Тема сообщения',
+                      border: OutlineInputBorder()),
+                ),
+              ],
+              if (type == 'program_started') ...[
+                TextField(
+                  controller: programController,
+                  decoration: const InputDecoration(
+                      labelText: 'Имя программы или путь',
+                      border: OutlineInputBorder()),
+                ),
+              ],
+              if (type == 'api_request') ...[
+                Row(children: [
+                  SizedBox(
+                    width: 160,
+                    child: TextField(
+                      controller: portController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                          labelText: 'Порт', border: OutlineInputBorder()),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: pathController,
+                      decoration: const InputDecoration(
+                          labelText: 'Путь API', border: OutlineInputBorder()),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: requestTextController,
+                  decoration: const InputDecoration(
+                      labelText: 'JSON путь текста запроса',
+                      border: OutlineInputBorder()),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена')),
+        FilledButton(
+          onPressed: () {
+            Navigator.pop(
+              context,
+              AgentTriggerConfig(
+                id: widget.trigger?.id ??
+                    'trigger_${DateTime.now().microsecondsSinceEpoch}',
+                name: nameController.text.trim().isEmpty
+                    ? 'Триггер'
+                    : nameController.text.trim(),
+                type: type,
+                parametersJson: jsonEncode(_params()),
+                enabled: enabled,
+              ),
+            );
+          },
+          child: const Text('Сохранить'),
+        ),
+      ],
+    );
+  }
+}
+
+class IndexingSettingsDialog extends StatefulWidget {
+  const IndexingSettingsDialog({super.key, required this.controller});
+  final AgentController controller;
+
+  @override
+  State<IndexingSettingsDialog> createState() => _IndexingSettingsDialogState();
+}
+
+class _IndexingSettingsDialogState extends State<IndexingSettingsDialog> {
+  Future<void> _addLocation() async {
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (_) => EmbeddedFilePickerDialog(
+          initialDirectory: Directory.current.path, selectDirectory: true),
+    );
+    if (picked == null || picked.trim().isEmpty) return;
+    await widget.controller.upsertIndexLocation(IndexLocationConfig(
+        path: picked.trim(), indexNames: true, indexContents: false));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Индексация устройства'),
+      content: SizedBox(
+        width: 860,
+        height: math.min(MediaQuery.of(context).size.height * 0.72, 620),
+        child: ListView(
+          children: [
+            if (widget.controller.indexLocations.isEmpty)
+              const ListTile(
+                leading: Icon(Icons.search_off),
+                title: Text('Расположения не выбраны'),
+                subtitle: Text('Индексация не работает, пока список пуст.'),
+              ),
+            for (final item in widget.controller.indexLocations)
+              ListTile(
+                title: Text(item.path),
+                subtitle: Row(
+                  children: [
+                    Checkbox(
+                      value: item.indexNames,
+                      onChanged: (value) async {
+                        await widget.controller.upsertIndexLocation(
+                            IndexLocationConfig(
+                                path: item.path,
+                                indexNames: value ?? false,
+                                indexContents: item.indexContents));
+                        if (mounted) setState(() {});
+                      },
+                    ),
+                    const Text('имена файлов'),
+                    const SizedBox(width: 18),
+                    Checkbox(
+                      value: item.indexContents,
+                      onChanged: (value) async {
+                        await widget.controller.upsertIndexLocation(
+                            IndexLocationConfig(
+                                path: item.path,
+                                indexNames: item.indexNames,
+                                indexContents: value ?? false));
+                        if (mounted) setState(() {});
+                      },
+                    ),
+                    const Text('содержимое файлов'),
+                  ],
+                ),
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () async {
+                    await widget.controller.deleteIndexLocation(item.path);
+                    if (mounted) setState(() {});
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        OutlinedButton.icon(
+            onPressed: _addLocation,
+            icon: const Icon(Icons.add),
+            label: const Text('Добавить расположение')),
+        OutlinedButton.icon(
+          onPressed: () async {
+            final result = await widget.controller.rebuildDeviceIndex();
+            if (context.mounted) {
+              ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(content: Text(result)));
+            }
+          },
+          icon: const Icon(Icons.manage_search),
+          label: const Text('Переиндексировать'),
+        ),
+        FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
+      ],
+    );
+  }
+}
+
+class CustomToolsDialog extends StatefulWidget {
+  const CustomToolsDialog({super.key, required this.controller});
+  final AgentController controller;
+
+  @override
+  State<CustomToolsDialog> createState() => _CustomToolsDialogState();
+}
+
+class _CustomToolsDialogState extends State<CustomToolsDialog> {
+  Future<void> _edit([CustomAgentToolConfig? tool]) async {
+    final saved = await showDialog<CustomAgentToolConfig>(
+      context: context,
+      builder: (_) => CustomToolEditorDialog(tool: tool),
+    );
+    if (saved == null) return;
+    await widget.controller.upsertCustomTool(saved);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _test(CustomAgentToolConfig tool) async {
+    final input = await askText(context, 'Тест инструмента', 'Входной текст');
+    if (input == null) return;
+    final result = await widget.controller.runCustomTool(tool.name, input);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('Результат: ${tool.name}'),
+        content: SizedBox(
+          width: 720,
+          height: 440,
+          child: SingleChildScrollView(child: SelectableText(result)),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Закрыть'))
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Инструменты агента'),
+      content: SizedBox(
+        width: 860,
+        height: math.min(MediaQuery.of(context).size.height * 0.72, 620),
+        child: ListView(
+          children: [
+            for (final tool in widget.controller.customTools)
+              ListTile(
+                leading: Icon(tool.temporary
+                    ? Icons.construction_outlined
+                    : Icons.handyman_outlined),
+                title: Text(tool.name),
+                subtitle: Text(tool.description,
+                    maxLines: 2, overflow: TextOverflow.ellipsis),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (value) async {
+                    if (value == 'edit') await _edit(tool);
+                    if (value == 'test') await _test(tool);
+                    if (value == 'toggle') {
+                      await widget.controller.upsertCustomTool(
+                          CustomAgentToolConfig.fromJson(
+                              {...tool.toJson(), 'enabled': !tool.enabled}));
+                    }
+                    if (value == 'delete') {
+                      await widget.controller.deleteCustomTool(tool.id);
+                    }
+                    if (mounted) setState(() {});
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'edit', child: Text('Изменить')),
+                    PopupMenuItem(value: 'test', child: Text('Тестировать')),
+                    PopupMenuItem(
+                        value: 'toggle', child: Text('Включить/отключить')),
+                    PopupMenuDivider(),
+                    PopupMenuItem(value: 'delete', child: Text('Удалить')),
+                  ],
+                ),
+                onTap: () => _edit(tool),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        OutlinedButton.icon(
+            onPressed: () => _edit(),
+            icon: const Icon(Icons.add),
+            label: const Text('Создать инструмент')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
+      ],
+    );
+  }
+}
+
+class CustomToolEditorDialog extends StatefulWidget {
+  const CustomToolEditorDialog({super.key, this.tool});
+  final CustomAgentToolConfig? tool;
+
+  @override
+  State<CustomToolEditorDialog> createState() => _CustomToolEditorDialogState();
+}
+
+class _CustomToolEditorDialogState extends State<CustomToolEditorDialog> {
+  late final TextEditingController nameController;
+  late final TextEditingController descriptionController;
+  late final TextEditingController scriptPathController;
+  late final TextEditingController commandController;
+  late bool temporary;
+  late bool enabled;
+
+  @override
+  void initState() {
+    super.initState();
+    final tool = widget.tool;
+    nameController = TextEditingController(text: tool?.name ?? 'custom_tool');
+    descriptionController =
+        TextEditingController(text: tool?.description ?? '');
+    scriptPathController = TextEditingController(text: tool?.scriptPath ?? '');
+    commandController = TextEditingController(
+        text: tool?.commandTemplate ??
+            (Platform.isWindows
+                ? 'powershell -NoProfile -Command "{{input}}"'
+                : 'sh -lc \'{{input}}\''));
+    temporary = tool?.temporary ?? true;
+    enabled = tool?.enabled ?? true;
+  }
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    descriptionController.dispose();
+    scriptPathController.dispose();
+    commandController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.tool == null ? 'Создать инструмент' : 'Инструмент'),
+      content: SizedBox(
+        width: 720,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SwitchListTile(
+                value: enabled,
+                onChanged: (value) => setState(() => enabled = value),
+                title: const Text('Включен'),
+              ),
+              SwitchListTile(
+                value: temporary,
+                onChanged: (value) => setState(() => temporary = value),
+                title: const Text('Временный инструмент агента'),
+              ),
+              TextField(
+                controller: nameController,
+                decoration: const InputDecoration(
+                    labelText: 'Имя инструмента для ИИ',
+                    border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: descriptionController,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                    labelText: 'Описание', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: TextField(
+                    controller: scriptPathController,
+                    decoration: const InputDecoration(
+                        labelText: 'Путь к скрипту',
+                        border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.outlined(
+                  tooltip: 'Выбрать файл',
+                  onPressed: () async {
+                    final picked = await showDialog<String>(
+                      context: context,
+                      builder: (_) => EmbeddedFilePickerDialog(
+                          initialDirectory: Directory.current.path),
+                    );
+                    if (picked != null) {
+                      setState(() => scriptPathController.text = picked);
+                    }
+                  },
+                  icon: const Icon(Icons.folder_open),
+                )
+              ]),
+              const SizedBox(height: 8),
+              TextField(
+                controller: commandController,
+                minLines: 4,
+                maxLines: 8,
+                decoration: const InputDecoration(
+                    labelText:
+                        'Команда. Переменные: {{input}}, {{project}}, {{tools}}',
+                    border: OutlineInputBorder()),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена')),
+        FilledButton(
+          onPressed: () => Navigator.pop(
+            context,
+            CustomAgentToolConfig(
+              id: widget.tool?.id ??
+                  'tool_${DateTime.now().microsecondsSinceEpoch}',
+              name: nameController.text.trim().isEmpty
+                  ? 'custom_tool'
+                  : nameController.text.trim(),
+              description: descriptionController.text.trim(),
+              scriptPath: scriptPathController.text.trim(),
+              commandTemplate: commandController.text.trim(),
+              temporary: temporary,
+              enabled: enabled,
+            ),
+          ),
+          child: const Text('Сохранить'),
+        ),
+      ],
+    );
+  }
+}
+
+class ProjectSchedulesDialog extends StatefulWidget {
+  const ProjectSchedulesDialog(
+      {super.key, required this.controller, required this.projectPath});
+  final AgentController controller;
+  final String projectPath;
+
+  @override
+  State<ProjectSchedulesDialog> createState() => _ProjectSchedulesDialogState();
+}
+
+class _ProjectSchedulesDialogState extends State<ProjectSchedulesDialog> {
+  List<AgentScheduleConfig> get schedules => widget.controller.schedules
+      .where((schedule) =>
+          normalizePathForCompare(schedule.projectPath) ==
+          normalizePathForCompare(widget.projectPath))
+      .toList();
+
+  Future<void> _edit([AgentScheduleConfig? schedule]) async {
+    final saved = await showDialog<AgentScheduleConfig>(
+      context: context,
+      builder: (_) => ScheduleEditorDialog(
+        controller: widget.controller,
+        projectPath: widget.projectPath,
+        schedule: schedule,
+      ),
+    );
+    if (saved == null) return;
+    await widget.controller.upsertSchedule(saved);
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Расписание проекта'),
+      content: SizedBox(
+        width: 900,
+        height: math.min(MediaQuery.of(context).size.height * 0.72, 620),
+        child: ListView(
+          children: [
+            if (schedules.isEmpty)
+              const ListTile(
+                  leading: Icon(Icons.event_busy_outlined),
+                  title: Text('Расписания пока нет')),
+            for (final schedule in schedules)
+              ListTile(
+                leading: Icon(schedule.enabled
+                    ? Icons.event_available_outlined
+                    : Icons.event_busy_outlined),
+                title: Text(schedule.name),
+                subtitle: Text(
+                    _scheduleSummary(schedule, widget.controller.triggers)),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (value) async {
+                    if (value == 'edit') await _edit(schedule);
+                    if (value == 'duplicate') {
+                      await widget.controller
+                          .upsertSchedule(AgentScheduleConfig.fromJson({
+                        ...schedule.toJson(),
+                        'id':
+                            'schedule_${DateTime.now().microsecondsSinceEpoch}',
+                        'name': '${schedule.name} copy',
+                      }));
+                    }
+                    if (value == 'toggle') {
+                      await widget.controller
+                          .upsertSchedule(AgentScheduleConfig.fromJson({
+                        ...schedule.toJson(),
+                        'enabled': !schedule.enabled,
+                      }));
+                    }
+                    if (value == 'delete') {
+                      await widget.controller.deleteSchedule(schedule.id);
+                    }
+                    if (mounted) setState(() {});
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'edit', child: Text('Изменить')),
+                    PopupMenuItem(
+                        value: 'duplicate', child: Text('Дублировать')),
+                    PopupMenuItem(
+                        value: 'toggle', child: Text('Включить/отключить')),
+                    PopupMenuDivider(),
+                    PopupMenuItem(value: 'delete', child: Text('Удалить')),
+                  ],
+                ),
+                onTap: () => _edit(schedule),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        OutlinedButton.icon(
+            onPressed: () => _edit(),
+            icon: const Icon(Icons.add),
+            label: const Text('Добавить новое')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
+      ],
+    );
+  }
+}
+
+class ScheduleEditorDialog extends StatefulWidget {
+  const ScheduleEditorDialog(
+      {super.key,
+      required this.controller,
+      required this.projectPath,
+      this.schedule});
+  final AgentController controller;
+  final String projectPath;
+  final AgentScheduleConfig? schedule;
+
+  @override
+  State<ScheduleEditorDialog> createState() => _ScheduleEditorDialogState();
+}
+
+class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
+  late final TextEditingController nameController;
+  late final TextEditingController promptController;
+  late final TextEditingController formatPromptController;
+  late bool enabled;
+  late bool onceEnabled;
+  late DateTime? onceDate;
+  final repeat = <String, bool>{
+    'yearly': false,
+    'monthly': false,
+    'weekly': false,
+    'daily': false,
+    'hourly': false,
+    'minutely': false,
+  };
+  late Set<String> triggerIds;
+  late List<String> attachments;
+  late List<String> extraFolders;
+  late String permissionMode;
+  late String profileId;
+  late String emailAccountId;
+  late Set<String> apiTemplateIds;
+
+  @override
+  void initState() {
+    super.initState();
+    final schedule = widget.schedule;
+    final data = _decodeMap(schedule?.scheduleJson ?? '{}');
+    final once =
+        data['once'] is Map ? Map<String, dynamic>.from(data['once']) : {};
+    final repeatData =
+        data['repeat'] is Map ? Map<String, dynamic>.from(data['repeat']) : {};
+    for (final key in repeat.keys.toList()) {
+      repeat[key] = repeatData[key] == true;
+    }
+    triggerIds = (data['triggerIds'] as List<dynamic>? ?? [])
+        .map((e) => e.toString())
+        .toSet();
+    enabled = schedule?.enabled ?? true;
+    onceEnabled = once['enabled'] == true;
+    onceDate = DateTime.tryParse(once['date']?.toString() ?? '');
+    nameController =
+        TextEditingController(text: schedule?.name ?? 'Новое расписание');
+    promptController = TextEditingController(text: schedule?.prompt ?? '');
+    formatPromptController =
+        TextEditingController(text: schedule?.formatPrompt ?? '');
+    attachments = [...?schedule?.attachmentPaths];
+    extraFolders = [...?schedule?.extraFolders];
+    permissionMode = schedule?.permissionMode ?? 'askCriticalOnly';
+    profileId = schedule?.profileId ?? 'auto';
+    emailAccountId = schedule?.emailAccountId ?? '';
+    apiTemplateIds = {...?schedule?.apiTemplateIds};
+  }
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    promptController.dispose();
+    formatPromptController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _addTrigger() async {
+    final trigger = await showDialog<AgentTriggerConfig>(
+      context: context,
+      builder: (_) => TriggerEditorDialog(controller: widget.controller),
+    );
+    if (trigger == null) return;
+    await widget.controller.upsertTrigger(trigger);
+    setState(() => triggerIds.add(trigger.id));
+  }
+
+  Future<void> _addAttachment() async {
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (_) => EmbeddedFilePickerDialog(
+          initialDirectory: widget.projectPath.isEmpty
+              ? Directory.current.path
+              : widget.projectPath),
+    );
+    if (picked != null && picked.trim().isNotEmpty) {
+      setState(() => attachments.add(picked.trim()));
+    }
+  }
+
+  Future<void> _addFolder() async {
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (_) => EmbeddedFilePickerDialog(
+          initialDirectory: widget.projectPath.isEmpty
+              ? Directory.current.path
+              : widget.projectPath,
+          selectDirectory: true),
+    );
+    if (picked != null && picked.trim().isNotEmpty) {
+      setState(() => extraFolders.add(picked.trim()));
+    }
+  }
+
+  AgentScheduleConfig _buildSchedule() {
+    final scheduleJson = jsonEncode({
+      'once': {
+        'enabled': onceEnabled,
+        'date': onceDate?.toIso8601String() ?? '',
+      },
+      'repeat': repeat,
+      'triggerIds': triggerIds.toList(),
+    });
+    return AgentScheduleConfig(
+      id: widget.schedule?.id ??
+          'schedule_${DateTime.now().microsecondsSinceEpoch}',
+      projectPath: widget.projectPath,
+      name: nameController.text.trim().isEmpty
+          ? 'Расписание'
+          : nameController.text.trim(),
+      scheduleJson: scheduleJson,
+      prompt: promptController.text,
+      attachmentPaths: attachments,
+      extraFolders: extraFolders,
+      permissionMode: permissionMode,
+      profileId: profileId,
+      apiTemplateIds: apiTemplateIds.toList(),
+      emailAccountId: emailAccountId,
+      formatPrompt: formatPromptController.text,
+      enabled: enabled,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final profiles = [
+      const DropdownMenuItem(value: 'auto', child: Text('Авто')),
+      ...widget.controller.profiles.map(
+        (profile) => DropdownMenuItem(
+            value: profile.id,
+            child: Text('${profile.name} • ${profile.kind.label}',
+                overflow: TextOverflow.ellipsis)),
+      ),
+    ];
+    final emailItems = [
+      const DropdownMenuItem(value: '', child: Text('Не отправлять')),
+      ...widget.controller.emailAccounts.map(
+        (mail) => DropdownMenuItem(value: mail.id, child: Text(mail.address)),
+      ),
+    ];
+    return AlertDialog(
+      title: Text(widget.schedule == null
+          ? 'Добавить выполнение'
+          : 'Настроить выполнение'),
+      content: SizedBox(
+        width: 900,
+        height: math.min(MediaQuery.of(context).size.height * 0.76, 720),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SwitchListTile(
+                value: enabled,
+                onChanged: (value) => setState(() => enabled = value),
+                title: const Text('Включено'),
+              ),
+              TextField(
+                controller: nameController,
+                decoration: const InputDecoration(
+                    labelText: 'Название', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 12),
+              const Text('Расписание выполнения',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              CheckboxListTile(
+                value: onceEnabled,
+                onChanged: (value) =>
+                    setState(() => onceEnabled = value ?? false),
+                title: Text(onceDate == null
+                    ? 'Разовый запуск'
+                    : 'Разовый запуск: ${onceDate!.toLocal()}'),
+                secondary: IconButton(
+                  icon: const Icon(Icons.calendar_month),
+                  onPressed: () async {
+                    final date = await showDatePicker(
+                      context: context,
+                      firstDate:
+                          DateTime.now().subtract(const Duration(days: 1)),
+                      lastDate: DateTime.now().add(const Duration(days: 3650)),
+                      initialDate: onceDate ?? DateTime.now(),
+                    );
+                    if (date != null) {
+                      setState(() {
+                        onceEnabled = true;
+                        onceDate = date;
+                      });
+                    }
+                  },
+                ),
+              ),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                children: [
+                  for (final entry in const {
+                    'yearly': 'ежегодно',
+                    'monthly': 'ежемесячно',
+                    'weekly': 'еженедельно',
+                    'daily': 'ежедневно',
+                    'hourly': 'ежечасно',
+                    'minutely': 'ежеминутно',
+                  }.entries)
+                    FilterChip(
+                      label: Text(entry.value),
+                      selected: repeat[entry.key] == true,
+                      onSelected: (value) =>
+                          setState(() => repeat[entry.key] = value),
+                    ),
+                ],
+              ),
+              const Divider(),
+              Row(children: [
+                const Expanded(
+                    child: Text('Триггеры',
+                        style: TextStyle(fontWeight: FontWeight.bold))),
+                TextButton.icon(
+                    onPressed: _addTrigger,
+                    icon: const Icon(Icons.add),
+                    label: const Text('Добавить триггер')),
+              ]),
+              for (final trigger in widget.controller.triggers)
+                CheckboxListTile(
+                  value: triggerIds.contains(trigger.id),
+                  onChanged: (value) => setState(() {
+                    if (value == true) {
+                      triggerIds.add(trigger.id);
+                    } else {
+                      triggerIds.remove(trigger.id);
+                    }
+                  }),
+                  title: Text(trigger.name),
+                  subtitle: Text(_prettyTriggerType(trigger.type)),
+                ),
+              const Divider(),
+              TextField(
+                controller: promptController,
+                minLines: 5,
+                maxLines: 12,
+                decoration: const InputDecoration(
+                    labelText: 'Промпт выполнения',
+                    border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 8),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                OutlinedButton.icon(
+                    onPressed: _addAttachment,
+                    icon: const Icon(Icons.attach_file),
+                    label: const Text('Вложить файл')),
+                OutlinedButton.icon(
+                    onPressed: _addFolder,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('Дополнительная папка')),
+              ]),
+              for (final path in attachments)
+                InputChip(
+                    avatar: const Icon(Icons.description, size: 18),
+                    label: Text(pathBasename(path)),
+                    tooltip: path,
+                    onDeleted: () => setState(() => attachments.remove(path))),
+              for (final path in extraFolders)
+                InputChip(
+                    avatar: const Icon(Icons.folder, size: 18),
+                    label: Text(pathBasename(path)),
+                    tooltip: path,
+                    onDeleted: () => setState(() => extraFolders.remove(path))),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                initialValue: permissionMode,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    labelText: 'Права доступа', border: OutlineInputBorder()),
+                items: PermissionMode.values
+                    .map((mode) => DropdownMenuItem(
+                        value: mode.name, child: Text(mode.label)))
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) setState(() => permissionMode = value);
+                },
+              ),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                initialValue: profileId,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    labelText: 'Модель/профиль', border: OutlineInputBorder()),
+                items: profiles,
+                onChanged: (value) {
+                  if (value != null) setState(() => profileId = value);
+                },
+              ),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                initialValue: emailAccountId,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    labelText: 'Отчет на почту', border: OutlineInputBorder()),
+                items: emailItems,
+                onChanged: (value) {
+                  if (value != null) setState(() => emailAccountId = value);
+                },
+              ),
+              const SizedBox(height: 8),
+              const Text('Отправить по API',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              for (final api in widget.controller.apiOutputTemplates)
+                CheckboxListTile(
+                  value: apiTemplateIds.contains(api.id),
+                  onChanged: (value) => setState(() {
+                    if (value == true) {
+                      apiTemplateIds.add(api.id);
+                    } else {
+                      apiTemplateIds.remove(api.id);
+                    }
+                  }),
+                  title: Text(api.name),
+                  subtitle: Text(api.endpoint,
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+              TextField(
+                controller: formatPromptController,
+                minLines: 3,
+                maxLines: 8,
+                decoration: const InputDecoration(
+                    labelText: 'Промпт форматирования перед выводом',
+                    border: OutlineInputBorder()),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context, _buildSchedule()),
+            child: const Text('Сохранить')),
+      ],
+    );
+  }
+}
+
+class ScheduledRunsDialog extends StatelessWidget {
+  const ScheduledRunsDialog({super.key, required this.controller});
+  final AgentController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Выполненные задачи по расписанию'),
+      content: SizedBox(
+        width: 860,
+        height: math.min(MediaQuery.of(context).size.height * 0.72, 620),
+        child: ListView(
+          children: [
+            if (controller.scheduledTaskRuns.isEmpty)
+              const ListTile(title: Text('Запусков пока нет')),
+            for (final run in controller.scheduledTaskRuns)
+              ListTile(
+                leading: Icon(run.errors == 0
+                    ? Icons.check_circle_outline
+                    : Icons.error_outline),
+                title: Text('${run.projectName} • ${run.scheduleName}'),
+                subtitle: Text(
+                    '${run.createdAt} • ${run.triggerName} • успешных команд: ${run.successfulCommands}, ошибок: ${run.errors}'),
+                onTap: () => showDialog<void>(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    title: const Text('Диалог выполнения'),
+                    content: SizedBox(
+                      width: 760,
+                      height: 520,
+                      child: SingleChildScrollView(
+                        child: SelectableText(run.dialogText),
+                      ),
+                    ),
+                    actions: [
+                      TextButton.icon(
+                          onPressed: () async => Clipboard.setData(
+                              ClipboardData(text: run.dialogText)),
+                          icon: const Icon(Icons.copy),
+                          label: const Text('Копировать диалог')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('Закрыть')),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
+      ],
+    );
+  }
+}
+
 class ProgramSettingsDialog extends StatefulWidget {
   const ProgramSettingsDialog(
       {super.key, required this.controller, required this.onChanged});
@@ -1805,12 +3244,13 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
               },
             ),
             SwitchListTile(
-              value: widget.controller.closeToTrayOnClose,
-              title: const Text('Windows: сворачивать в трей при закрытии'),
+              value: !widget.controller.closeToTrayOnClose,
+              title: const Text(
+                  'Windows: закрывать программу без сворачивания в трей'),
               subtitle: const Text(
                   'Можно отключить, тогда кнопка закрытия завершает окно как обычно. Нативный трей включается через Windows bridge, если доступен.'),
               onChanged: (v) async {
-                setState(() => widget.controller.closeToTrayOnClose = v);
+                setState(() => widget.controller.closeToTrayOnClose = !v);
                 await widget.controller.saveAppSettings();
                 await widget.controller.configureWindowsTrayBridge();
                 widget.onChanged();
@@ -1865,17 +3305,68 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
               icon: const Icon(Icons.library_books),
               label: const Text('База знаний агента'),
             ),
-            OutlinedButton.icon(
-              onPressed: () async {
-                await showDialog<void>(
-                    context: context,
-                    builder: (_) => AutomationSettingsDialog(
-                        controller: widget.controller));
-                setState(() {});
-              },
-              icon: const Icon(Icons.auto_mode),
-              label: const Text('Автоматизация, API, индексация, tools'),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showDialog<void>(
+                        context: context,
+                        builder: (_) => ApiOutputTemplatesDialog(
+                            controller: widget.controller));
+                    setState(() {});
+                  },
+                  icon: const Icon(Icons.api),
+                  label: const Text('API вывод'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showDialog<void>(
+                        context: context,
+                        builder: (_) => IndexingSettingsDialog(
+                            controller: widget.controller));
+                    setState(() {});
+                  },
+                  icon: const Icon(Icons.manage_search),
+                  label: const Text('Индексация'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showDialog<void>(
+                        context: context,
+                        builder: (_) => TriggerSettingsDialog(
+                            controller: widget.controller));
+                    setState(() {});
+                  },
+                  icon: const Icon(Icons.bolt_outlined),
+                  label: const Text('Триггеры'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showDialog<void>(
+                        context: context,
+                        builder: (_) =>
+                            CustomToolsDialog(controller: widget.controller));
+                    setState(() {});
+                  },
+                  icon: const Icon(Icons.construction_outlined),
+                  label: const Text('Инструменты агента'),
+                ),
+              ],
             ),
+            if (DateTime.now().microsecondsSinceEpoch < 0)
+              OutlinedButton.icon(
+                onPressed: () async {
+                  await showDialog<void>(
+                      context: context,
+                      builder: (_) => AutomationSettingsDialog(
+                          controller: widget.controller));
+                  setState(() {});
+                },
+                icon: const Icon(Icons.auto_mode),
+                label: const Text('Автоматизация, API, индексация, tools'),
+              ),
             TextField(
               controller: iterationsController,
               keyboardType: TextInputType.number,

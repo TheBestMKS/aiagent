@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.50.0+50 - 2026-06-28
+
+- Added native WebView browsing for Windows WebView2 and Android platform WebView, with text/source fallback preserved.
+- Split automation settings into user-friendly dialogs for API output, indexing, global triggers, custom tools, project schedules, and scheduled task run history.
+- Reworked project schedule editing around forms, checkboxes, trigger selection/creation, attachments, extra folders, permissions, profile selection, email/API reports, and output formatting prompts.
+- Added the explicit "close without minimizing to tray" setting while preserving tray restore/context-menu behavior.
+- Fixed compact chat permissions control so it becomes icon-only on narrow windows.
+- Kept generated Console/Web quick actions and project-scoped session state compatible with the new UI.
+- Added Linux desktop runner sources configured with `AIAgent` as the executable/window name.
+- Disabled Kotlin incremental compilation for Android release builds to avoid cross-drive cache path failures.
+
 ## 1.49.0+49 - 2026-06-27
 
 - Fixed local `llama.cpp` launch arguments for CPU and current `--flash-attn` syntax.

@@ -711,19 +711,24 @@ class _ChatTabState extends State<ChatTab> {
                                       style: const TextStyle(fontSize: 12)))),
                         ],
                         child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 8),
+                          width: compactControls ? 40 : null,
+                          height: compactControls ? 40 : null,
+                          padding: EdgeInsets.symmetric(
+                              horizontal: compactControls ? 0 : 12,
+                              vertical: 8),
                           decoration: BoxDecoration(
                               border: Border.all(
                                   color: Theme.of(context).colorScheme.outline),
                               borderRadius: BorderRadius.circular(20)),
-                          child: const Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.verified_user, size: 18),
-                                SizedBox(width: 8),
-                                Text('Права')
-                              ]),
+                          child: compactControls
+                              ? const Icon(Icons.verified_user, size: 18)
+                              : const Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                      Icon(Icons.verified_user, size: 18),
+                                      SizedBox(width: 8),
+                                      Text('Права')
+                                    ]),
                         ),
                       ),
                       const SizedBox(height: 8),

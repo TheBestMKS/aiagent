@@ -2,7 +2,7 @@
 chcp 65001 >nul 2>nul
 setlocal EnableExtensions
 echo ========================================
-echo AI Agent build environment diagnostics v1.49
+echo AI Agent build environment diagnostics v1.50
 echo Script: %~f0
 echo Time: %DATE% %TIME%
 echo ========================================

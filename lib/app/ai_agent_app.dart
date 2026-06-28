@@ -468,7 +468,7 @@ class ProjectPanel extends StatelessWidget {
                       } else if (value == 'schedule') {
                         await showDialog<void>(
                           context: context,
-                          builder: (_) => AutomationSettingsDialog(
+                          builder: (_) => ProjectSchedulesDialog(
                               controller: controller,
                               projectPath: project.path),
                         );
@@ -708,7 +708,7 @@ class _ProjectEditDialogState extends State<ProjectEditDialog> {
                   onPressed: () async {
                     await showDialog<void>(
                       context: context,
-                      builder: (_) => AutomationSettingsDialog(
+                      builder: (_) => ProjectSchedulesDialog(
                           controller: widget.controller,
                           projectPath: pathController.text.trim()),
                     );

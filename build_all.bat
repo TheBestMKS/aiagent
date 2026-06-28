@@ -6,7 +6,7 @@ set "SCRIPT_DIR=%~dp0"
 set "LOG=%SCRIPT_DIR%build_logs\build_all_latest.log"
 
 echo ========================================
-echo AI Agent build_all v1.49
+echo AI Agent build_all v1.50
 echo Script: %~f0
 echo Time: %DATE% %TIME%
 echo ========================================

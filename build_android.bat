@@ -12,7 +12,7 @@ if /I not "%SKIP_CHECKS%"=="1" (
 )
 call "%FLUTTER%" build apk --release || goto fail
 set "APP_NAME=AIAgent"
-set "APP_VERSION=v1.49"
+set "APP_VERSION=v1.50"
 set "APP_PLATFORM=android"
 set "APP_ARCH=universal"
 set "DIST_ROOT=%PROJECT_ROOT%dist"
