@@ -61,6 +61,9 @@ class AgentController {
   List<IndexLocationConfig> indexLocations = [];
   List<CustomAgentToolConfig> customTools = [];
   List<ScheduledTaskRunRecord> scheduledTaskRuns = [];
+  Map<String, String> scheduleLastRunKeys = {};
+  Timer? automationSchedulerTimer;
+  final Set<String> runningScheduleIds = {};
   bool defaultAllowInternetUse = true;
   bool defaultAllowComputerSearch = false;
   bool defaultAllowDeviceFileAccess = false;
@@ -83,7 +86,19 @@ class AgentController {
   Process? llamaServerProcess;
   int? llamaServerPid;
   Timer? llamaMemoryTimer;
+  Timer? llamaHealthTimer;
+  DateTime? llamaLastHealthyAt;
+  bool llamaAutoRestartEnabled = true;
+  bool llamaHealthCheckInProgress = false;
+  bool llamaStopRequested = false;
+  ModelProfile? activeLocalLlamaProfile;
   String llamaMemoryStatus = '';
+  HeavyTaskStatus? heavyTaskStatus;
+  OffsetLike heavyTaskOffset = const OffsetLike(360, 72);
+  Timer? tokenPauseTimer;
+  DateTime? tokenPauseUntil;
+  bool tokenPauseSkipRequested = false;
+  bool tokenPauseRetryActive = false;
   File? currentLlamaLogFile;
   File? currentRunLogFile;
   File? currentLatestLogFile;
@@ -122,6 +137,37 @@ class AgentController {
   void Function({required String command, String cwd, bool newTab})?
       consoleRunner;
   ConsoleRunRequest? pendingConsoleRun;
+
+  void setHeavyTaskStatus(String title, String detail,
+      {double? progress, int remainingSeconds = 0, bool canContinue = false}) {
+    heavyTaskStatus = HeavyTaskStatus(
+        title: title,
+        detail: detail,
+        progress: progress,
+        remainingSeconds: remainingSeconds,
+        canContinue: canContinue);
+    status = detail.isEmpty ? title : '$title: $detail';
+    notifyUi();
+  }
+
+  void moveHeavyTaskStatus(double dx, double dy) {
+    heavyTaskOffset = OffsetLike(
+        (heavyTaskOffset.dx + dx).clamp(8.0, 1600.0).toDouble(),
+        (heavyTaskOffset.dy + dy).clamp(8.0, 1200.0).toDouble());
+    notifyUi();
+  }
+
+  void clearHeavyTaskStatus() {
+    heavyTaskStatus = null;
+    notifyUi();
+  }
+
+  void continueAfterTokenPause() {
+    tokenPauseSkipRequested = true;
+    tokenPauseTimer?.cancel();
+    tokenPauseUntil = null;
+    clearHeavyTaskStatus();
+  }
 
   void log(String message) {
     if (!loggingEnabled) return;
@@ -227,21 +273,199 @@ class AgentController {
         return '${m.role}:\n${m.content}';
       }).join('\n\n---\n\n');
 
+  String get hostPlatformKey {
+    final arch = hostArchSegment;
+    if (Platform.isWindows) return 'windows_$arch';
+    if (Platform.isLinux) return 'linux_$arch';
+    if (Platform.isAndroid) return 'android_$arch';
+    if (Platform.isMacOS) return 'macos_$arch';
+    return '${Platform.operatingSystem}_$arch';
+  }
+
+  List<LlamaBackendVariant> get llamaBackendVariants => const [
+        LlamaBackendVariant(
+            id: 'linux_x64/cpu',
+            platformKey: 'linux_x64',
+            backend: 'cpu',
+            label: 'Ubuntu x64 (CPU)',
+            assetMatchers: ['bin-ubuntu-x64'],
+            speedRank: 10),
+        LlamaBackendVariant(
+            id: 'linux_arm64/cpu',
+            platformKey: 'linux_arm64',
+            backend: 'cpu',
+            label: 'Ubuntu arm64 (CPU)',
+            assetMatchers: ['bin-ubuntu-arm64'],
+            speedRank: 10),
+        LlamaBackendVariant(
+            id: 'linux_s390x/cpu',
+            platformKey: 'linux_s390x',
+            backend: 'cpu',
+            label: 'Ubuntu s390x (CPU)',
+            assetMatchers: ['bin-ubuntu-s390x'],
+            speedRank: 10),
+        LlamaBackendVariant(
+            id: 'linux_x64/vulkan',
+            platformKey: 'linux_x64',
+            backend: 'vulkan',
+            label: 'Ubuntu x64 (Vulkan)',
+            assetMatchers: ['bin-ubuntu-vulkan-x64'],
+            speedRank: 60),
+        LlamaBackendVariant(
+            id: 'linux_arm64/vulkan',
+            platformKey: 'linux_arm64',
+            backend: 'vulkan',
+            label: 'Ubuntu arm64 (Vulkan)',
+            assetMatchers: ['bin-ubuntu-vulkan-arm64'],
+            speedRank: 55),
+        LlamaBackendVariant(
+            id: 'linux_x64/rocm72',
+            platformKey: 'linux_x64',
+            backend: 'rocm72',
+            label: 'Ubuntu x64 (ROCm 7.2)',
+            assetMatchers: ['bin-ubuntu-rocm-7.2-x64'],
+            speedRank: 85),
+        LlamaBackendVariant(
+            id: 'linux_x64/openvino',
+            platformKey: 'linux_x64',
+            backend: 'openvino',
+            label: 'Ubuntu x64 (OpenVINO)',
+            assetMatchers: ['bin-ubuntu-openvino', '-x64'],
+            speedRank: 50),
+        LlamaBackendVariant(
+            id: 'linux_x64/sycl-fp32',
+            platformKey: 'linux_x64',
+            backend: 'sycl-fp32',
+            label: 'Ubuntu x64 (SYCL FP32)',
+            assetMatchers: ['bin-ubuntu-sycl-fp32-x64'],
+            speedRank: 62),
+        LlamaBackendVariant(
+            id: 'linux_x64/sycl-fp16',
+            platformKey: 'linux_x64',
+            backend: 'sycl-fp16',
+            label: 'Ubuntu x64 (SYCL FP16)',
+            assetMatchers: ['bin-ubuntu-sycl-fp16-x64'],
+            speedRank: 64),
+        LlamaBackendVariant(
+            id: 'android_arm64/cpu',
+            platformKey: 'android_arm64',
+            backend: 'cpu',
+            label: 'Android arm64 (CPU)',
+            assetMatchers: ['bin-android-arm64'],
+            speedRank: 10),
+        LlamaBackendVariant(
+            id: 'windows_x64/cpu',
+            platformKey: 'windows_x64',
+            backend: 'cpu',
+            label: 'Windows x64 (CPU)',
+            assetMatchers: ['bin-win-cpu-x64'],
+            speedRank: 10),
+        LlamaBackendVariant(
+            id: 'windows_arm64/cpu',
+            platformKey: 'windows_arm64',
+            backend: 'cpu',
+            label: 'Windows arm64 (CPU)',
+            assetMatchers: ['bin-win-cpu-arm64'],
+            speedRank: 10),
+        LlamaBackendVariant(
+            id: 'windows_arm64/opencl-adreno',
+            platformKey: 'windows_arm64',
+            backend: 'opencl-adreno',
+            label: 'Windows arm64 (OpenCL Adreno)',
+            assetMatchers: ['bin-win-opencl-adreno-arm64'],
+            speedRank: 55),
+        LlamaBackendVariant(
+            id: 'windows_x64/cuda12',
+            platformKey: 'windows_x64',
+            backend: 'cuda12',
+            label: 'Windows x64 (CUDA 12)',
+            assetMatchers: ['bin-win-cuda-12.4-x64'],
+            extraAssetMatchers: ['cudart-llama-bin-win-cuda-12.4-x64'],
+            speedRank: 100),
+        LlamaBackendVariant(
+            id: 'windows_x64/cuda13',
+            platformKey: 'windows_x64',
+            backend: 'cuda13',
+            label: 'Windows x64 (CUDA 13)',
+            assetMatchers: ['bin-win-cuda-13.3-x64'],
+            extraAssetMatchers: ['cudart-llama-bin-win-cuda-13.3-x64'],
+            speedRank: 100),
+        LlamaBackendVariant(
+            id: 'windows_x64/vulkan',
+            platformKey: 'windows_x64',
+            backend: 'vulkan',
+            label: 'Windows x64 (Vulkan)',
+            assetMatchers: ['bin-win-vulkan-x64'],
+            speedRank: 65),
+        LlamaBackendVariant(
+            id: 'windows_x64/openvino',
+            platformKey: 'windows_x64',
+            backend: 'openvino',
+            label: 'Windows x64 (OpenVINO)',
+            assetMatchers: ['bin-win-openvino', '-x64'],
+            speedRank: 50),
+        LlamaBackendVariant(
+            id: 'windows_x64/sycl',
+            platformKey: 'windows_x64',
+            backend: 'sycl',
+            label: 'Windows x64 (SYCL)',
+            assetMatchers: ['bin-win-sycl-x64'],
+            speedRank: 62),
+        LlamaBackendVariant(
+            id: 'windows_x64/hip',
+            platformKey: 'windows_x64',
+            backend: 'hip',
+            label: 'Windows x64 (HIP)',
+            assetMatchers: ['bin-win-hip-radeon-x64'],
+            speedRank: 80),
+      ];
+
+  List<LlamaBackendVariant> compatibleLlamaBackendVariants() =>
+      llamaBackendVariants
+          .where((variant) => variant.platformKey == hostPlatformKey)
+          .toList()
+        ..sort((a, b) => b.speedRank.compareTo(a.speedRank));
+
+  LlamaBackendVariant? llamaVariantByBackend(String backend) {
+    final wanted = backend.trim().toLowerCase();
+    if (wanted == 'cuda') {
+      for (final variant in compatibleLlamaBackendVariants()) {
+        if (variant.backend == 'cuda13' || variant.backend == 'cuda12') {
+          return variant;
+        }
+      }
+    }
+    for (final variant in compatibleLlamaBackendVariants()) {
+      if (variant.backend == wanted || variant.id == wanted) return variant;
+    }
+    for (final variant in llamaBackendVariants) {
+      if (variant.backend == wanted || variant.id == wanted) return variant;
+    }
+    return null;
+  }
+
+  String llamaInstallRelativeDir(String backend, {String? platformKey}) =>
+      pathJoin('tools', 'llama.cpp', platformKey ?? hostPlatformKey, backend);
+
   Future<void> logStartupLlamaScan() async {
     final root = Directory.current.path;
-    final checkDirs = [
-      pathJoin(root, 'llama.cpp', 'cuda'),
-      pathJoin(root, 'llama.cpp', 'vulkan'),
-      pathJoin(root, 'llama.cpp', 'cpu'),
-      pathJoin(root, 'tooling', 'llama.cpp', 'cuda'),
-      pathJoin(root, 'tooling', 'llama.cpp', 'vulkan'),
-      pathJoin(root, 'tooling', 'llama.cpp', 'cpu'),
+    final checkDirs = <String>[
+      for (final variant in compatibleLlamaBackendVariants())
+        pathJoin(
+            root,
+            llamaInstallRelativeDir(variant.backend,
+                platformKey: variant.platformKey)),
+      pathJoin(root, 'tools', 'llama.cpp', 'cpu'),
+      pathJoin(root, 'tools', 'llama.cpp', 'vulkan'),
+      pathJoin(root, 'tools', 'llama.cpp', 'cuda'),
     ];
     for (final dir in checkDirs) {
       log('CHECK llama.cpp folder: $dir => ${Directory(dir).existsSync() ? 'exists' : 'missing'}');
     }
     final modelDirs = [
       pathJoin(root, 'models'),
+      pathJoin(root, 'tools', 'models'),
+      pathJoin(root, 'tools', 'llama.cpp', 'models'),
       pathJoin(root, 'tooling', 'models'),
       pathJoin(root, 'llama.cpp', 'models'),
       pathJoin(root, 'tooling', 'llama.cpp', 'models'),
@@ -720,6 +944,7 @@ class AgentController {
       }
       log('TOOLS STARTUP SCAN: deferred until tools are needed. toolsRoot=${toolsRoot.path}');
       await loadProfiles().timeout(const Duration(seconds: 5));
+      startAutomationScheduler();
       await refreshProjects().timeout(const Duration(seconds: 5));
       if (projects.isEmpty) {
         await createProject('DefaultProject')
@@ -823,6 +1048,9 @@ class AgentController {
       llamaProcessLoggingEnabled = data['llamaProcessLoggingEnabled'] is bool
           ? data['llamaProcessLoggingEnabled'] as bool
           : llamaProcessLoggingEnabled;
+      llamaAutoRestartEnabled = data['llamaAutoRestartEnabled'] is bool
+          ? data['llamaAutoRestartEnabled'] as bool
+          : llamaAutoRestartEnabled;
       isolatedToolsEnabled = data['isolatedToolsEnabled'] is bool
           ? data['isolatedToolsEnabled'] as bool
           : isolatedToolsEnabled;
@@ -865,6 +1093,9 @@ class AgentController {
           .map((m) => ScheduledTaskRunRecord.fromJson(
               m.map((key, value) => MapEntry(key.toString(), value))))
           .toList();
+      scheduleLastRunKeys =
+          (data['scheduleLastRunKeys'] as Map<dynamic, dynamic>? ?? {})
+              .map((key, value) => MapEntry(key.toString(), value.toString()));
       defaultPermissionMode = PermissionMode.values.firstWhere(
           (m) => m.name == (data['defaultPermissionMode']?.toString() ?? ''),
           orElse: () => PermissionMode.askEveryAction);
@@ -906,6 +1137,7 @@ class AgentController {
         'closeToTrayOnClose': closeToTrayOnClose,
         'trayNotificationsEnabled': trayNotificationsEnabled,
         'llamaProcessLoggingEnabled': llamaProcessLoggingEnabled,
+        'llamaAutoRestartEnabled': llamaAutoRestartEnabled,
         'isolatedToolsEnabled': isolatedToolsEnabled,
         'emailAccounts': emailAccounts.map((a) => a.toJson()).toList(),
         'apiOutputTemplates':
@@ -915,6 +1147,7 @@ class AgentController {
         'indexLocations': indexLocations.map((l) => l.toJson()).toList(),
         'customTools': customTools.map((t) => t.toJson()).toList(),
         'scheduledTaskRuns': scheduledTaskRuns.map((r) => r.toJson()).toList(),
+        'scheduleLastRunKeys': scheduleLastRunKeys,
         'projectsRoot': projectsRoot.path,
       }),
       encoding: utf8,
@@ -1007,6 +1240,175 @@ class AgentController {
     schedules.removeWhere((s) => s.id == id);
     await saveAppSettings();
     notifyUi();
+  }
+
+  void startAutomationScheduler() {
+    automationSchedulerTimer?.cancel();
+    automationSchedulerTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      unawaited(checkProjectSchedules());
+    });
+    unawaited(checkProjectSchedules());
+  }
+
+  Future<void> checkProjectSchedules() async {
+    if (busy) return;
+    final now = DateTime.now();
+    for (final schedule in schedules.where((s) => s.enabled)) {
+      if (runningScheduleIds.contains(schedule.id)) continue;
+      final due = scheduleDueKey(schedule, now);
+      if (due == null) continue;
+      if (scheduleLastRunKeys[schedule.id] == due) continue;
+      scheduleLastRunKeys[schedule.id] = due;
+      await saveAppSettings();
+      unawaited(runProjectSchedule(schedule, due));
+    }
+  }
+
+  String? scheduleDueKey(AgentScheduleConfig schedule, DateTime now) {
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(schedule.scheduleJson) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+    bool nearMinute(DateTime value) =>
+        now.difference(value).inSeconds.abs() <= 30;
+    final once = data['once'] is Map
+        ? Map<String, dynamic>.from(data['once'] as Map)
+        : <String, dynamic>{};
+    if (once['enabled'] == true) {
+      final date = DateTime.tryParse(once['date']?.toString() ?? '');
+      if (date != null && nearMinute(date))
+        return 'once:${date.toIso8601String()}';
+    }
+    final repeat = data['repeat'] is Map
+        ? Map<String, dynamic>.from(data['repeat'] as Map)
+        : <String, dynamic>{};
+    Map<String, dynamic> rule(String key) =>
+        repeat[key] is Map ? Map<String, dynamic>.from(repeat[key] as Map) : {};
+    bool enabled(String key) =>
+        rule(key)['enabled'] == true || repeat[key] == true;
+    List<int> ints(Object? value) {
+      if (value is List) {
+        return value
+            .map((e) => int.tryParse(e.toString()))
+            .whereType<int>()
+            .toList();
+      }
+      return value
+          .toString()
+          .split(RegExp(r'[,; ]+'))
+          .map((e) => int.tryParse(e.trim()))
+          .whereType<int>()
+          .toList();
+    }
+
+    List<int> hms(String text) {
+      final parts = text.split(':').map((e) => int.tryParse(e) ?? 0).toList();
+      while (parts.length < 3) {
+        parts.add(0);
+      }
+      return parts.take(3).toList();
+    }
+
+    if (enabled('yearly')) {
+      final r = rule('yearly');
+      final time = hms(r['time']?.toString() ?? '09:00:00');
+      if (ints(r['months']).contains(now.month) &&
+          (int.tryParse(r['day']?.toString() ?? '') ?? 1) == now.day &&
+          now.hour == time[0] &&
+          now.minute == time[1]) {
+        return 'yearly:${now.year}-${now.month}-${now.day}-${now.hour}-${now.minute}';
+      }
+    }
+    if (enabled('monthly')) {
+      final r = rule('monthly');
+      final time = hms(r['time']?.toString() ?? '09:00:00');
+      if ((int.tryParse(r['day']?.toString() ?? '') ?? 1) == now.day &&
+          now.hour == time[0] &&
+          now.minute == time[1]) {
+        return 'monthly:${now.year}-${now.month}-${now.day}-${now.hour}-${now.minute}';
+      }
+    }
+    if (enabled('weekly')) {
+      final r = rule('weekly');
+      final time = hms(r['time']?.toString() ?? '09:00:00');
+      if (ints(r['weekdays']).contains(now.weekday) &&
+          now.hour == time[0] &&
+          now.minute == time[1]) {
+        return 'weekly:${now.year}-${now.month}-${now.day}-${now.hour}-${now.minute}';
+      }
+    }
+    if (enabled('daily')) {
+      final time = hms(rule('daily')['time']?.toString() ?? '09:00:00');
+      if (now.hour == time[0] && now.minute == time[1]) {
+        return 'daily:${now.year}-${now.month}-${now.day}-${now.hour}-${now.minute}';
+      }
+    }
+    if (enabled('hourly')) {
+      final r = rule('hourly');
+      final minute = int.tryParse(r['minute']?.toString() ?? '') ?? 0;
+      if (now.minute == minute) {
+        return 'hourly:${now.year}-${now.month}-${now.day}-${now.hour}-$minute';
+      }
+    }
+    if (enabled('minutely')) {
+      return 'minutely:${now.year}-${now.month}-${now.day}-${now.hour}-${now.minute}';
+    }
+    return null;
+  }
+
+  Future<void> runProjectSchedule(
+      AgentScheduleConfig schedule, String triggerName) async {
+    runningScheduleIds.add(schedule.id);
+    final startedMessages = messages.length;
+    var successCommands = 0;
+    var errors = 0;
+    try {
+      if (projects.isEmpty) return;
+      final project = projects.firstWhere(
+          (p) =>
+              normalizePathForCompare(p.path) ==
+              normalizePathForCompare(schedule.projectPath),
+          orElse: () => currentProject ?? projects.first);
+      await openProject(project);
+      if (schedule.profileId.isNotEmpty && schedule.profileId != 'auto') {
+        await selectProfile(schedule.profileId);
+      }
+      for (final path in schedule.attachmentPaths) {
+        addAttachment(path);
+      }
+      for (final folder in schedule.extraFolders) {
+        addSelectedLocation(folder);
+      }
+      await sendPrompt(schedule.prompt, '');
+      successCommands = taskCommandRuns - taskFailedCommands;
+      errors = taskFailedCommands;
+    } catch (error) {
+      errors++;
+      log('SCHEDULE RUN ERROR: schedule=${schedule.id} error=$error');
+    } finally {
+      final dialogText = messages.skip(startedMessages).map((m) {
+        return '${m.role}: ${m.content}';
+      }).join('\n\n');
+      scheduledTaskRuns.insert(
+          0,
+          ScheduledTaskRunRecord(
+              id: 'run_${DateTime.now().microsecondsSinceEpoch}',
+              projectName: currentProject?.name ?? schedule.projectPath,
+              scheduleName: schedule.name,
+              triggerName: triggerName,
+              successfulCommands: successCommands,
+              errors: errors,
+              dialogText: dialogText,
+              createdAt: DateTime.now()));
+      if (scheduledTaskRuns.length > 100) {
+        scheduledTaskRuns = scheduledTaskRuns.take(100).toList();
+      }
+      runningScheduleIds.remove(schedule.id);
+      await saveAppSettings();
+      notifyUi();
+    }
   }
 
   Future<void> upsertIndexLocation(IndexLocationConfig location) async {
@@ -1595,8 +1997,10 @@ class AgentController {
     final profile = currentProfile;
     if (profile == null) return;
     availableModels = [];
-    maxContextTokens = profile.maxContextTokens;
-    maxOutputTokens = profile.maxOutputTokens;
+    maxContextTokens =
+        profile.maxContextTokens > 0 ? profile.maxContextTokens : 8192;
+    maxOutputTokens =
+        profile.maxOutputTokens > 0 ? profile.maxOutputTokens : 4096;
     if (profile.kind == ProfileKind.localLlama) {
       availableModels = await scanModelFiles().then((paths) => paths
           .map((p) => AvailableModel(pathBasename(p), profile.maxContextTokens,
@@ -1651,8 +2055,14 @@ class AgentController {
                 'n_predict',
                 'output_token_limit'
               ]);
-              final ctx = rawCtx ?? profile.maxContextTokens;
-              final out = rawOut ?? profile.maxOutputTokens;
+              final ctx = rawCtx ??
+                  (profile.maxContextTokens > 0
+                      ? profile.maxContextTokens
+                      : 8192);
+              final out = rawOut ??
+                  (profile.maxOutputTokens > 0
+                      ? profile.maxOutputTokens
+                      : 4096);
               if (rawCtx == null || rawOut == null) {
                 log('MODEL LIMITS METADATA: model=$id endpoint_ctx=${rawCtx ?? 'missing'} endpoint_output=${rawOut ?? 'missing'} using_profile_ctx=$ctx using_profile_output=$out');
               }
@@ -1681,6 +2091,16 @@ class AgentController {
     if (current != null) {
       maxContextTokens = current.maxContextTokens;
       maxOutputTokens = current.maxOutputTokens;
+    }
+    if (profile.maxContextTokens <= 0 || profile.maxOutputTokens <= 0) {
+      final limits =
+          await refreshRuntimeLimitsForProfile(profile, force: false);
+      if (profile.maxContextTokens <= 0 && limits.contextTokens != null) {
+        maxContextTokens = limits.contextTokens!;
+      }
+      if (profile.maxOutputTokens <= 0 && limits.outputTokens != null) {
+        maxOutputTokens = limits.outputTokens!;
+      }
     }
     recalculateContext();
   }
@@ -1728,32 +2148,56 @@ class AgentController {
   }
 
   Future<List<LocalLlamaCandidate>> scanLocalLlamaCandidates() async {
-    final modes = <String, List<String>>{
-      'cuda': [
-        'tools/llama.cpp/cuda',
-        'llama.cpp/cuda',
-        'tooling/llama.cpp/cuda'
-      ],
-      'vulkan': [
-        'tools/llama.cpp/vulkan',
-        'llama.cpp/vulkan',
-        'tooling/llama.cpp/vulkan'
-      ],
-      'cpu': ['tools/llama.cpp/cpu', 'llama.cpp/cpu', 'tooling/llama.cpp/cpu'],
-    };
     final models = await scanModelFiles();
     final result = <LocalLlamaCandidate>[];
-    for (final entry in modes.entries) {
-      for (final rel in entry.value) {
-        final dir = Directory(
-            pathJoin(appRootPath, rel.replaceAll('/', Platform.pathSeparator)));
-        if (!dir.existsSync()) continue;
-        for (final model in models) {
-          result.add(LocalLlamaCandidate(
-              mode: entry.key, llamaDir: dir.path, modelPath: model));
-        }
+    final dirs = <({String mode, String path, int rank})>[];
+    for (final variant in compatibleLlamaBackendVariants()) {
+      dirs.add((
+        mode: variant.backend,
+        path: pathJoin(
+            appRootPath,
+            llamaInstallRelativeDir(variant.backend,
+                platformKey: variant.platformKey)),
+        rank: variant.speedRank
+      ));
+    }
+    for (final legacy in const [
+      ('cuda', 'tools/llama.cpp/cuda', 40),
+      ('vulkan', 'tools/llama.cpp/vulkan', 30),
+      ('cpu', 'tools/llama.cpp/cpu', 10),
+      ('cuda', 'llama.cpp/cuda', 40),
+      ('vulkan', 'llama.cpp/vulkan', 30),
+      ('cpu', 'llama.cpp/cpu', 10),
+      ('cuda', 'tooling/llama.cpp/cuda', 40),
+      ('vulkan', 'tooling/llama.cpp/vulkan', 30),
+      ('cpu', 'tooling/llama.cpp/cpu', 10),
+    ]) {
+      dirs.add((
+        mode: legacy.$1,
+        path: pathJoin(
+            appRootPath, legacy.$2.replaceAll('/', Platform.pathSeparator)),
+        rank: legacy.$3
+      ));
+    }
+    final seen = <String>{};
+    for (final item in dirs) {
+      final dir = Directory(item.path);
+      if (!dir.existsSync()) continue;
+      if (findLlamaServer(dir.path) == null) continue;
+      if (!seen.add(normalizePathForCompare(dir.path))) continue;
+      for (final model in models) {
+        result.add(LocalLlamaCandidate(
+            mode: item.mode, llamaDir: dir.path, modelPath: model));
       }
     }
+    result.sort((a, b) {
+      final rank = (llamaVariantByBackend(b.mode)?.speedRank ?? 0)
+          .compareTo(llamaVariantByBackend(a.mode)?.speedRank ?? 0);
+      if (rank != 0) return rank;
+      return pathBasename(a.modelPath)
+          .toLowerCase()
+          .compareTo(pathBasename(b.modelPath).toLowerCase());
+    });
     return result;
   }
 
@@ -1816,16 +2260,20 @@ class AgentController {
 
   Future<void> startLocalLlama(ModelProfile profile) async {
     if (profile.kind != ProfileKind.localLlama) return;
+    activeLocalLlamaProfile = profile;
+    llamaStopRequested = false;
+    setHeavyTaskStatus('llama.cpp startup',
+        'Starting ${profile.llamaMode} server for ${profile.model}');
     final exe = findLlamaServer(profile.llamaDir);
     if (exe == null) {
       status = 'llama-server не найден в ${profile.llamaDir}';
       log('LLAMA START FAILED: llama-server not found in ${profile.llamaDir}');
+      clearHeavyTaskStatus();
       return;
     }
-    final previous = llamaServerProcess;
-    if (previous != null) {
-      final killed = previous.kill();
-      log('LLAMA PREVIOUS PROCESS KILL: killed=$killed');
+    if (llamaServerProcess != null || llamaServerPid != null) {
+      await stopLocalLlama(
+          reason: 'restart before local llama startup', keepProfile: true);
     }
     await openLlamaProcessLog(profile);
     final args = profile.llamaSettings.toLlamaArgs(
@@ -1859,6 +2307,22 @@ class AgentController {
       logAction('llama_exit', {'exit_code': code});
       if (llamaServerPid == process.pid) {
         llamaMemoryTimer?.cancel();
+        llamaHealthTimer?.cancel();
+        llamaServerProcess = null;
+        llamaServerPid = null;
+        if (!llamaStopRequested &&
+            llamaAutoRestartEnabled &&
+            activeLocalLlamaProfile?.autoRestartLocalLlama == true) {
+          log('LLAMA AUTO-RESTART SCHEDULED AFTER EXIT: exit=$code');
+          Future<void>.delayed(const Duration(seconds: 3), () async {
+            final active = activeLocalLlamaProfile;
+            if (active != null &&
+                active.kind == ProfileKind.localLlama &&
+                !llamaStopRequested) {
+              await startLocalLlama(active);
+            }
+          });
+        }
         llamaMemoryStatus = 'llama.cpp остановлен, exit=$code';
         notifyUi();
       }
@@ -1898,10 +2362,13 @@ class AgentController {
     log('LLAMA HEALTHCHECK RESULT: $health');
     if (health.startsWith('ok')) {
       status = 'Запущен llama.cpp ${profile.llamaMode}: ${profile.model}';
+      llamaLastHealthyAt = DateTime.now();
+      startLlamaHealthMonitor();
       await refreshAvailableModels();
     } else {
       status = 'llama.cpp запущен, но API не готов: $health';
     }
+    clearHeavyTaskStatus();
   }
 
   Future<void> openLlamaProcessLog(ModelProfile profile) async {
@@ -1935,27 +2402,139 @@ class AgentController {
     } catch (_) {}
   }
 
-  Future<void> stopLocalLlama({String reason = 'manual stop'}) async {
+  Future<void> stopLocalLlama(
+      {String reason = 'manual stop', bool keepProfile = false}) async {
+    llamaStopRequested = true;
     llamaMemoryTimer?.cancel();
+    llamaHealthTimer?.cancel();
     final process = llamaServerProcess;
-    if (process != null) {
-      final killed = process.kill();
-      log('LLAMA STOP: reason=$reason pid=${process.pid} killed=$killed');
+    final pid = process?.pid ?? llamaServerPid;
+    if (pid != null) {
+      final killed = await killLlamaProcessTree(pid, process: process);
+      log('LLAMA STOP: reason=$reason pid=$pid killed=$killed');
       logAction('llama_stop', {
         'reason': reason,
-        'pid': process.pid,
+        'pid': pid,
         'killed': killed,
       });
     }
     llamaServerProcess = null;
     llamaServerPid = null;
+    if (!keepProfile) activeLocalLlamaProfile = null;
     llamaMemoryStatus = '';
     currentLlamaLogFile = null;
+    clearHeavyTaskStatus();
     notifyUi();
   }
 
   Future<void> shutdown() async {
+    automationSchedulerTimer?.cancel();
     await stopLocalLlama(reason: 'application shutdown');
+  }
+
+  Future<bool> killLlamaProcessTree(int pid, {Process? process}) async {
+    try {
+      if (Platform.isWindows) {
+        final result = await Process.run(
+          'taskkill',
+          ['/PID', pid.toString(), '/T', '/F'],
+          stdoutEncoding: const Utf8Codec(allowMalformed: true),
+          stderrEncoding: const Utf8Codec(allowMalformed: true),
+        ).timeout(const Duration(seconds: 8));
+        log('LLAMA TASKKILL exit=${result.exitCode}: ${truncateMiddle('${result.stdout}\n${result.stderr}', 4000)}');
+        return result.exitCode == 0;
+      }
+      return process?.kill(ProcessSignal.sigterm) ?? false;
+    } catch (error) {
+      log('LLAMA KILL TREE ERROR: $error');
+      return process?.kill() ?? false;
+    }
+  }
+
+  Future<void> restartLocalLlama() async {
+    final profile = activeLocalLlamaProfile ?? currentProfile;
+    if (profile == null || profile.kind != ProfileKind.localLlama) return;
+    await stopLocalLlama(reason: 'manual restart', keepProfile: true);
+    await startLocalLlama(profile);
+  }
+
+  void startLlamaHealthMonitor() {
+    llamaHealthTimer?.cancel();
+    llamaHealthTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      unawaited(checkLocalLlamaHealth());
+    });
+  }
+
+  Future<void> checkLocalLlamaHealth() async {
+    if (llamaHealthCheckInProgress) return;
+    final profile = activeLocalLlamaProfile;
+    if (profile == null || profile.kind != ProfileKind.localLlama) return;
+    if (!llamaAutoRestartEnabled || !profile.autoRestartLocalLlama) return;
+    llamaHealthCheckInProgress = true;
+    try {
+      final pid = llamaServerPid;
+      final processAlive = pid != null && await processExists(pid);
+      final apiAlive = processAlive && await openAiModelsEndpointOk(profile);
+      if (apiAlive) {
+        llamaLastHealthyAt = DateTime.now();
+        return;
+      }
+      log('LLAMA HEALTH MONITOR: unhealthy pid=$pid processAlive=$processAlive apiAlive=$apiAlive, restarting profile=${profile.id}');
+      await stopLocalLlama(reason: 'health monitor restart', keepProfile: true);
+      await startLocalLlama(profile);
+    } catch (error) {
+      log('LLAMA HEALTH MONITOR ERROR: $error');
+    } finally {
+      llamaHealthCheckInProgress = false;
+    }
+  }
+
+  Future<bool> openAiModelsEndpointOk(ModelProfile profile) async {
+    try {
+      final cleanedBase = profile.baseUrl.replaceAll(RegExp(r'/+$'), '');
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 2);
+      final request = await client
+          .getUrl(Uri.parse('$cleanedBase/models'))
+          .timeout(const Duration(seconds: 2));
+      if (profile.apiKey.isNotEmpty) {
+        request.headers
+            .set(HttpHeaders.authorizationHeader, 'Bearer ${profile.apiKey}');
+      }
+      final response =
+          await request.close().timeout(const Duration(seconds: 3));
+      await response.drain<void>();
+      return response.statusCode >= 200 && response.statusCode < 300;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> processExists(int pid) async {
+    try {
+      if (Platform.isWindows) {
+        final result = await Process.run(
+          'powershell',
+          [
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { '1' }"
+          ],
+          stdoutEncoding: const Utf8Codec(allowMalformed: true),
+          stderrEncoding: const Utf8Codec(allowMalformed: true),
+        ).timeout(const Duration(seconds: 3));
+        return result.stdout.toString().trim() == '1';
+      }
+      final result = await Process.run('sh', ['-c', 'kill -0 $pid 2>/dev/null'],
+              stdoutEncoding: const Utf8Codec(allowMalformed: true),
+              stderrEncoding: const Utf8Codec(allowMalformed: true))
+          .timeout(const Duration(seconds: 3));
+      return result.exitCode == 0;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<String> waitForOpenAiHealth(String baseUrl,
@@ -1964,6 +2543,9 @@ class AgentController {
       required int? Function() exitCode}) async {
     final cleanedBase = baseUrl.replaceAll(RegExp(r'/+$'), '');
     for (var attempt = 1; attempt <= 30; attempt++) {
+      setHeavyTaskStatus('llama.cpp startup',
+          'Waiting for API $attempt/30 at $cleanedBase/models',
+          progress: attempt / 30);
       if (isExited())
         return 'process exited before healthcheck, exit_code=${exitCode()}';
       try {
@@ -2036,98 +2618,152 @@ class AgentController {
     }
   }
 
-  String llamaInstallRelativeDir(String mode) =>
-      pathJoin('tools', 'llama.cpp', mode);
+  bool isArchiveName(String name) {
+    final lower = name.toLowerCase();
+    return lower.endsWith('.zip') ||
+        lower.endsWith('.tar.gz') ||
+        lower.endsWith('.tgz') ||
+        lower.endsWith('.7z');
+  }
 
-  String selectLlamaAssetName(String mode, List<String> assets) {
-    final lowerMode = mode.toLowerCase();
-    final osTokens = Platform.isWindows
-        ? ['win', 'windows']
-        : Platform.isAndroid
-            ? ['android']
-            : Platform.isLinux
-                ? ['linux', 'ubuntu']
-                : Platform.isMacOS
-                    ? ['macos', 'osx', 'darwin']
-                    : [Platform.operatingSystem];
-    bool good(String name) {
-      final n = name.toLowerCase();
-      if (!(n.endsWith('.zip') ||
-          n.endsWith('.tar.gz') ||
-          n.endsWith('.tgz') ||
-          n.endsWith('.7z'))) return false;
-      if (!osTokens.any(n.contains)) return false;
-      if (lowerMode == 'cuda')
-        return n.contains('cuda') || n.contains('cu12') || n.contains('cublas');
-      if (lowerMode == 'vulkan') return n.contains('vulkan');
-      if (lowerMode == 'cpu')
-        return !n.contains('cuda') &&
-            !n.contains('vulkan') &&
-            !n.contains('metal');
-      return true;
+  String selectLlamaAssetName(String mode, List<String> assets,
+      {bool extra = false}) {
+    final variant = llamaVariantByBackend(mode);
+    if (variant == null) return '';
+    final matchers =
+        (extra ? variant.extraAssetMatchers : variant.assetMatchers)
+            .map((e) => e.toLowerCase())
+            .where((e) => e.isNotEmpty)
+            .toList(growable: false);
+    if (matchers.isEmpty) return '';
+    final sorted = assets.where(isArchiveName).toList()
+      ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    for (final name in sorted) {
+      final lower = name.toLowerCase();
+      if (matchers.every(lower.contains)) return name;
     }
+    return '';
+  }
 
-    return assets.firstWhere(good,
-        orElse: () => assets.firstWhere((n) => n.toLowerCase().endsWith('.zip'),
-            orElse: () => assets.isEmpty ? '' : assets.first));
+  File? findDownloadedLlamaArchive(String mode, {bool extra = false}) {
+    final downloads = Directory(pathJoin(appRootPath, 'tools', 'downloads'));
+    if (!downloads.existsSync()) return null;
+    final files = downloads
+        .listSync(recursive: true)
+        .whereType<File>()
+        .where((f) => isArchiveName(pathBasename(f.path)))
+        .toList();
+    final name = selectLlamaAssetName(
+        mode, files.map((f) => pathBasename(f.path)).toList(),
+        extra: extra);
+    if (name.isEmpty) return null;
+    for (final file in files) {
+      if (pathBasename(file.path) == name) return file;
+    }
+    return null;
   }
 
   Future<String> installLlamaCppFromGithub(String mode) async {
-    final selectedMode =
-        mode.trim().toLowerCase().isEmpty ? 'cpu' : mode.trim().toLowerCase();
-    final uri = Uri.parse(
-        'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest');
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 15);
-    final request =
-        await client.getUrl(uri).timeout(const Duration(seconds: 20));
-    request.headers.set(HttpHeaders.userAgentHeader, 'AI-Agent/$appVersion');
-    final response = await request.close().timeout(const Duration(seconds: 45));
-    final body = await utf8.decodeStream(response);
-    if (response.statusCode < 200 || response.statusCode >= 300)
-      return 'LLAMA_CPP_INSTALL_FAILED: GitHub HTTP ${response.statusCode}\n$body';
-    final json = jsonDecode(body) as Map<String, dynamic>;
-    final tag = json['tag_name']?.toString() ?? 'latest';
-    final assetsRaw = json['assets'] as List<dynamic>? ?? const [];
+    final selectedVariant = llamaVariantByBackend(mode) ??
+        compatibleLlamaBackendVariants().firstWhere((v) => v.backend == 'cpu',
+            orElse: () => llamaBackendVariants.first);
+    final selectedMode = selectedVariant.backend;
+    setHeavyTaskStatus(
+        'llama.cpp install', 'Preparing ${selectedVariant.label}');
     final assets = <String, String>{};
-    for (final item in assetsRaw) {
-      if (item is! Map<String, dynamic>) continue;
-      final name = item['name']?.toString() ?? '';
-      final url = item['browser_download_url']?.toString() ?? '';
-      if (name.isNotEmpty && url.isNotEmpty) assets[name] = url;
+    var tag = 'downloads-cache';
+    var onlineError = '';
+    try {
+      final uri = Uri.parse(
+          'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest');
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 15);
+      final request =
+          await client.getUrl(uri).timeout(const Duration(seconds: 20));
+      request.headers.set(HttpHeaders.userAgentHeader, 'AI-Agent/$appVersion');
+      final response =
+          await request.close().timeout(const Duration(seconds: 45));
+      final body = await utf8.decodeStream(response);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        onlineError = 'GitHub HTTP ${response.statusCode}\n$body';
+      } else {
+        final json = jsonDecode(body) as Map<String, dynamic>;
+        tag = json['tag_name']?.toString() ?? 'latest';
+        final assetsRaw = json['assets'] as List<dynamic>? ?? const [];
+        for (final item in assetsRaw) {
+          if (item is! Map<String, dynamic>) continue;
+          final name = item['name']?.toString() ?? '';
+          final url = item['browser_download_url']?.toString() ?? '';
+          if (name.isNotEmpty && url.isNotEmpty) assets[name] = url;
+        }
+      }
+    } catch (error) {
+      onlineError = error.toString();
+      log('LLAMA INSTALL ONLINE CHECK FAILED: $error');
     }
-    final assetName = selectLlamaAssetName(selectedMode, assets.keys.toList());
+    final cachedArchive = findDownloadedLlamaArchive(selectedMode);
+    final assetName = cachedArchive != null
+        ? pathBasename(cachedArchive.path)
+        : selectLlamaAssetName(selectedMode, assets.keys.toList());
     if (assetName.isEmpty) {
+      log('LLAMA INSTALL NO MATCHING ASSET: variant=${selectedVariant.id}; onlineError=$onlineError');
+      clearHeavyTaskStatus();
       return 'LLAMA_CPP_INSTALL_FAILED: в latest-релизе $tag не найден подходящий архив для ${Platform.operatingSystem}/$selectedMode. Можно скачать вручную и распаковать в ${pathJoin(appRootPath, llamaInstallRelativeDir(selectedMode))}';
     }
-    final url = assets[assetName]!;
     final downloads = Directory(pathJoin(appRootPath, 'tools', 'downloads'));
     await downloads.create(recursive: true);
     final archivePath = pathJoin(downloads.path, assetName);
-    final downloadResult = await downloadUrlToFile(url, archivePath);
-    if (!downloadResult.startsWith('OK'))
-      return 'LLAMA_CPP_INSTALL_FAILED: $downloadResult';
+    File archiveFile;
+    if (cachedArchive != null) {
+      archiveFile = cachedArchive;
+    } else {
+      final downloadResult =
+          await downloadUrlToFile(assets[assetName]!, archivePath);
+      if (!downloadResult.startsWith('OK')) {
+        clearHeavyTaskStatus();
+        return 'LLAMA_CPP_INSTALL_FAILED: $downloadResult';
+      }
+      archiveFile = File(archivePath);
+    }
     final dest =
         Directory(pathJoin(appRootPath, llamaInstallRelativeDir(selectedMode)));
     if (await dest.exists()) await dest.delete(recursive: true);
     await dest.create(recursive: true);
-    final extracted = await extractDownloadedArchive(File(archivePath), dest);
+    setHeavyTaskStatus('llama.cpp install', 'Extracting $assetName');
+    final extracted = await extractDownloadedArchive(archiveFile, dest);
+    var extraExtracted = '';
+    var extraArchive = findDownloadedLlamaArchive(selectedMode, extra: true);
+    if (extraArchive == null) {
+      final extraAsset =
+          selectLlamaAssetName(selectedMode, assets.keys.toList(), extra: true);
+      if (extraAsset.isNotEmpty) {
+        final extraPath = pathJoin(downloads.path, extraAsset);
+        final extraDownload =
+            await downloadUrlToFile(assets[extraAsset]!, extraPath);
+        if (extraDownload.startsWith('OK')) extraArchive = File(extraPath);
+      }
+    }
+    if (extraArchive != null) {
+      setHeavyTaskStatus(
+          'llama.cpp install', 'Extracting ${pathBasename(extraArchive.path)}');
+      extraExtracted = await extractDownloadedArchive(extraArchive, dest);
+    }
+    clearHeavyTaskStatus();
     await saveAppSettings();
     await refreshAvailableModels();
-    return 'LLAMA_CPP_INSTALLED\nMODE: $selectedMode\nTAG: $tag\nASSET: $assetName\nARCHIVE: $archivePath\nDEST: ${dest.path}\n$extracted';
+    return 'LLAMA_CPP_INSTALLED\nVARIANT: ${selectedVariant.id}\nLABEL: ${selectedVariant.label}\nTAG: $tag\nASSET: $assetName\nARCHIVE: ${archiveFile.path}\nDEST: ${dest.path}\n$extracted${extraExtracted.isEmpty ? '' : '\nEXTRA_RUNTIME:\n$extraExtracted'}';
   }
 
   Future<String> createLlamaCppManualFolders() async {
     final created = <String>[];
-    for (final rel in const [
-      'tools/downloads',
-      'tools/llama.cpp/cpu',
-      'tools/llama.cpp/vulkan',
-      'tools/llama.cpp/cuda',
-      'models'
+    for (final rel in [
+      pathJoin('tools', 'downloads'),
+      'models',
+      for (final variant in llamaBackendVariants)
+        llamaInstallRelativeDir(variant.backend,
+            platformKey: variant.platformKey),
     ]) {
-      final dir = Directory(
-          pathJoin(appRootPath, rel.replaceAll('/', Platform.pathSeparator)));
+      final dir = Directory(pathJoin(appRootPath, rel));
       await dir.create(recursive: true);
       created.add(dir.path);
     }
@@ -2136,8 +2772,10 @@ class AgentController {
 
   Future<String> installLlamaCppFromArchive(
       String archivePath, String mode) async {
-    final selectedMode =
-        mode.trim().toLowerCase().isEmpty ? 'cpu' : mode.trim().toLowerCase();
+    final selectedVariant = llamaVariantByBackend(mode) ??
+        compatibleLlamaBackendVariants().firstWhere((v) => v.backend == 'cpu',
+            orElse: () => llamaBackendVariants.first);
+    final selectedMode = selectedVariant.backend;
     final archive = File(archivePath.trim());
     if (!await archive.exists()) {
       return 'LLAMA_CPP_INSTALL_FAILED: archive not found: ${archive.path}';
@@ -2154,9 +2792,12 @@ class AgentController {
         Directory(pathJoin(appRootPath, llamaInstallRelativeDir(selectedMode)));
     if (await dest.exists()) await dest.delete(recursive: true);
     await dest.create(recursive: true);
+    setHeavyTaskStatus(
+        'llama.cpp install', 'Extracting ${pathBasename(cachedArchive.path)}');
     final extracted = await extractDownloadedArchive(cachedArchive, dest);
+    clearHeavyTaskStatus();
     await refreshAvailableModels();
-    return 'LLAMA_CPP_INSTALLED_FROM_ARCHIVE\nMODE: $selectedMode\nARCHIVE: ${cachedArchive.path}\nDEST: ${dest.path}\n$extracted';
+    return 'LLAMA_CPP_INSTALLED_FROM_ARCHIVE\nVARIANT: ${selectedVariant.id}\nARCHIVE: ${cachedArchive.path}\nDEST: ${dest.path}\n$extracted';
   }
 
   Future<String> downloadUrlToFile(String url, String targetPath) async {
@@ -3876,6 +4517,39 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
 ''';
   }
 
+  bool isTokenOrRateLimitError(int statusCode, String text) {
+    final lower = text.toLowerCase();
+    return statusCode == 429 ||
+        lower.contains('rate limit') ||
+        lower.contains('too many request') ||
+        lower.contains('quota') ||
+        lower.contains('tokens per') ||
+        lower.contains('token limit') ||
+        lower.contains('context_length_exceeded') ||
+        lower.contains('maximum context') ||
+        lower.contains('too many tokens');
+  }
+
+  Future<void> waitForConfiguredModelPause(
+      ModelProfile profile, String reason) async {
+    final seconds = profile.tokenLimitPauseSeconds;
+    if (seconds <= 0) return;
+    tokenPauseSkipRequested = false;
+    final started = DateTime.now();
+    tokenPauseUntil = started.add(Duration(seconds: seconds));
+    tokenPauseTimer?.cancel();
+    while (
+        !tokenPauseSkipRequested && DateTime.now().isBefore(tokenPauseUntil!)) {
+      final remaining = tokenPauseUntil!.difference(DateTime.now()).inSeconds;
+      final progress = 1.0 - (remaining / seconds).clamp(0.0, 1.0).toDouble();
+      setHeavyTaskStatus('Model limit pause', reason,
+          progress: progress, remainingSeconds: remaining, canContinue: true);
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+    tokenPauseUntil = null;
+    clearHeavyTaskStatus();
+  }
+
   Future<String> callModel() async {
     final profile = currentProfile;
     lastContextMismatch = false;
@@ -3962,6 +4636,18 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
         return lastContextMismatchDetails;
       }
       final lowerError = text.toLowerCase();
+      if (!tokenPauseRetryActive &&
+          isTokenOrRateLimitError(response.statusCode, text) &&
+          profile.tokenLimitPauseSeconds > 0) {
+        tokenPauseRetryActive = true;
+        try {
+          await waitForConfiguredModelPause(profile,
+              'HTTP ${response.statusCode}: ${truncateMiddle(text, 300)}');
+          return await callModel();
+        } finally {
+          tokenPauseRetryActive = false;
+        }
+      }
       if (lowerError.contains('failed to load model') ||
           lowerError.contains('insufficient system resources') ||
           lowerError.contains('недостаточно')) {
@@ -8285,6 +8971,30 @@ ${linkLines.join('\n')}
     return 'READ_DOCUMENT_STRUCTURE_RESULT\n${result.toAgentText(maxTextChars: maxChars)}';
   }
 
+  String? documentPlaceholderQualityIssue(String text) {
+    final lower = text.toLowerCase();
+    final patterns = [
+      'здесь будут',
+      'здесь будет',
+      'остальные рецепты',
+      'еще 17',
+      'ещё 17',
+      'фото блюда',
+      'фото этапа',
+      '[фото',
+      'placeholder',
+      'todo:',
+      'omitted',
+      '...'
+    ];
+    for (final pattern in patterns) {
+      if (lower.contains(pattern)) {
+        return 'Document text contains placeholder marker "$pattern". Provide complete final content, real image paths/URLs if images are required, and concrete table rows before creating the document.';
+      }
+    }
+    return null;
+  }
+
   Future<String> createDocumentFromText(String rawPath, String text) async {
     final path = resolveDevicePath(rawPath);
     if (path.isEmpty) return 'CREATE_DOCUMENT_FAILED: path is required';
@@ -8293,6 +9003,11 @@ ${linkLines.join('\n')}
         !isPathInsideAllowedSandbox(path))
       return 'DEVICE_FILE_ACCESS_DENIED: $rawPath';
     if (text.trim().isEmpty) return 'CREATE_DOCUMENT_FAILED: text is empty';
+    final qualityIssue = documentPlaceholderQualityIssue(text);
+    if (qualityIssue != null) {
+      log('DOCUMENT CREATE BLOCKED: $qualityIssue');
+      return 'CREATE_DOCUMENT_FAILED_QUALITY_CHECK: $qualityIssue';
+    }
     final result =
         await const office.OfficeDocumentBuilder().buildFromText(path, text);
     taskFileMutations++;

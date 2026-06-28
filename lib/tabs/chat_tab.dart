@@ -125,6 +125,7 @@ class _ChatTabState extends State<ChatTab> {
     final controller = widget.controller;
     final promptController = widget.promptController;
     final onChanged = widget.onChanged;
+    final profile = controller.currentProfile;
     final compactControls = MediaQuery.of(context).size.width < 720;
     final visibleMessages = controller.visibleMessages;
     if (_lastVisibleMessageCount != visibleMessages.length) {
@@ -144,6 +145,15 @@ class _ChatTabState extends State<ChatTab> {
             spacing: 8,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
+              if (profile != null && profile.kind == ProfileKind.localLlama)
+                IconButton.outlined(
+                  tooltip: 'Restart llama.cpp',
+                  onPressed: () async {
+                    await controller.restartLocalLlama();
+                    onChanged();
+                  },
+                  icon: const Icon(Icons.restart_alt),
+                ),
               SizedBox(
                 width: 310,
                 child: DropdownButtonFormField<String>(

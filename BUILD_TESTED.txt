@@ -1,11 +1,11 @@
-AI Agent v1.50
+AI Agent v1.51
 
 Checked on Windows host, 2026-06-28:
 
 - flutter analyze: passed.
 - flutter test: passed.
 - flutter build windows --release: passed.
-- build_windows.bat with SKIP_CHECKS=1: passed, copied dist/AIAgent_v1.50_windows_x64.
+- build_windows.bat with SKIP_CHECKS=1: passed, copied dist/AIAgent_v1.51_windows_x64.
 - flutter build apk --release: passed.
-- build_android.bat with SKIP_CHECKS=1: passed, copied dist/AIAgent_v1.50_android_universal.apk.
+- build_android.bat with SKIP_CHECKS=1: passed, copied dist/AIAgent_v1.51_android_universal.apk.
 - flutter build linux --release: blocked by Flutter because Linux release builds are supported only on Linux hosts. Linux runner sources are present and configured with the AIAgent executable name.

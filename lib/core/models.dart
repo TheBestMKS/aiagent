@@ -240,6 +240,25 @@ extension ProfileKindLabel on ProfileKind {
       };
 }
 
+class ModelApiStyle {
+  static const openAi = 'openai';
+  static const lmStudio = 'lmstudio';
+  static const anthropic = 'anthropic';
+  static const deepSeek = 'deepseek';
+  static const customOpenAi = 'custom_openai';
+
+  static const values = [openAi, lmStudio, anthropic, deepSeek, customOpenAi];
+
+  static String label(String style) => switch (style) {
+        openAi => 'OpenAI API',
+        lmStudio => 'LM Studio API',
+        anthropic => 'Anthropic',
+        deepSeek => 'DeepSeek/OpenAI-compatible',
+        customOpenAi => 'Другой OpenAI-compatible',
+        _ => style,
+      };
+}
+
 class ModelProfile {
   const ModelProfile({
     required this.id,
@@ -248,9 +267,12 @@ class ModelProfile {
     required this.baseUrl,
     required this.model,
     required this.apiKey,
+    required this.apiStyle,
     required this.maxContextTokens,
     required this.maxOutputTokens,
     required this.streamResponses,
+    required this.tokenLimitPauseSeconds,
+    required this.autoRestartLocalLlama,
     required this.modelPath,
     required this.mmprojPath,
     required this.llamaMode,
@@ -264,9 +286,12 @@ class ModelProfile {
           required String baseUrl,
           required String model,
           required String apiKey,
-          int maxContextTokens = 131072,
+          String apiStyle = ModelApiStyle.openAi,
+          int maxContextTokens = 0,
           int maxOutputTokens = 16384,
-          bool streamResponses = true}) =>
+          bool streamResponses = true,
+          int tokenLimitPauseSeconds = 0,
+          bool autoRestartLocalLlama = true}) =>
       ModelProfile(
         id: 'openai_${DateTime.now().microsecondsSinceEpoch}',
         name: name,
@@ -274,9 +299,12 @@ class ModelProfile {
         baseUrl: baseUrl,
         model: model,
         apiKey: apiKey,
+        apiStyle: apiStyle,
         maxContextTokens: maxContextTokens,
         maxOutputTokens: maxOutputTokens,
         streamResponses: streamResponses,
+        tokenLimitPauseSeconds: tokenLimitPauseSeconds,
+        autoRestartLocalLlama: autoRestartLocalLlama,
         modelPath: '',
         mmprojPath: '',
         llamaMode: '',
@@ -296,7 +324,9 @@ class ModelProfile {
           required int llamaPort,
           required LlamaSettings llamaSettings,
           int maxOutputTokens = 16384,
-          bool streamResponses = true}) =>
+          bool streamResponses = true,
+          int tokenLimitPauseSeconds = 0,
+          bool autoRestartLocalLlama = true}) =>
       ModelProfile(
         id: 'llama_${DateTime.now().microsecondsSinceEpoch}',
         name: name,
@@ -304,9 +334,12 @@ class ModelProfile {
         baseUrl: baseUrl,
         model: model,
         apiKey: '',
+        apiStyle: ModelApiStyle.lmStudio,
         maxContextTokens: llamaSettings.contextLength,
         maxOutputTokens: maxOutputTokens,
         streamResponses: streamResponses,
+        tokenLimitPauseSeconds: tokenLimitPauseSeconds,
+        autoRestartLocalLlama: autoRestartLocalLlama,
         modelPath: modelPath,
         mmprojPath: mmprojPath,
         llamaMode: llamaMode,
@@ -325,11 +358,18 @@ class ModelProfile {
         baseUrl: json['baseUrl']?.toString() ?? '',
         model: json['model']?.toString() ?? '',
         apiKey: json['apiKey']?.toString() ?? '',
+        apiStyle: json['apiStyle']?.toString() ??
+            (json['kind'] == 'localLlama'
+                ? ModelApiStyle.lmStudio
+                : ModelApiStyle.openAi),
         maxContextTokens:
-            int.tryParse(json['maxContextTokens']?.toString() ?? '') ?? 131072,
+            int.tryParse(json['maxContextTokens']?.toString() ?? '') ?? 0,
         maxOutputTokens:
             int.tryParse(json['maxOutputTokens']?.toString() ?? '') ?? 16384,
         streamResponses: json['streamResponses'] != false,
+        tokenLimitPauseSeconds:
+            int.tryParse(json['tokenLimitPauseSeconds']?.toString() ?? '') ?? 0,
+        autoRestartLocalLlama: json['autoRestartLocalLlama'] != false,
         modelPath: json['modelPath']?.toString() ?? '',
         mmprojPath: json['mmprojPath']?.toString() ?? '',
         llamaMode: json['llamaMode']?.toString() ?? '',
@@ -347,9 +387,12 @@ class ModelProfile {
   final String baseUrl;
   final String model;
   final String apiKey;
+  final String apiStyle;
   final int maxContextTokens;
   final int maxOutputTokens;
   final bool streamResponses;
+  final int tokenLimitPauseSeconds;
+  final bool autoRestartLocalLlama;
   final String modelPath;
   final String mmprojPath;
   final String llamaMode;
@@ -364,9 +407,12 @@ class ModelProfile {
         'baseUrl': baseUrl,
         'model': model,
         'apiKey': apiKey,
+        'apiStyle': apiStyle,
         'maxContextTokens': maxContextTokens,
         'maxOutputTokens': maxOutputTokens,
         'streamResponses': streamResponses,
+        'tokenLimitPauseSeconds': tokenLimitPauseSeconds,
+        'autoRestartLocalLlama': autoRestartLocalLlama,
         'modelPath': modelPath,
         'mmprojPath': mmprojPath,
         'llamaMode': llamaMode,
@@ -381,9 +427,12 @@ class ModelProfile {
           String? baseUrl,
           String? model,
           String? apiKey,
+          String? apiStyle,
           int? maxContextTokens,
           int? maxOutputTokens,
           bool? streamResponses,
+          int? tokenLimitPauseSeconds,
+          bool? autoRestartLocalLlama,
           String? modelPath,
           String? mmprojPath,
           String? llamaMode,
@@ -397,9 +446,14 @@ class ModelProfile {
         baseUrl: baseUrl ?? this.baseUrl,
         model: model ?? this.model,
         apiKey: apiKey ?? this.apiKey,
+        apiStyle: apiStyle ?? this.apiStyle,
         maxContextTokens: maxContextTokens ?? this.maxContextTokens,
         maxOutputTokens: maxOutputTokens ?? this.maxOutputTokens,
         streamResponses: streamResponses ?? this.streamResponses,
+        tokenLimitPauseSeconds:
+            tokenLimitPauseSeconds ?? this.tokenLimitPauseSeconds,
+        autoRestartLocalLlama:
+            autoRestartLocalLlama ?? this.autoRestartLocalLlama,
         modelPath: modelPath ?? this.modelPath,
         mmprojPath: mmprojPath ?? this.mmprojPath,
         llamaMode: llamaMode ?? this.llamaMode,

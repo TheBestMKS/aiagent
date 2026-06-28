@@ -67,12 +67,36 @@ List<List<String>> splitTableRows(String text) {
     return [
       ['']
     ];
+  final markdownRows = <List<String>>[];
+  for (var i = 0; i < lines.length; i++) {
+    final line = lines[i].trim();
+    if (!line.contains('|')) continue;
+    if (i + 1 < lines.length &&
+        RegExp(r'^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$')
+            .hasMatch(lines[i + 1].trim())) {
+      markdownRows.add(_splitMarkdownTableRow(line));
+      i += 2;
+      while (i < lines.length && lines[i].contains('|')) {
+        markdownRows.add(_splitMarkdownTableRow(lines[i].trim()));
+        i++;
+      }
+      break;
+    }
+  }
+  if (markdownRows.isNotEmpty) return markdownRows;
   return lines.map((line) {
     final separator =
         line.contains('\t') ? '\t' : (line.contains(';') ? ';' : ',');
     final cells = line.split(separator).map((c) => c.trim()).toList();
     return cells.isEmpty ? [''] : cells;
   }).toList();
+}
+
+List<String> _splitMarkdownTableRow(String line) {
+  var raw = line.trim();
+  if (raw.startsWith('|')) raw = raw.substring(1);
+  if (raw.endsWith('|')) raw = raw.substring(0, raw.length - 1);
+  return raw.split('|').map((cell) => cell.trim()).toList();
 }
 
 List<String> splitSlides(String text) {

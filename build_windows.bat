@@ -11,7 +11,7 @@ if /I not "%SKIP_CHECKS%"=="1" (
 )
 call "%FLUTTER%" build windows --release || goto fail
 set "APP_NAME=AIAgent"
-set "APP_VERSION=v1.50"
+set "APP_VERSION=v1.51"
 set "APP_PLATFORM=windows"
 set "APP_ARCH=x64"
 set "DIST_ROOT=%PROJECT_ROOT%dist"

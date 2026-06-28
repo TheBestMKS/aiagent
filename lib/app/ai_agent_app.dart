@@ -189,6 +189,10 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (widget.controller.initializationFailed) return;
     askedLocalLlama = true;
+    if (widget.controller.profiles
+        .any((profile) => profile.kind == ProfileKind.localLlama)) {
+      return;
+    }
     final candidates = await widget.controller.scanLocalLlamaCandidates();
     if (candidates.isEmpty || !mounted) return;
     await showDialog<void>(
@@ -205,53 +209,133 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final controller = widget.controller;
     return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final narrow = constraints.maxWidth < 820;
-          if (narrow) {
-            return Stack(
-              children: [
-                Positioned.fill(child: _mainArea(controller)),
-                Positioned(
-                  left: 12,
-                  top: 12,
-                  child: FloatingActionButton.small(
-                    heroTag: 'open_project_panel',
-                    tooltip: 'Проекты',
-                    onPressed: () async {
-                      await showModalBottomSheet<void>(
-                        context: context,
-                        isScrollControlled: true,
-                        builder: (_) => SafeArea(
-                          child: SizedBox(
-                            height: MediaQuery.of(context).size.height * 0.82,
-                            child: ProjectPanel(
-                                controller: controller,
-                                onChanged: () => setState(() {})),
-                          ),
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final narrow = constraints.maxWidth < 820;
+                if (narrow) {
+                  return Stack(
+                    children: [
+                      Positioned.fill(child: _mainArea(controller)),
+                      Positioned(
+                        left: 12,
+                        top: 12,
+                        child: FloatingActionButton.small(
+                          heroTag: 'open_project_panel',
+                          tooltip: 'Проекты',
+                          onPressed: () async {
+                            await showModalBottomSheet<void>(
+                              context: context,
+                              isScrollControlled: true,
+                              builder: (_) => SafeArea(
+                                child: SizedBox(
+                                  height:
+                                      MediaQuery.of(context).size.height * 0.82,
+                                  child: ProjectPanel(
+                                      controller: controller,
+                                      onChanged: () => setState(() {})),
+                                ),
+                              ),
+                            );
+                          },
+                          child: const Icon(Icons.menu_open),
                         ),
-                      );
-                    },
-                    child: const Icon(Icons.menu_open),
+                      ),
+                    ],
+                  );
+                }
+                return Row(
+                  children: [
+                    if (!projectPanelCollapsed) ...[
+                      SizedBox(
+                        width: 290,
+                        child: ProjectPanel(
+                            controller: controller,
+                            onChanged: () => setState(() {})),
+                      ),
+                      const VerticalDivider(width: 1),
+                    ],
+                    Expanded(child: _mainArea(controller)),
+                  ],
+                );
+              },
+            ),
+          ),
+          if (controller.heavyTaskStatus != null) _heavyTaskOverlay(controller),
+        ],
+      ),
+    );
+  }
+
+  Widget _heavyTaskOverlay(AgentController controller) {
+    final task = controller.heavyTaskStatus;
+    if (task == null) return const SizedBox.shrink();
+    final remaining = task.remainingSeconds > 0
+        ? '${(task.remainingSeconds ~/ 60).toString().padLeft(2, '0')}:${(task.remainingSeconds % 60).toString().padLeft(2, '0')}'
+        : '';
+    return Positioned(
+      left: controller.heavyTaskOffset.dx,
+      top: controller.heavyTaskOffset.dy,
+      child: GestureDetector(
+        onPanUpdate: (details) => setState(() {
+          controller.moveHeavyTaskStatus(details.delta.dx, details.delta.dy);
+        }),
+        child: Material(
+          elevation: 10,
+          color: Theme.of(context).colorScheme.surface,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            width: 360,
+            constraints: const BoxConstraints(maxWidth: 420),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Theme.of(context).dividerColor),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.hourglass_top, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(task.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w700)),
+                    ),
+                    if (remaining.isNotEmpty)
+                      Text(remaining,
+                          style: Theme.of(context).textTheme.labelMedium),
+                  ],
+                ),
+                if (task.detail.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Text(task.detail,
+                      maxLines: 3, overflow: TextOverflow.ellipsis),
+                ],
+                const SizedBox(height: 10),
+                LinearProgressIndicator(value: task.progress),
+                if (task.canContinue) ...[
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: () =>
+                          setState(controller.continueAfterTokenPause),
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text('Continue'),
+                    ),
                   ),
-                ),
+                ],
               ],
-            );
-          }
-          return Row(
-            children: [
-              if (!projectPanelCollapsed) ...[
-                SizedBox(
-                  width: 290,
-                  child: ProjectPanel(
-                      controller: controller, onChanged: () => setState(() {})),
-                ),
-                const VerticalDivider(width: 1),
-              ],
-              Expanded(child: _mainArea(controller)),
-            ],
-          );
-        },
+            ),
+          ),
+        ),
       ),
     );
   }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.51.0+51 - 2026-06-28
+
+- Reworked `llama.cpp` backend folders to `tools/llama.cpp/<os_arch>/<backend>` and added the full requested Windows/Linux/Android variant matrix.
+- Fixed release-asset selection so Windows x64 cannot accidentally install arm64 archives; installer now falls back to `tools/downloads` when online release lookup/download is unavailable.
+- Local model profiles now list only installed `llama-server` backends, keep per-profile auto-restart settings, and support an icon-only restart button in Chat.
+- Added draggable heavy-task status overlay for model startup/install and token-limit wait timers.
+- Added process-tree shutdown for local llama on Windows, app-shutdown cleanup, periodic process/API health checks, and optional automatic restore.
+- Added API style, runtime-only remote limit probing, token-limit pause duration, and profile context actions for check/edit/delete.
+- Expanded schedule editor with one-time time selection and structured yearly/monthly/weekly/daily/hourly/minutely parameters; added a lightweight due scheduler for project prompts.
+- Improved office document generation: placeholder output is blocked, markdown tables become real DOCX/XLSX tables, XLSX formulas are written as formulas, and DOCX can embed local markdown image references.
+
 ## 1.50.0+50 - 2026-06-28
 
 - Added native WebView browsing for Windows WebView2 and Android platform WebView, with text/source fallback preserved.

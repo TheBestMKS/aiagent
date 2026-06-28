@@ -48,10 +48,7 @@ class OfficeDocumentBuilder {
   }
 
   List<int> buildDocxBytes(String text) {
-    final paragraphs = splitParagraphs(text)
-        .map((p) =>
-            '<w:p><w:r><w:t xml:space="preserve">${xmlEscape(p)}</w:t></w:r></w:p>')
-        .join();
+    final docx = _docxPartsFromText(text);
     final archive = Archive();
     archiveAddUtf8(archive, '[Content_Types].xml', _docxContentTypes());
     archiveAddUtf8(
@@ -60,14 +57,18 @@ class OfficeDocumentBuilder {
         _packageRels(
             'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument',
             'word/document.xml'));
-    archiveAddUtf8(
-        archive, 'word/_rels/document.xml.rels', _emptyRelationships());
+    archiveAddUtf8(archive, 'word/_rels/document.xml.rels',
+        _docxRelationships(docx.images));
     archiveAddUtf8(archive, 'word/styles.xml', _docxStyles());
+    for (final image in docx.images) {
+      archive
+          .addFile(ArchiveFile.bytes('word/media/${image.name}', image.bytes));
+    }
     archiveAddUtf8(archive, 'word/document.xml',
         '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
   <w:body>
-    $paragraphs
+    ${docx.body}
     <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
   </w:body>
 </w:document>''');
@@ -81,8 +82,14 @@ class OfficeDocumentBuilder {
       sheetRows.write('<row r="${r + 1}">');
       for (var c = 0; c < rows[r].length; c++) {
         final ref = '${_xlsxColumnName(c + 1)}${r + 1}';
-        sheetRows.write(
-            '<c r="$ref" t="inlineStr"><is><t>${xmlEscape(rows[r][c])}</t></is></c>');
+        final value = rows[r][c];
+        if (value.trim().startsWith('=') && value.trim().length > 1) {
+          sheetRows.write(
+              '<c r="$ref"><f>${xmlEscape(value.trim().substring(1))}</f></c>');
+        } else {
+          sheetRows.write(
+              '<c r="$ref" t="inlineStr"><is><t>${xmlEscape(value)}</t></is></c>');
+        }
       }
       sheetRows.write('</row>');
     }
@@ -224,15 +231,157 @@ class OfficeDocumentBuilder {
   <Relationship Id="rId1" Type="$type" Target="$target"/>
 </Relationships>''';
 
-  String _emptyRelationships() =>
-      '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>''';
+  _DocxBuildParts _docxPartsFromText(String text) {
+    final lines =
+        text.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n');
+    final buffer = StringBuffer();
+    final images = <_DocxImagePart>[];
+    var i = 0;
+    while (i < lines.length) {
+      final line = lines[i].trimRight();
+      if (line.trim().isEmpty) {
+        i++;
+        continue;
+      }
+      final imageMatch =
+          RegExp(r'!\[([^\]]*)\]\(([^)]+)\)').firstMatch(line.trim());
+      if (imageMatch != null) {
+        final imagePath = imageMatch.group(2)?.trim() ?? '';
+        final file = File(imagePath);
+        if (file.existsSync()) {
+          final dot = file.path.lastIndexOf('.');
+          final ext =
+              dot < 0 ? 'png' : file.path.substring(dot + 1).toLowerCase();
+          final safeExt = ext == 'jpg' ? 'jpeg' : (ext.isEmpty ? 'png' : ext);
+          final image = _DocxImagePart(
+              relId: 'rIdImage${images.length + 1}',
+              name: 'image${images.length + 1}.$safeExt',
+              bytes: file.readAsBytesSync());
+          images.add(image);
+          buffer.write(_docxImageParagraph(image, imageMatch.group(1) ?? ''));
+          i++;
+          continue;
+        }
+      }
+      if (_looksLikeMarkdownTable(lines, i)) {
+        final tableRows = <List<String>>[];
+        tableRows.add(_splitMarkdownTableRow(lines[i]));
+        i += 2;
+        while (i < lines.length && lines[i].contains('|')) {
+          tableRows.add(_splitMarkdownTableRow(lines[i]));
+          i++;
+        }
+        buffer.write(_docxTable(tableRows));
+        continue;
+      }
+      buffer.write(_docxParagraph(line));
+      i++;
+    }
+    if (buffer.isEmpty) buffer.write(_docxParagraph(text.trim()));
+    return _DocxBuildParts(buffer.toString(), images);
+  }
+
+  bool _looksLikeMarkdownTable(List<String> lines, int index) {
+    if (index + 1 >= lines.length) return false;
+    if (!lines[index].contains('|')) return false;
+    final sep = lines[index + 1].trim();
+    return RegExp(r'^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$').hasMatch(sep);
+  }
+
+  List<String> _splitMarkdownTableRow(String line) {
+    var raw = line.trim();
+    if (raw.startsWith('|')) raw = raw.substring(1);
+    if (raw.endsWith('|')) raw = raw.substring(0, raw.length - 1);
+    return raw.split('|').map((cell) => cell.trim()).toList();
+  }
+
+  String _docxParagraph(String raw) {
+    var text = raw.trim();
+    var bold = false;
+    var size = '22';
+    if (text.startsWith('#')) {
+      final level = RegExp(r'^#+').firstMatch(text)?.group(0)?.length ?? 1;
+      text = text.replaceFirst(RegExp(r'^#+\s*'), '');
+      bold = true;
+      size = level <= 1 ? '32' : (level == 2 ? '28' : '24');
+    } else if (text.startsWith('- ') || text.startsWith('* ')) {
+      text = '• ${text.substring(2).trim()}';
+    }
+    final props = bold ? '<w:rPr><w:b/><w:sz w:val="$size"/></w:rPr>' : '';
+    return '<w:p><w:r>$props<w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p>';
+  }
+
+  String _docxTable(List<List<String>> rows) {
+    final rowXml = rows.map((row) {
+      final cells = row
+          .map((cell) =>
+              '<w:tc><w:tcPr><w:tcW w:w="2400" w:type="dxa"/></w:tcPr>${_docxParagraph(cell)}</w:tc>')
+          .join();
+      return '<w:tr>$cells</w:tr>';
+    }).join();
+    return '''
+<w:tbl>
+  <w:tblPr>
+    <w:tblBorders>
+      <w:top w:val="single" w:sz="6" w:space="0" w:color="999999"/>
+      <w:left w:val="single" w:sz="6" w:space="0" w:color="999999"/>
+      <w:bottom w:val="single" w:sz="6" w:space="0" w:color="999999"/>
+      <w:right w:val="single" w:sz="6" w:space="0" w:color="999999"/>
+      <w:insideH w:val="single" w:sz="6" w:space="0" w:color="999999"/>
+      <w:insideV w:val="single" w:sz="6" w:space="0" w:color="999999"/>
+    </w:tblBorders>
+  </w:tblPr>
+  $rowXml
+</w:tbl>''';
+  }
+
+  String _docxRelationships(List<_DocxImagePart> images) {
+    final buffer =
+        StringBuffer('''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">''');
+    for (final image in images) {
+      buffer.write(
+          '<Relationship Id="${image.relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${image.name}"/>');
+    }
+    buffer.write('</Relationships>');
+    return buffer.toString();
+  }
+
+  String _docxImageParagraph(_DocxImagePart image, String caption) {
+    const cx = 4572000;
+    const cy = 3000000;
+    final descr = xmlEscape(caption.isEmpty ? image.name : caption);
+    return '''
+<w:p>
+  <w:r>
+    <w:drawing>
+      <wp:inline distT="0" distB="0" distL="0" distR="0">
+        <wp:extent cx="$cx" cy="$cy"/>
+        <wp:docPr id="1" name="$descr"/>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+            <pic:pic>
+              <pic:nvPicPr><pic:cNvPr id="0" name="$descr"/><pic:cNvPicPr/></pic:nvPicPr>
+              <pic:blipFill><a:blip r:embed="${image.relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+              <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="$cx" cy="$cy"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+            </pic:pic>
+          </a:graphicData>
+        </a:graphic>
+      </wp:inline>
+    </w:drawing>
+  </w:r>
+</w:p>${caption.trim().isEmpty ? '' : _docxParagraph(caption)}''';
+  }
 
   String _docxContentTypes() =>
       '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="jpg" ContentType="image/jpeg"/>
+  <Default Extension="jpeg" ContentType="image/jpeg"/>
+  <Default Extension="gif" ContentType="image/gif"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
 </Types>''';
@@ -337,4 +486,18 @@ class OfficeDocumentBuilder {
   <office:body><office:presentation>$slides</office:presentation></office:body>
 </office:document-content>''';
   }
+}
+
+class _DocxBuildParts {
+  const _DocxBuildParts(this.body, this.images);
+  final String body;
+  final List<_DocxImagePart> images;
+}
+
+class _DocxImagePart {
+  const _DocxImagePart(
+      {required this.relId, required this.name, required this.bytes});
+  final String relId;
+  final String name;
+  final List<int> bytes;
 }

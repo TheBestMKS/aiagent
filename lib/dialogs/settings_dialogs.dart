@@ -53,7 +53,7 @@ class _SettingsTabState extends State<SettingsTab> {
   final TextEditingController apiKeyController = TextEditingController();
   final TextEditingController modelController = TextEditingController();
   final TextEditingController contextController =
-      TextEditingController(text: '131072');
+      TextEditingController(text: '0');
   final TextEditingController outputController =
       TextEditingController(text: '16384');
   final TextEditingController probeHostController =
@@ -65,9 +65,19 @@ class _SettingsTabState extends State<SettingsTab> {
   final TextEditingController mmprojPathController = TextEditingController();
   final TextEditingController llamaPortController =
       TextEditingController(text: '1234');
+  final TextEditingController pauseDaysController =
+      TextEditingController(text: '0');
+  final TextEditingController pauseHoursController =
+      TextEditingController(text: '0');
+  final TextEditingController pauseMinutesController =
+      TextEditingController(text: '0');
+  final TextEditingController pauseSecondsController =
+      TextEditingController(text: '0');
   String profileKind = ProfileKind.openAiCompatible.name;
+  String apiStyle = ModelApiStyle.openAi;
   String llamaMode = 'cpu';
   bool streamResponses = true;
+  bool autoRestartLocalLlama = true;
 
   @override
   void dispose() {
@@ -83,6 +93,10 @@ class _SettingsTabState extends State<SettingsTab> {
     modelPathController.dispose();
     mmprojPathController.dispose();
     llamaPortController.dispose();
+    pauseDaysController.dispose();
+    pauseHoursController.dispose();
+    pauseMinutesController.dispose();
+    pauseSecondsController.dispose();
     super.dispose();
   }
 
@@ -99,7 +113,22 @@ class _SettingsTabState extends State<SettingsTab> {
     mmprojPathController.text = profile.mmprojPath;
     llamaPortController.text = profile.llamaPort.toString();
     llamaMode = profile.llamaMode.trim().isEmpty ? 'cpu' : profile.llamaMode;
+    apiStyle = profile.apiStyle;
     streamResponses = profile.streamResponses;
+    autoRestartLocalLlama = profile.autoRestartLocalLlama;
+    final pause = profile.tokenLimitPauseSeconds;
+    pauseDaysController.text = (pause ~/ 86400).toString();
+    pauseHoursController.text = ((pause % 86400) ~/ 3600).toString();
+    pauseMinutesController.text = ((pause % 3600) ~/ 60).toString();
+    pauseSecondsController.text = (pause % 60).toString();
+  }
+
+  int tokenLimitPauseSecondsFromFields() {
+    final days = int.tryParse(pauseDaysController.text.trim()) ?? 0;
+    final hours = int.tryParse(pauseHoursController.text.trim()) ?? 0;
+    final minutes = int.tryParse(pauseMinutesController.text.trim()) ?? 0;
+    final seconds = int.tryParse(pauseSecondsController.text.trim()) ?? 0;
+    return math.max(0, days * 86400 + hours * 3600 + minutes * 60 + seconds);
   }
 
   @override
@@ -107,6 +136,19 @@ class _SettingsTabState extends State<SettingsTab> {
     final controller = widget.controller;
     final selected = controller.currentProfile;
     if (selected != null && nameController.text.isEmpty) loadProfile(selected);
+    final installedLlamaVariants =
+        controller.compatibleLlamaBackendVariants().where((variant) {
+      final dir = pathJoin(
+          controller.appRootPath,
+          controller.llamaInstallRelativeDir(variant.backend,
+              platformKey: variant.platformKey));
+      return controller.findLlamaServer(dir) != null;
+    }).toList();
+    if (installedLlamaVariants.isEmpty &&
+        llamaMode.trim().isNotEmpty &&
+        controller.llamaVariantByBackend(llamaMode) != null) {
+      installedLlamaVariants.add(controller.llamaVariantByBackend(llamaMode)!);
+    }
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -131,6 +173,49 @@ class _SettingsTabState extends State<SettingsTab> {
               )
               .toList(),
         ),
+        for (final p in controller.profiles)
+          ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            title: Text(p.name),
+            subtitle: Text('${p.kind.label} • ${p.baseUrl}',
+                maxLines: 1, overflow: TextOverflow.ellipsis),
+            trailing: PopupMenuButton<String>(
+              tooltip: 'Profile actions',
+              onSelected: (value) async {
+                if (value == 'check') {
+                  await controller.selectProfile(p.id);
+                  final limits = await controller
+                      .refreshRuntimeLimitsForProfile(p, force: true);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(
+                          'ctx=${limits.contextTokens ?? 'unknown'}, output=${limits.outputTokens ?? 'unknown'}, source=${limits.source}'),
+                    ));
+                  }
+                } else if (value == 'edit') {
+                  await controller.selectProfile(p.id);
+                  loadProfile(p);
+                  setState(() {});
+                } else if (value == 'delete') {
+                  controller.profiles.removeWhere((e) => e.id == p.id);
+                  controller.selectedProfileId = controller.profiles.isEmpty
+                      ? ''
+                      : controller.profiles.first.id;
+                  await controller.saveProfiles();
+                  await controller.refreshAvailableModels();
+                  widget.onChanged();
+                  setState(() {});
+                }
+              },
+              itemBuilder: (context) => const [
+                PopupMenuItem(
+                    value: 'check', child: Text('Проверить доступность')),
+                PopupMenuItem(value: 'edit', child: Text('Изменить')),
+                PopupMenuItem(value: 'delete', child: Text('Удалить')),
+              ],
+            ),
+          ),
         const SizedBox(height: 16),
         TextField(
             controller: nameController,
@@ -151,6 +236,19 @@ class _SettingsTabState extends State<SettingsTab> {
               setState(() => profileKind = value ?? 'openAiCompatible'),
         ),
         const SizedBox(height: 8),
+        DropdownButtonFormField<String>(
+          initialValue: apiStyle,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              labelText: 'API processing style', border: OutlineInputBorder()),
+          items: ModelApiStyle.values
+              .map((style) => DropdownMenuItem(
+                  value: style, child: Text(ModelApiStyle.label(style))))
+              .toList(),
+          onChanged: (value) =>
+              setState(() => apiStyle = value ?? ModelApiStyle.openAi),
+        ),
+        const SizedBox(height: 8),
         if (profileKind == ProfileKind.localLlama.name) ...[
           Row(
             children: [
@@ -159,11 +257,10 @@ class _SettingsTabState extends State<SettingsTab> {
                   initialValue: llamaMode,
                   decoration: const InputDecoration(
                       labelText: 'Backend', border: OutlineInputBorder()),
-                  items: const [
-                    DropdownMenuItem(value: 'cpu', child: Text('CPU')),
-                    DropdownMenuItem(value: 'vulkan', child: Text('Vulkan')),
-                    DropdownMenuItem(value: 'cuda', child: Text('CUDA')),
-                  ],
+                  items: installedLlamaVariants
+                      .map((variant) => DropdownMenuItem(
+                          value: variant.backend, child: Text(variant.label)))
+                      .toList(),
                   onChanged: (value) =>
                       setState(() => llamaMode = value ?? 'cpu'),
                 ),
@@ -201,6 +298,12 @@ class _SettingsTabState extends State<SettingsTab> {
                 labelText: 'mmproj .gguf (необязательно)',
                 border: OutlineInputBorder()),
           ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: autoRestartLocalLlama,
+            title: const Text('Auto-restart llama.cpp server'),
+            onChanged: (value) => setState(() => autoRestartLocalLlama = value),
+          ),
           const SizedBox(height: 8),
         ],
         TextField(
@@ -236,6 +339,28 @@ class _SettingsTabState extends State<SettingsTab> {
                     decoration: const InputDecoration(
                         labelText: 'Max output tokens',
                         border: OutlineInputBorder()))),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            for (final entry in [
+              ('Days', pauseDaysController),
+              ('Hours', pauseHoursController),
+              ('Minutes', pauseMinutesController),
+              ('Seconds', pauseSecondsController),
+            ]) ...[
+              Expanded(
+                child: TextField(
+                  controller: entry.$2,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                      labelText: 'Limit pause ${entry.$1}',
+                      border: const OutlineInputBorder()),
+                ),
+              ),
+              if (entry.$1 != 'Seconds') const SizedBox(width: 8),
+            ],
           ],
         ),
         const SizedBox(height: 8),
@@ -280,6 +405,9 @@ class _SettingsTabState extends State<SettingsTab> {
                         maxOutputTokens:
                             int.tryParse(outputController.text.trim()) ?? 16384,
                         streamResponses: streamResponses,
+                        tokenLimitPauseSeconds:
+                            tokenLimitPauseSecondsFromFields(),
+                        autoRestartLocalLlama: autoRestartLocalLlama,
                       )
                     : ModelProfile.openAiCompatible(
                         name: nameController.text.trim().isEmpty
@@ -288,12 +416,14 @@ class _SettingsTabState extends State<SettingsTab> {
                         baseUrl: baseUrlController.text.trim(),
                         model: modelController.text.trim(),
                         apiKey: apiKeyController.text.trim(),
+                        apiStyle: apiStyle,
                         maxContextTokens:
-                            int.tryParse(contextController.text.trim()) ??
-                                131072,
+                            int.tryParse(contextController.text.trim()) ?? 0,
                         maxOutputTokens:
                             int.tryParse(outputController.text.trim()) ?? 16384,
                         streamResponses: streamResponses,
+                        tokenLimitPauseSeconds:
+                            tokenLimitPauseSecondsFromFields(),
                       );
                 await controller.upsertProfile(profile, select: true);
                 widget.onChanged();
@@ -420,6 +550,13 @@ class _LlamaCppInstallDialogState extends State<LlamaCppInstallDialog> {
   final TextEditingController archiveController = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    final variants = widget.controller.compatibleLlamaBackendVariants();
+    if (variants.isNotEmpty) mode = variants.first.backend;
+  }
+
+  @override
   void dispose() {
     archiveController.dispose();
     super.dispose();
@@ -436,17 +573,17 @@ class _LlamaCppInstallDialogState extends State<LlamaCppInstallDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-                'Программа скачает подходящий архив из последнего релиза GitHub ggml-org/llama.cpp и распакует его в tooling/llama.cpp/<режим>. На Android будет выбран Android-архив, если он есть в релизе.'),
+                'Программа скачает подходящий архив из последнего релиза GitHub ggml-org/llama.cpp или возьмет его из tools/downloads и распакует в tools/llama.cpp/<os_arch>/<backend>.'),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               initialValue: mode,
               decoration: const InputDecoration(
                   labelText: 'Вариант работы', border: OutlineInputBorder()),
-              items: const [
-                DropdownMenuItem(value: 'cpu', child: Text('CPU')),
-                DropdownMenuItem(value: 'vulkan', child: Text('Vulkan')),
-                DropdownMenuItem(value: 'cuda', child: Text('CUDA')),
-              ],
+              items: widget.controller
+                  .compatibleLlamaBackendVariants()
+                  .map((variant) => DropdownMenuItem(
+                      value: variant.backend, child: Text(variant.label)))
+                  .toList(),
               onChanged: busy ? null : (v) => setState(() => mode = v ?? 'cpu'),
             ),
             const SizedBox(height: 12),
@@ -2658,6 +2795,18 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
   late bool enabled;
   late bool onceEnabled;
   late DateTime? onceDate;
+  late TimeOfDay onceTime;
+  late final TextEditingController yearlyMonthsController;
+  late final TextEditingController yearlyDayController;
+  late final TextEditingController yearlyTimeController;
+  late final TextEditingController monthlyDayController;
+  late final TextEditingController monthlyTimeController;
+  late final TextEditingController weeklyDaysController;
+  late final TextEditingController weeklyTimeController;
+  late final TextEditingController dailyTimeController;
+  late final TextEditingController hourlyMinuteController;
+  late final TextEditingController hourlySecondController;
+  late final TextEditingController minutelySecondController;
   final repeat = <String, bool>{
     'yearly': false,
     'monthly': false,
@@ -2684,7 +2833,8 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     final repeatData =
         data['repeat'] is Map ? Map<String, dynamic>.from(data['repeat']) : {};
     for (final key in repeat.keys.toList()) {
-      repeat[key] = repeatData[key] == true;
+      final raw = repeatData[key];
+      repeat[key] = raw == true || (raw is Map && raw['enabled'] == true);
     }
     triggerIds = (data['triggerIds'] as List<dynamic>? ?? [])
         .map((e) => e.toString())
@@ -2692,6 +2842,35 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     enabled = schedule?.enabled ?? true;
     onceEnabled = once['enabled'] == true;
     onceDate = DateTime.tryParse(once['date']?.toString() ?? '');
+    final onceParsed = onceDate ?? DateTime.now();
+    onceTime = TimeOfDay(hour: onceParsed.hour, minute: onceParsed.minute);
+    Map<String, dynamic> repeatMap(String key) => repeatData[key] is Map
+        ? Map<String, dynamic>.from(repeatData[key])
+        : {};
+    String repeatText(String key, String field, String fallback) =>
+        repeatMap(key)[field]?.toString() ?? fallback;
+    yearlyMonthsController = TextEditingController(
+        text: repeatText('yearly', 'months', DateTime.now().month.toString()));
+    yearlyDayController =
+        TextEditingController(text: repeatText('yearly', 'day', '1'));
+    yearlyTimeController =
+        TextEditingController(text: repeatText('yearly', 'time', '09:00:00'));
+    monthlyDayController =
+        TextEditingController(text: repeatText('monthly', 'day', '1'));
+    monthlyTimeController =
+        TextEditingController(text: repeatText('monthly', 'time', '09:00:00'));
+    weeklyDaysController =
+        TextEditingController(text: repeatText('weekly', 'weekdays', '1'));
+    weeklyTimeController =
+        TextEditingController(text: repeatText('weekly', 'time', '09:00:00'));
+    dailyTimeController =
+        TextEditingController(text: repeatText('daily', 'time', '09:00:00'));
+    hourlyMinuteController =
+        TextEditingController(text: repeatText('hourly', 'minute', '0'));
+    hourlySecondController =
+        TextEditingController(text: repeatText('hourly', 'second', '0'));
+    minutelySecondController =
+        TextEditingController(text: repeatText('minutely', 'second', '0'));
     nameController =
         TextEditingController(text: schedule?.name ?? 'Новое расписание');
     promptController = TextEditingController(text: schedule?.prompt ?? '');
@@ -2710,6 +2889,17 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     nameController.dispose();
     promptController.dispose();
     formatPromptController.dispose();
+    yearlyMonthsController.dispose();
+    yearlyDayController.dispose();
+    yearlyTimeController.dispose();
+    monthlyDayController.dispose();
+    monthlyTimeController.dispose();
+    weeklyDaysController.dispose();
+    weeklyTimeController.dispose();
+    dailyTimeController.dispose();
+    hourlyMinuteController.dispose();
+    hourlySecondController.dispose();
+    minutelySecondController.dispose();
     super.dispose();
   }
 
@@ -2750,13 +2940,77 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     }
   }
 
+  String _timeText(TimeOfDay time) =>
+      '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}:00';
+
+  List<int> _intList(TextEditingController controller,
+      {required int min, required int max}) {
+    final values = controller.text
+        .split(RegExp(r'[,; ]+'))
+        .map((e) => int.tryParse(e.trim()))
+        .whereType<int>()
+        .where((e) => e >= min && e <= max)
+        .toSet()
+        .toList()
+      ..sort();
+    return values.isEmpty ? [min] : values;
+  }
+
+  int _intValue(TextEditingController controller, int fallback,
+      {required int min, required int max}) {
+    final value = int.tryParse(controller.text.trim()) ?? fallback;
+    return value.clamp(min, max).toInt();
+  }
+
   AgentScheduleConfig _buildSchedule() {
+    final onceDateTime = onceDate == null
+        ? null
+        : DateTime(onceDate!.year, onceDate!.month, onceDate!.day,
+            onceTime.hour, onceTime.minute);
     final scheduleJson = jsonEncode({
       'once': {
         'enabled': onceEnabled,
-        'date': onceDate?.toIso8601String() ?? '',
+        'date': onceDateTime?.toIso8601String() ?? '',
       },
-      'repeat': repeat,
+      'repeat': {
+        'yearly': {
+          'enabled': repeat['yearly'] == true,
+          'months': _intList(yearlyMonthsController, min: 1, max: 12),
+          'day': _intValue(yearlyDayController, 1, min: 1, max: 31),
+          'time': yearlyTimeController.text.trim().isEmpty
+              ? '09:00:00'
+              : yearlyTimeController.text.trim(),
+        },
+        'monthly': {
+          'enabled': repeat['monthly'] == true,
+          'day': _intValue(monthlyDayController, 1, min: 1, max: 31),
+          'time': monthlyTimeController.text.trim().isEmpty
+              ? '09:00:00'
+              : monthlyTimeController.text.trim(),
+        },
+        'weekly': {
+          'enabled': repeat['weekly'] == true,
+          'weekdays': _intList(weeklyDaysController, min: 1, max: 7),
+          'time': weeklyTimeController.text.trim().isEmpty
+              ? '09:00:00'
+              : weeklyTimeController.text.trim(),
+        },
+        'daily': {
+          'enabled': repeat['daily'] == true,
+          'time': dailyTimeController.text.trim().isEmpty
+              ? '09:00:00'
+              : dailyTimeController.text.trim(),
+        },
+        'hourly': {
+          'enabled': repeat['hourly'] == true,
+          'minute': _intValue(hourlyMinuteController, 0, min: 0, max: 59),
+          'second': _intValue(hourlySecondController, 0, min: 0, max: 59),
+        },
+        'minutely': {
+          'enabled': repeat['minutely'] == true,
+          'second': _intValue(minutelySecondController, 0, min: 0, max: 59),
+        },
+      },
       'triggerIds': triggerIds.toList(),
     });
     return AgentScheduleConfig(
@@ -2776,6 +3030,27 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
       emailAccountId: emailAccountId,
       formatPrompt: formatPromptController.text,
       enabled: enabled,
+    );
+  }
+
+  Widget _repeatRow(String label, List<TextEditingController> controllers) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        children: [
+          SizedBox(width: 210, child: Text(label)),
+          for (final controller in controllers) ...[
+            Expanded(
+              child: TextField(
+                controller: controller,
+                decoration: const InputDecoration(
+                    isDense: true, border: OutlineInputBorder()),
+              ),
+            ),
+            if (controller != controllers.last) const SizedBox(width: 8),
+          ],
+        ],
+      ),
     );
   }
 
@@ -2846,6 +3121,21 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
                   },
                 ),
               ),
+              if (onceEnabled)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: () async {
+                      final picked = await showTimePicker(
+                          context: context, initialTime: onceTime);
+                      if (picked != null) {
+                        setState(() => onceTime = picked);
+                      }
+                    },
+                    icon: const Icon(Icons.schedule),
+                    label: Text('Time: ${_timeText(onceTime)}'),
+                  ),
+                ),
               Wrap(
                 spacing: 8,
                 runSpacing: 4,
@@ -2866,6 +3156,25 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
                     ),
                 ],
               ),
+              if (repeat['yearly'] == true)
+                _repeatRow('Yearly: months, day, time', [
+                  yearlyMonthsController,
+                  yearlyDayController,
+                  yearlyTimeController
+                ]),
+              if (repeat['monthly'] == true)
+                _repeatRow('Monthly: day, time',
+                    [monthlyDayController, monthlyTimeController]),
+              if (repeat['weekly'] == true)
+                _repeatRow('Weekly: weekdays 1-7, time',
+                    [weeklyDaysController, weeklyTimeController]),
+              if (repeat['daily'] == true)
+                _repeatRow('Daily: time', [dailyTimeController]),
+              if (repeat['hourly'] == true)
+                _repeatRow('Hourly: minute, second',
+                    [hourlyMinuteController, hourlySecondController]),
+              if (repeat['minutely'] == true)
+                _repeatRow('Minutely: second', [minutelySecondController]),
               const Divider(),
               Row(children: [
                 const Expanded(
@@ -3228,6 +3537,17 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
               onChanged: (v) async {
                 setState(
                     () => widget.controller.llamaProcessLoggingEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.llamaAutoRestartEnabled,
+              title: const Text('Auto-restore local llama.cpp server'),
+              subtitle: const Text(
+                  'Checks the process and /models endpoint, then restarts the selected local profile if it is unavailable.'),
+              onChanged: (v) async {
+                setState(() => widget.controller.llamaAutoRestartEnabled = v);
                 await widget.controller.saveAppSettings();
                 widget.onChanged();
               },

@@ -46,3 +46,43 @@ class RuntimeModelLimits {
   final int? outputTokens;
   final String source;
 }
+
+class HeavyTaskStatus {
+  const HeavyTaskStatus(
+      {required this.title,
+      required this.detail,
+      required this.progress,
+      this.remainingSeconds = 0,
+      this.canContinue = false});
+  final String title;
+  final String detail;
+  final double? progress;
+  final int remainingSeconds;
+  final bool canContinue;
+}
+
+class OffsetLike {
+  const OffsetLike(this.dx, this.dy);
+  final double dx;
+  final double dy;
+}
+
+class LlamaBackendVariant {
+  const LlamaBackendVariant({
+    required this.id,
+    required this.platformKey,
+    required this.backend,
+    required this.label,
+    required this.assetMatchers,
+    this.extraAssetMatchers = const [],
+    this.speedRank = 0,
+  });
+
+  final String id;
+  final String platformKey;
+  final String backend;
+  final String label;
+  final List<String> assetMatchers;
+  final List<String> extraAssetMatchers;
+  final int speedRank;
+}

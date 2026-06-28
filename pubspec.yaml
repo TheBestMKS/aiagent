@@ -1,7 +1,7 @@
 name: ii_agent
 description: Cross-platform Flutter UI for a local coding agent with OpenAI-compatible model profiles.
 publish_to: 'none'
-version: 1.50.0+50
+version: 1.51.0+51
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
