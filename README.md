@@ -10,9 +10,15 @@ AIAgent is a Flutter desktop/mobile shell for a local AI coding and document age
 
 ## Latest Version
 
-Version: `1.51.0+51`
+Version: `1.52.0+52`
 
 New in this version:
+
+- CUDA local profiles now resolve to the matching installed `tools/llama.cpp/<os_arch>/cuda12` or `cuda13` backend and refuse to start from an incompatible CPU folder.
+- The local llama status line shows RAM and, when NVIDIA tooling is available, per-process VRAM usage so GPU offload is visible during model startup and inference.
+- Android startup was fixed by aligning the runner package with the app manifest.
+
+Previous 1.51 highlights:
 
 - Reworked `llama.cpp` layout to `tools/llama.cpp/<os_arch>/<backend>` and added strict release-asset matching for Windows/Linux/Android CPU, Vulkan, CUDA 12/13, ROCm, OpenVINO, SYCL, HIP, and OpenCL Adreno variants.
 - `llama.cpp` install now reuses matching archives from `tools/downloads` when GitHub is unavailable and only shows installed local backends when creating local profiles.
@@ -76,7 +82,7 @@ Latest local verification on Windows:
 - `flutter analyze` - passed.
 - `flutter test` - passed.
 - `flutter build windows --release` - passed, produced `build/windows/x64/runner/Release/AIAgent.exe`.
-- `build_windows.bat` with `SKIP_CHECKS=1` - passed, copied `dist/AIAgent_v1.51_windows_x64`.
+- `build_windows.bat` with `SKIP_CHECKS=1` - passed, copied `dist/AIAgent_v1.52_windows_x64`.
 - `flutter build apk --release` - passed, produced `build/app/outputs/flutter-apk/app-release.apk`.
-- `build_android.bat` with `SKIP_CHECKS=1` - passed, copied `dist/AIAgent_v1.51_android_universal.apk`.
+- `build_android.bat` with `SKIP_CHECKS=1` - passed, copied `dist/AIAgent_v1.52_android_universal.apk`.
 - `flutter build linux --release` - blocked on Windows host by Flutter platform rule; build it on Linux.

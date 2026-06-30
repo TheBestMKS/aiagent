@@ -429,11 +429,7 @@ class AgentController {
   LlamaBackendVariant? llamaVariantByBackend(String backend) {
     final wanted = backend.trim().toLowerCase();
     if (wanted == 'cuda') {
-      for (final variant in compatibleLlamaBackendVariants()) {
-        if (variant.backend == 'cuda13' || variant.backend == 'cuda12') {
-          return variant;
-        }
-      }
+      return preferredCudaVariant();
     }
     for (final variant in compatibleLlamaBackendVariants()) {
       if (variant.backend == wanted || variant.id == wanted) return variant;
@@ -444,8 +440,81 @@ class AgentController {
     return null;
   }
 
+  LlamaBackendVariant? preferredCudaVariant() {
+    final candidates = compatibleLlamaBackendVariants()
+        .where((variant) =>
+            variant.backend == 'cuda13' || variant.backend == 'cuda12')
+        .toList()
+      ..sort((a, b) {
+        final aInstalled = llamaDirLooksCompatible(
+            expectedLlamaDirForBackend(a.backend), a.backend);
+        final bInstalled = llamaDirLooksCompatible(
+            expectedLlamaDirForBackend(b.backend), b.backend);
+        if (aInstalled != bInstalled) return aInstalled ? -1 : 1;
+        if (a.backend == b.backend) return 0;
+        return a.backend == 'cuda13' ? -1 : 1;
+      });
+    return candidates.isEmpty ? null : candidates.first;
+  }
+
   String llamaInstallRelativeDir(String backend, {String? platformKey}) =>
       pathJoin('tools', 'llama.cpp', platformKey ?? hostPlatformKey, backend);
+
+  String expectedLlamaDirForBackend(String backend) {
+    final variant = llamaVariantByBackend(backend);
+    final effectiveBackend = variant?.backend ?? backend.trim().toLowerCase();
+    final platformKey = variant?.platformKey ?? hostPlatformKey;
+    return pathJoin(appRootPath,
+        llamaInstallRelativeDir(effectiveBackend, platformKey: platformKey));
+  }
+
+  List<String> backendLibraryMarkers(String backend) {
+    final mode = backend.trim().toLowerCase();
+    if (mode.startsWith('cuda')) return ['ggml-cuda', 'cuda'];
+    if (mode == 'vulkan') return ['ggml-vulkan', 'vulkan'];
+    if (mode == 'openvino') return ['openvino'];
+    if (mode.startsWith('sycl')) return ['sycl'];
+    if (mode == 'hip') return ['ggml-hip', 'hip'];
+    if (mode == 'opencl-adreno') return ['opencl', 'adreno'];
+    return const [];
+  }
+
+  bool llamaDirLooksCompatible(String dirPath, String backend) {
+    if (dirPath.trim().isEmpty || findLlamaServer(dirPath) == null)
+      return false;
+    final markers = backendLibraryMarkers(backend);
+    if (markers.isEmpty) return true;
+    final dir = Directory(dirPath);
+    if (!dir.existsSync()) return false;
+    for (final file in dir.listSync(recursive: true).whereType<File>()) {
+      final name = pathBasename(file.path).toLowerCase();
+      if (markers.any(name.contains)) return true;
+    }
+    return false;
+  }
+
+  ModelProfile resolveLocalLlamaLaunchProfile(ModelProfile profile) {
+    if (profile.kind != ProfileKind.localLlama) return profile;
+    final variant = llamaVariantByBackend(profile.llamaMode);
+    final backend = variant?.backend ??
+        (profile.llamaMode.trim().isEmpty
+            ? 'cpu'
+            : profile.llamaMode.trim().toLowerCase());
+    final expectedDir = expectedLlamaDirForBackend(backend);
+    final currentDir = profile.llamaDir.trim();
+    final expectedOk = llamaDirLooksCompatible(expectedDir, backend);
+    final currentOk = llamaDirLooksCompatible(currentDir, backend);
+    if (currentOk) {
+      return profile.copyWith(llamaMode: backend, llamaDir: currentDir);
+    }
+    if (expectedOk) {
+      log('LLAMA BACKEND DIR AUTO-FIX: backend=$backend old_dir=$currentDir new_dir=$expectedDir');
+      return profile.copyWith(llamaMode: backend, llamaDir: expectedDir);
+    }
+    return profile.copyWith(
+        llamaMode: backend,
+        llamaDir: currentDir.isEmpty ? expectedDir : currentDir);
+  }
 
   Future<void> logStartupLlamaScan() async {
     final root = Directory.current.path;
@@ -2260,10 +2329,30 @@ class AgentController {
 
   Future<void> startLocalLlama(ModelProfile profile) async {
     if (profile.kind != ProfileKind.localLlama) return;
+    final originalProfile = profile;
+    profile = resolveLocalLlamaLaunchProfile(profile);
+    if (profile.llamaDir != originalProfile.llamaDir ||
+        profile.llamaMode != originalProfile.llamaMode) {
+      final index = profiles.indexWhere((p) => p.id == originalProfile.id);
+      if (index >= 0) {
+        profiles[index] = profile;
+        await saveProfiles();
+      }
+    }
     activeLocalLlamaProfile = profile;
     llamaStopRequested = false;
     setHeavyTaskStatus('llama.cpp startup',
         'Starting ${profile.llamaMode} server for ${profile.model}');
+    if (backendLibraryMarkers(profile.llamaMode).isNotEmpty &&
+        !llamaDirLooksCompatible(profile.llamaDir, profile.llamaMode)) {
+      final expected = expectedLlamaDirForBackend(profile.llamaMode);
+      status =
+          'Selected llama.cpp backend ${profile.llamaMode} is not installed or incompatible. Expected: $expected';
+      log('LLAMA START FAILED: backend=${profile.llamaMode} incompatible dir=${profile.llamaDir} expected=$expected');
+      clearHeavyTaskStatus();
+      notifyUi();
+      return;
+    }
     final exe = findLlamaServer(profile.llamaDir);
     if (exe == null) {
       status = 'llama-server не найден в ${profile.llamaDir}';
@@ -2581,7 +2670,7 @@ class AgentController {
 
   Future<void> updateLlamaMemoryStatus(int pid) async {
     try {
-      int? bytes;
+      int? ramBytes;
       if (Platform.isWindows) {
         final result = await Process.run(
           'powershell',
@@ -2601,20 +2690,63 @@ class AgentController {
             .split(RegExp(r'\s+'))
             .where((e) => e.trim().isNotEmpty)
             .toList();
-        bytes = parts.isEmpty ? null : int.tryParse(parts.last);
+        ramBytes = parts.isEmpty ? null : int.tryParse(parts.last);
       } else {
         final result = await Process.run(
                 'sh', ['-c', "ps -o rss= -p $pid 2>/dev/null | tail -n 1"],
                 stdoutEncoding: const Utf8Codec(allowMalformed: true))
             .timeout(const Duration(seconds: 3));
         final kb = int.tryParse(result.stdout.toString().trim());
-        if (kb != null) bytes = kb * 1024;
+        if (kb != null) ramBytes = kb * 1024;
       }
-      if (bytes == null || bytes <= 0) return;
-      llamaMemoryStatus = 'llama.cpp PID $pid • ОЗУ: ${formatBytes(bytes)}';
+      final gpuBytes = await queryNvidiaGpuMemoryForProcess(pid);
+      if ((ramBytes == null || ramBytes <= 0) && gpuBytes == null) return;
+      final backend = activeLocalLlamaProfile?.llamaMode.toLowerCase() ?? '';
+      final parts = <String>[
+        'llama.cpp PID $pid',
+        'ОЗУ: ${ramBytes == null || ramBytes <= 0 ? 'n/a' : formatBytes(ramBytes)}'
+      ];
+      if (gpuBytes != null) {
+        var gpuText = formatBytes(gpuBytes);
+        if (backend.startsWith('cuda') && gpuBytes == 0) {
+          gpuText = '$gpuText (CUDA offload not detected)';
+        }
+        parts.add('VRAM: $gpuText');
+      } else if (backend.startsWith('cuda')) {
+        parts.add('VRAM: n/a (nvidia-smi not found)');
+      }
+      llamaMemoryStatus = parts.join(' • ');
       notifyUi();
     } catch (_) {
       // Memory indicator is best-effort only.
+    }
+  }
+
+  Future<int?> queryNvidiaGpuMemoryForProcess(int pid) async {
+    try {
+      final tool = findExecutableInTools(['nvidia-smi.exe', 'nvidia-smi']);
+      final executable = tool?.path ?? 'nvidia-smi';
+      final result = await Process.run(
+        executable,
+        [
+          '--query-compute-apps=pid,used_memory',
+          '--format=csv,noheader,nounits'
+        ],
+        stdoutEncoding: const Utf8Codec(allowMalformed: true),
+        stderrEncoding: const Utf8Codec(allowMalformed: true),
+        environment: buildToolAwareEnvironment(),
+      ).timeout(const Duration(seconds: 3));
+      if (result.exitCode != 0) return null;
+      var mib = 0;
+      for (final line in result.stdout.toString().split(RegExp(r'\r?\n'))) {
+        final parts = line.split(',').map((e) => e.trim()).toList();
+        if (parts.length < 2) continue;
+        if (int.tryParse(parts[0]) != pid) continue;
+        mib += int.tryParse(parts[1]) ?? 0;
+      }
+      return mib * 1024 * 1024;
+    } catch (_) {
+      return null;
     }
   }
 

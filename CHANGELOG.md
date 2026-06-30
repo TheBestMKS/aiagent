@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.52.0+52 - 2026-06-30
+
+- Fixed local CUDA `llama.cpp` launch profile resolution so CUDA backends cannot silently start from a CPU folder; legacy `cuda` profiles are normalized to an installed CUDA 13 or CUDA 12 backend when available.
+- Added backend compatibility checks before local llama startup and clearer logs/status when a selected GPU backend is missing or incompatible.
+- Added best-effort NVIDIA VRAM reporting for the running `llama-server` process in the model status line, next to RAM usage.
+- Fixed the Android runner package so the manifest resolves `local.ai.agent.MainActivity` correctly instead of closing immediately on startup.
+
 ## 1.51.0+51 - 2026-06-28
 
 - Reworked `llama.cpp` backend folders to `tools/llama.cpp/<os_arch>/<backend>` and added the full requested Windows/Linux/Android variant matrix.

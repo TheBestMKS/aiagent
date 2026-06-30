@@ -108,11 +108,16 @@ class _SettingsTabState extends State<SettingsTab> {
     contextController.text = profile.maxContextTokens.toString();
     outputController.text = profile.maxOutputTokens.toString();
     profileKind = profile.kind.name;
-    llamaDirController.text = profile.llamaDir;
+    final variant = widget.controller.llamaVariantByBackend(profile.llamaMode);
+    final normalizedMode = variant?.backend ??
+        (profile.llamaMode.trim().isEmpty ? 'cpu' : profile.llamaMode);
+    llamaDirController.text = profile.llamaDir.trim().isEmpty
+        ? widget.controller.expectedLlamaDirForBackend(normalizedMode)
+        : profile.llamaDir;
     modelPathController.text = profile.modelPath;
     mmprojPathController.text = profile.mmprojPath;
     llamaPortController.text = profile.llamaPort.toString();
-    llamaMode = profile.llamaMode.trim().isEmpty ? 'cpu' : profile.llamaMode;
+    llamaMode = normalizedMode;
     apiStyle = profile.apiStyle;
     streamResponses = profile.streamResponses;
     autoRestartLocalLlama = profile.autoRestartLocalLlama;
@@ -261,8 +266,11 @@ class _SettingsTabState extends State<SettingsTab> {
                       .map((variant) => DropdownMenuItem(
                           value: variant.backend, child: Text(variant.label)))
                       .toList(),
-                  onChanged: (value) =>
-                      setState(() => llamaMode = value ?? 'cpu'),
+                  onChanged: (value) => setState(() {
+                    llamaMode = value ?? 'cpu';
+                    llamaDirController.text =
+                        widget.controller.expectedLlamaDirForBackend(llamaMode);
+                  }),
                 ),
               ),
               const SizedBox(width: 8),
@@ -381,6 +389,10 @@ class _SettingsTabState extends State<SettingsTab> {
           children: [
             FilledButton.icon(
               onPressed: () async {
+                final selectedLlamaDir = controller.llamaDirLooksCompatible(
+                        llamaDirController.text.trim(), llamaMode)
+                    ? llamaDirController.text.trim()
+                    : controller.expectedLlamaDirForBackend(llamaMode);
                 final profile = profileKind == ProfileKind.localLlama.name
                     ? ModelProfile.localLlama(
                         name: nameController.text.trim().isEmpty
@@ -395,7 +407,7 @@ class _SettingsTabState extends State<SettingsTab> {
                         modelPath: modelPathController.text.trim(),
                         mmprojPath: mmprojPathController.text.trim(),
                         llamaMode: llamaMode,
-                        llamaDir: llamaDirController.text.trim(),
+                        llamaDir: selectedLlamaDir,
                         llamaPort:
                             int.tryParse(llamaPortController.text.trim()) ??
                                 1234,
