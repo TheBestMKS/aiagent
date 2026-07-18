@@ -3,34 +3,61 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:xterm/xterm.dart';
 
+import '../agent_core/terminal/interactive_terminal_service.dart';
 import '../controllers/agent_controller.dart';
 import '../core/runtime_types.dart';
 import '../utils/html_utils.dart';
 import '../utils/path_utils.dart';
 
 class ConsoleSession {
-  ConsoleSession({required this.name, this.cwd = '.', this.output = ''}) {
+  ConsoleSession({
+    required this.id,
+    required this.name,
+    this.cwd = '.',
+    this.output = '',
+  }) {
     cwdController.text = cwd;
+    if (output.isNotEmpty) terminal.write(output);
   }
 
+  final String id;
   String name;
   String cwd;
   String output;
   final List<String> commandHistory = [];
   final TextEditingController commandController = TextEditingController();
   final TextEditingController cwdController = TextEditingController();
+  final Terminal terminal = Terminal(maxLines: 20000);
+  final TerminalController terminalController = TerminalController();
+
+  void appendOutput(String value) {
+    if (value.isEmpty) return;
+    output += value;
+    const maxChars = 2 * 1024 * 1024;
+    if (output.length > maxChars) {
+      output = output.substring(output.length - maxChars);
+    }
+    terminal.write(value);
+  }
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'name': name,
         'cwd': cwd,
-        'output': output,
+        'output': output.length <= 300000
+            ? output
+            : output.substring(output.length - 300000),
         'history': commandHistory.take(80).toList(),
         'command': commandController.text,
       };
 
   static ConsoleSession fromJson(Map<String, dynamic> json) {
     final session = ConsoleSession(
+      id: json['id']?.toString().trim().isNotEmpty == true
+          ? json['id'].toString()
+          : 'console-${DateTime.now().microsecondsSinceEpoch}',
       name: json['name']?.toString() ?? 'Консоль',
       cwd: json['cwd']?.toString() ?? '.',
       output: json['output']?.toString() ?? '',
@@ -43,6 +70,9 @@ class ConsoleSession {
   }
 
   void dispose() {
+    terminal.onOutput = null;
+    terminal.onResize = null;
+    terminalController.dispose();
     commandController.dispose();
     cwdController.dispose();
   }
@@ -58,10 +88,12 @@ class ConsoleTab extends StatefulWidget {
 }
 
 class _ConsoleTabState extends State<ConsoleTab> {
-  final List<ConsoleSession> sessions = [ConsoleSession(name: 'Консоль 1')];
+  final List<ConsoleSession> sessions = [
+    ConsoleSession(id: 'agent-main', name: 'Команды агента')
+  ];
   final List<ConsoleQuickAction> quickActions = [];
-  final ScrollController verticalScrollController = ScrollController();
-  final ScrollController horizontalScrollController = ScrollController();
+  StreamSubscription<TerminalSessionEvent>? terminalEventSubscription;
+  Timer? stateSaveTimer;
   int selected = 0;
   bool running = false;
   bool showQuickPanel = false;
@@ -70,10 +102,120 @@ class _ConsoleTabState extends State<ConsoleTab> {
   ConsoleSession get current =>
       sessions[selected.clamp(0, sessions.length - 1).toInt()];
 
+  void bindTerminal(ConsoleSession session) {
+    session.terminal.onOutput = (data) {
+      unawaited(sendTerminalInput(session, data));
+    };
+    session.terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      widget.controller.terminalService.resize(session.id, height, width);
+    };
+  }
+
+  Future<void> sendTerminalInput(ConsoleSession session, String data) async {
+    var snapshot = widget.controller.terminalService.snapshot(session.id);
+    if (snapshot == null || !snapshot.running) {
+      try {
+        snapshot = await widget.controller.terminalService.open(
+          sessionId: session.id,
+          name: session.name,
+          cwd: session.cwd,
+          environment: widget.controller.buildToolAwareEnvironment(),
+          rows: session.terminal.viewHeight,
+          columns: session.terminal.viewWidth,
+        );
+      } catch (error) {
+        onTerminalEvent(TerminalSessionEvent(
+          sessionId: session.id,
+          kind: TerminalEventKind.error,
+          text: '\r\n[Не удалось открыть PTY] $error\r\n',
+          time: DateTime.now(),
+        ));
+        return;
+      }
+    }
+    widget.controller.terminalService.writeRaw(snapshot.id, data);
+  }
+
+  void onTerminalEvent(TerminalSessionEvent event) {
+    if (!mounted) return;
+    final snapshot =
+        widget.controller.terminalService.snapshot(event.sessionId);
+    var index = sessions.indexWhere((session) => session.id == event.sessionId);
+    var uiChanged = false;
+    if (index < 0) {
+      final session = ConsoleSession(
+        id: event.sessionId,
+        name: snapshot?.name ?? event.sessionId,
+        cwd: snapshot?.cwd ?? '.',
+      );
+      bindTerminal(session);
+      sessions.add(session);
+      index = sessions.length - 1;
+      uiChanged = true;
+    }
+    final session = sessions[index];
+    if (snapshot != null) {
+      uiChanged = uiChanged ||
+          session.name != snapshot.name ||
+          session.cwd != snapshot.cwd;
+      session.name = snapshot.name;
+      session.cwd = snapshot.cwd;
+      session.cwdController.text = snapshot.cwd;
+    }
+    if (event.kind == TerminalEventKind.opened) {
+      session.appendOutput(
+          '\r\n\x1b[90m[PTY открыт: ${snapshot?.shell ?? ''}]\x1b[0m\r\n');
+      uiChanged = true;
+    } else if (event.text.isNotEmpty &&
+        event.kind != TerminalEventKind.command &&
+        event.kind != TerminalEventKind.closed) {
+      session.appendOutput(event.text);
+    }
+    if (uiChanged) setState(() {});
+    markStateChanged();
+  }
+
+  void syncTerminalServiceSessions() {
+    if (!mounted) return;
+    var changed = false;
+    for (final snapshot in widget.controller.terminalService.snapshots) {
+      final existing = sessions.indexWhere((item) => item.id == snapshot.id);
+      if (existing >= 0) {
+        final session = sessions[existing];
+        session.name = snapshot.name;
+        session.cwd = snapshot.cwd;
+        session.cwdController.text = snapshot.cwd;
+        if (session.output.isEmpty && snapshot.transcript.isNotEmpty) {
+          session.appendOutput(snapshot.transcript);
+          changed = true;
+        }
+        continue;
+      }
+      final session = ConsoleSession(
+        id: snapshot.id,
+        name: snapshot.name,
+        cwd: snapshot.cwd,
+        output: snapshot.transcript,
+      );
+      bindTerminal(session);
+      sessions.add(session);
+      changed = true;
+    }
+    if (changed) {
+      setState(() {});
+      markStateChanged();
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     quickActions.addAll(defaultQuickActions());
+    for (final session in sessions) {
+      bindTerminal(session);
+    }
+    terminalEventSubscription =
+        widget.controller.terminalService.events.listen(onTerminalEvent);
     widget.controller.consoleRunner =
         ({required String command, String cwd = '.', bool newTab = false}) {
       if (!mounted) return;
@@ -86,7 +228,7 @@ class _ConsoleTabState extends State<ConsoleTab> {
       unawaited(run(command));
     };
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(loadState());
+      unawaited(loadState().whenComplete(syncTerminalServiceSessions));
       final pending = widget.controller.takePendingConsoleRun();
       if (pending != null) {
         widget.controller.consoleRunner?.call(
@@ -100,12 +242,12 @@ class _ConsoleTabState extends State<ConsoleTab> {
     if (widget.controller.consoleRunner != null) {
       widget.controller.consoleRunner = null;
     }
+    stateSaveTimer?.cancel();
     unawaited(saveState());
+    unawaited(terminalEventSubscription?.cancel());
     for (final session in sessions) {
       session.dispose();
     }
-    verticalScrollController.dispose();
-    horizontalScrollController.dispose();
     super.dispose();
   }
 
@@ -148,8 +290,11 @@ class _ConsoleTabState extends State<ConsoleTab> {
       sessions
         ..clear()
         ..addAll(loadedSessions.isEmpty
-            ? [ConsoleSession(name: 'Консоль 1')]
+            ? [ConsoleSession(id: 'agent-main', name: 'Команды агента')]
             : loadedSessions);
+      for (final session in sessions) {
+        bindTerminal(session);
+      }
       quickActions
         ..clear()
         ..addAll(loadedQuick.isEmpty ? defaultQuickActions() : loadedQuick);
@@ -171,11 +316,17 @@ class _ConsoleTabState extends State<ConsoleTab> {
     });
   }
 
-  void markStateChanged() => unawaited(saveState());
+  void markStateChanged() {
+    stateSaveTimer?.cancel();
+    stateSaveTimer = Timer(const Duration(milliseconds: 600), () {
+      unawaited(saveState());
+    });
+  }
 
   void addSession({ConsoleSession? from}) {
     setState(() {
       final session = ConsoleSession(
+        id: 'console-${DateTime.now().microsecondsSinceEpoch}',
         name: from == null
             ? 'Консоль ${sessions.length + 1}'
             : '${from.name} копия',
@@ -186,6 +337,7 @@ class _ConsoleTabState extends State<ConsoleTab> {
         session.commandHistory.addAll(from.commandHistory);
         session.commandController.text = from.commandController.text;
       }
+      bindTerminal(session);
       sessions.add(session);
       selected = sessions.length - 1;
     });
@@ -216,11 +368,13 @@ class _ConsoleTabState extends State<ConsoleTab> {
       }
     }
     if (value == 'delete' && sessions.length > 1) {
+      final removedId = sessions[index].id;
       setState(() {
         sessions[index].dispose();
         sessions.removeAt(index);
         selected = selected.clamp(0, sessions.length - 1).toInt();
       });
+      unawaited(widget.controller.terminalService.close(removedId));
       markStateChanged();
     }
   }
@@ -264,61 +418,41 @@ class _ConsoleTabState extends State<ConsoleTab> {
     }
   }
 
-  String consolePrompt() {
-    final projectName = widget.controller.currentProject?.name ?? 'project';
-    final cwd = current.cwd.trim().isEmpty || current.cwd.trim() == '.'
-        ? ''
-        : current.cwd.trim();
-    if (Platform.isWindows)
-      return '$projectName${cwd.isEmpty ? '' : '\\$cwd'}>';
-    return '~$projectName${cwd.isEmpty ? '' : '/$cwd'}>';
-  }
-
-  String consoleStdoutOnly(String result) {
-    final stdoutMatch =
-        RegExp(r'\[STDOUT\]\n([\s\S]*?)\n\[STDERR\]', multiLine: true)
-            .firstMatch(result);
-    final stdout = stdoutMatch?.group(1)?.trimRight() ?? '';
-    if (stdout.isNotEmpty) return stdout;
-    final stderrMatch =
-        RegExp(r'\[STDERR\]\n([\s\S]*?)\n\[/STDERR\]', multiLine: true)
-            .firstMatch(result);
-    final stderr = stderrMatch?.group(1)?.trimRight() ?? '';
-    return stderr.isNotEmpty ? stderr : result.trimRight();
-  }
-
   Future<void> run(String command) async {
     final clean = command.trim();
     if (clean.isEmpty || running) return;
     setState(() {
       running = true;
-      current.output += '\n${consolePrompt()} $clean\n';
       current.commandHistory.remove(clean);
       current.commandHistory.insert(0, clean);
       if (current.commandHistory.length > 80) {
         current.commandHistory.removeRange(80, current.commandHistory.length);
       }
+      current.commandController.clear();
     });
     markStateChanged();
     try {
-      final result = await widget.controller
-          .runCommand(clean, relativeWorkingDirectory: current.cwd);
-      final visible = consoleStdoutOnly(result);
-      setState(() {
-        current.output +=
-            '${visible.isEmpty ? '(команда завершилась без stdout)' : visible}\n';
-      });
+      final snapshot = widget.controller.terminalService.snapshot(current.id);
+      if (snapshot == null || !snapshot.running) {
+        await widget.controller.terminalService.open(
+          sessionId: current.id,
+          name: current.name,
+          cwd: current.cwd,
+          environment: widget.controller.buildToolAwareEnvironment(),
+          rows: current.terminal.viewHeight,
+          columns: current.terminal.viewWidth,
+        );
+      }
+      await widget.controller.terminalService.writeAndCollect(
+        current.id,
+        clean,
+        timeout: const Duration(seconds: 3),
+      );
     } catch (e) {
-      setState(() => current.output += 'Ошибка консоли: $e\n');
+      current.appendOutput('\r\nОшибка консоли: $e\r\n');
     } finally {
       if (mounted) setState(() => running = false);
       markStateChanged();
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (verticalScrollController.hasClients) {
-          verticalScrollController
-              .jumpTo(verticalScrollController.position.maxScrollExtent);
-        }
-      });
     }
   }
 
@@ -514,10 +648,19 @@ class _ConsoleTabState extends State<ConsoleTab> {
         PopupMenuItem(value: 'clear', child: Text('Очистить')),
       ],
     );
-    if (value == 'copy')
-      await Clipboard.setData(ClipboardData(text: current.output));
+    if (value == 'copy') {
+      final selection = current.terminalController.selection;
+      final text = selection == null
+          ? current.output
+          : current.terminal.buffer.getText(selection);
+      await Clipboard.setData(ClipboardData(text: text));
+      current.terminalController.clearSelection();
+    }
     if (value == 'clear') {
-      setState(() => current.output = '');
+      setState(() {
+        current.output = '';
+        current.terminal.write('\x1b[2J\x1b[H\x1b[3J');
+      });
       markStateChanged();
     }
   }
@@ -635,39 +778,21 @@ class _ConsoleTabState extends State<ConsoleTab> {
                 ),
               ),
               Expanded(
-                child: GestureDetector(
-                  onSecondaryTapDown: showConsoleOutputMenu,
-                  child: Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.all(8),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                        color: Colors.black,
-                        borderRadius: BorderRadius.circular(8)),
-                    child: Scrollbar(
-                      controller: verticalScrollController,
-                      thumbVisibility: true,
-                      child: SingleChildScrollView(
-                        controller: verticalScrollController,
-                        child: Scrollbar(
-                          controller: horizontalScrollController,
-                          thumbVisibility: true,
-                          notificationPredicate: (n) =>
-                              n.metrics.axis == Axis.horizontal,
-                          child: SingleChildScrollView(
-                            controller: horizontalScrollController,
-                            scrollDirection: Axis.horizontal,
-                            child: SelectableText(
-                              current.output.isEmpty
-                                  ? 'Консоль готова.'
-                                  : current.output,
-                              style: const TextStyle(
-                                  fontFamily: 'monospace', color: Colors.white),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
+                child: Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.all(8),
+                  clipBehavior: Clip.antiAlias,
+                  decoration: BoxDecoration(
+                    color: Colors.black,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: TerminalView(
+                    current.terminal,
+                    controller: current.terminalController,
+                    autofocus: true,
+                    backgroundOpacity: 1,
+                    onSecondaryTapDown: (details, offset) =>
+                        showConsoleOutputMenu(details),
                   ),
                 ),
               ),
@@ -708,14 +833,25 @@ class _ConsoleTabState extends State<ConsoleTab> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    FilledButton.icon(
-                      onPressed: running
-                          ? null
-                          : () =>
-                              unawaited(run(current.commandController.text)),
-                      icon: const Icon(Icons.play_arrow),
-                      label: Text(running ? 'Выполняется' : 'Выполнить'),
-                    ),
+                    if (narrow)
+                      IconButton.filled(
+                        tooltip: running ? 'Выполняется' : 'Выполнить',
+                        onPressed: running
+                            ? null
+                            : () =>
+                                unawaited(run(current.commandController.text)),
+                        icon: Icon(
+                            running ? Icons.hourglass_top : Icons.play_arrow),
+                      )
+                    else
+                      FilledButton.icon(
+                        onPressed: running
+                            ? null
+                            : () =>
+                                unawaited(run(current.commandController.text)),
+                        icon: const Icon(Icons.play_arrow),
+                        label: Text(running ? 'Выполняется' : 'Выполнить'),
+                      ),
                   ],
                 ),
               ),

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ii_agent/app/ai_agent_app.dart';
+import 'package:ii_agent/app/ai_agent_web_app.dart';
 import 'package:ii_agent/utils/path_utils.dart';
 
 void main() {
@@ -10,6 +11,15 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.byType(MaterialApp), findsOneWidget);
+  });
+
+  testWidgets('Web app starts without desktop services',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const AiAgentWebApp());
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('AI Agent для браузера'), findsOneWidget);
   });
 
   test('sanitize file names', () {

@@ -9,7 +9,9 @@ import 'package:flutter/services.dart';
 import '../core/app_constants.dart';
 import '../controllers/agent_controller.dart';
 import '../core/models.dart';
+import '../plugins/plugin_models.dart';
 import '../utils/html_utils.dart';
+import '../widgets/task_run_history_dialog.dart';
 import '../utils/path_utils.dart';
 
 class ModelProfilesDialog extends StatelessWidget {
@@ -3575,6 +3577,142 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
                 widget.onChanged();
               },
             ),
+            const Divider(),
+            const Text('Надёжность агентного цикла',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            SwitchListTile(
+              value: widget.controller.taskCheckpointingEnabled,
+              title: const Text('Сохранять контрольные точки задачи'),
+              subtitle: const Text(
+                  'Состояние, итерация, команды, доказательства и защита от повторов сохраняются в .cppagent/runs. После аварийного закрытия продолжается тот же запуск.'),
+              onChanged: (v) async {
+                setState(() => widget.controller.taskCheckpointingEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.toolCircuitBreakerEnabled,
+              title: const Text('Защита от циклических вызовов инструментов'),
+              subtitle: const Text(
+                  'Блокирует одинаковые вызовы, повторение одной ошибки и чередование разных инструментов без измеримого прогресса.'),
+              onChanged: (v) async {
+                setState(() => widget.controller.toolCircuitBreakerEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.autoLearnVerifiedRunsEnabled,
+              title: const Text(
+                  'Автоматически запоминать проверенные успешные решения'),
+              subtitle: const Text(
+                  'В память попадают только задачи с реальным изменением файлов и распознанной успешной сборкой, тестом или анализом. Секреты маскируются.'),
+              onChanged: (v) async {
+                setState(
+                    () => widget.controller.autoLearnVerifiedRunsEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    final report = widget.controller.currentTaskStatusReport();
+                    await showDialog<void>(
+                      context: context,
+                      builder: (dialogContext) {
+                        final screen = MediaQuery.sizeOf(dialogContext);
+                        return AlertDialog(
+                          title: const Text('Состояние агентной задачи'),
+                          content: SizedBox(
+                            width: (screen.width - 48)
+                                .clamp(300.0, 680.0)
+                                .toDouble(),
+                            height: (screen.height - 220)
+                                .clamp(240.0, 620.0)
+                                .toDouble(),
+                            child: SingleChildScrollView(
+                              child: SelectableText(report),
+                            ),
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(dialogContext),
+                              child: const Text('Закрыть'),
+                            ),
+                          ],
+                        );
+                      },
+                    );
+                  },
+                  icon: const Icon(Icons.fact_check_outlined),
+                  label: const Text('План и доказательства'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showDialog<void>(
+                      context: context,
+                      builder: (_) => TaskRunHistoryDialog(
+                        controller: widget.controller,
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.history),
+                  label: const Text('История запусков'),
+                ),
+              ],
+            ),
+            const Divider(),
+            const Text('Плагины и контекст агента',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            SwitchListTile(
+              value: widget.controller.pluginAutoCheckEnabled,
+              title: const Text('Проверять обновления плагинов при запуске'),
+              subtitle: const Text(
+                  'Проверяются только уже синхронизированные плагины. Для проверки требуется разрешённый интернет.'),
+              onChanged: (v) async {
+                setState(() => widget.controller.pluginAutoCheckEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.pluginAutoUpdateEnabled,
+              title: const Text('Обновлять плагины автоматически без запроса'),
+              subtitle: const Text(
+                  'Обновление выполняется в фоне через временную папку, проверку архива и атомарную замену с резервной копией.'),
+              onChanged: (v) async {
+                setState(() => widget.controller.pluginAutoUpdateEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.toolOutputCompactionEnabled,
+              title: const Text('Сжимать большие результаты инструментов в контексте'),
+              subtitle: const Text(
+                  'Полный вывод остаётся в логах, а модели передаются важные строки, начало и конец результата.'),
+              onChanged: (v) async {
+                setState(() => widget.controller.toolOutputCompactionEnabled = v);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            OutlinedButton.icon(
+              onPressed: () async {
+                await showDialog<void>(
+                  context: context,
+                  builder: (_) => PluginManagerDialog(controller: widget.controller),
+                );
+                setState(() {});
+              },
+              icon: const Icon(Icons.extension),
+              label: Text('Менеджер плагинов: ${widget.controller.plugins.length}'),
+            ),
             SwitchListTile(
               value: !widget.controller.closeToTrayOnClose,
               title: const Text(
@@ -3706,7 +3844,9 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
                   labelText: 'Максимум действий агента',
                   border: OutlineInputBorder()),
               onChanged: (v) => widget.controller.maxAgentIterations =
-                  int.tryParse(v) ?? widget.controller.maxAgentIterations,
+                  (int.tryParse(v) ?? widget.controller.maxAgentIterations)
+                      .clamp(1, 1000)
+                      .toInt(),
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
@@ -3797,11 +3937,12 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
       ),
       actions: [
         FilledButton(
-          onPressed: () {
+          onPressed: () async {
             widget.controller.log(
                 'SETTINGS UPDATE: logging=${widget.controller.loggingEnabled}; quality=${widget.controller.qualityCheckEnabled}; maxIterations=${widget.controller.maxAgentIterations}');
+            await widget.controller.saveAppSettings();
             widget.onChanged();
-            Navigator.pop(context);
+            if (context.mounted) Navigator.pop(context);
           },
           child: const Text('Закрыть'),
         ),
@@ -4237,6 +4378,294 @@ class _ProgramFilesDialogState extends State<ProgramFilesDialog> {
         TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('Закрыть'))
+      ],
+    );
+  }
+}
+
+
+class PluginUpdateSelectionDialog extends StatefulWidget {
+  const PluginUpdateSelectionDialog({super.key, required this.updates});
+
+  final List<PluginUpdateInfo> updates;
+
+  @override
+  State<PluginUpdateSelectionDialog> createState() =>
+      _PluginUpdateSelectionDialogState();
+}
+
+class _PluginUpdateSelectionDialogState
+    extends State<PluginUpdateSelectionDialog> {
+  late final Set<String> selected;
+
+  @override
+  void initState() {
+    super.initState();
+    selected = widget.updates.map((item) => item.pluginId).toSet();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Доступны обновления плагинов'),
+      content: SizedBox(
+        width: 620,
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Text(
+                'Снимите флажки с плагинов, которые сейчас обновлять не нужно.'),
+            const SizedBox(height: 8),
+            for (final update in widget.updates)
+              CheckboxListTile(
+                value: selected.contains(update.pluginId),
+                title: Text(update.name),
+                subtitle: Text('${update.installedShort} → ${update.latestShort}'),
+                onChanged: (value) => setState(() {
+                  if (value == true) {
+                    selected.add(update.pluginId);
+                  } else {
+                    selected.remove(update.pluginId);
+                  }
+                }),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, <String>[]),
+          child: const Text('Не обновлять'),
+        ),
+        FilledButton.icon(
+          onPressed: selected.isEmpty
+              ? null
+              : () => Navigator.pop(context, selected.toList(growable: false)),
+          icon: const Icon(Icons.system_update_alt),
+          label: Text('Обновить (${selected.length})'),
+        ),
+      ],
+    );
+  }
+}
+
+class PluginManagerDialog extends StatefulWidget {
+  const PluginManagerDialog({super.key, required this.controller});
+
+  final AgentController controller;
+
+  @override
+  State<PluginManagerDialog> createState() => _PluginManagerDialogState();
+}
+
+class _PluginManagerDialogState extends State<PluginManagerDialog> {
+  bool working = false;
+  String message = '';
+
+  Future<void> _run(Future<void> Function() action) async {
+    if (working) return;
+    setState(() {
+      working = true;
+      message = '';
+    });
+    try {
+      await action();
+    } catch (error) {
+      message = error.toString();
+    } finally {
+      if (mounted) setState(() => working = false);
+    }
+  }
+
+  String _permissionLabel(AgentPluginPermission permission) => switch (permission) {
+        AgentPluginPermission.network => 'сеть',
+        AgentPluginPermission.process => 'процессы',
+        AgentPluginPermission.projectFiles => 'файлы проекта',
+        AgentPluginPermission.deviceFiles => 'файлы устройства',
+        AgentPluginPermission.secrets => 'секреты',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = widget.controller;
+    return AlertDialog(
+      title: const Text('Менеджер плагинов'),
+      content: SizedBox(
+        width: math.min(MediaQuery.of(context).size.width * 0.94, 900.0).toDouble(),
+        height: math.min(MediaQuery.of(context).size.height * 0.80, 760.0).toDouble(),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    controller.pluginOperationStatus.message,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: working || controller.pluginOperationStatus.active
+                      ? null
+                      : () => _run(() async {
+                            await controller.checkPluginUpdates(
+                                includeNotInstalled: true);
+                          }),
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Проверить GitHub'),
+                ),
+              ],
+            ),
+            if (working || controller.pluginOperationStatus.active)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: LinearProgressIndicator(
+                    value: controller.pluginOperationStatus.progress),
+              ),
+            if (message.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: SelectableText(message,
+                    style: TextStyle(color: Theme.of(context).colorScheme.error)),
+              ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListView.separated(
+                itemCount: controller.plugins.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, index) {
+                  final plugin = controller.plugins[index];
+                  final permissions = plugin.permissions
+                      .map(_permissionLabel)
+                      .join(', ');
+                  return Card(
+                    margin: const EdgeInsets.symmetric(vertical: 5),
+                    child: Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(plugin.name,
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold)),
+                              ),
+                              if (plugin.sensitive)
+                                const Tooltip(
+                                  message: 'Чувствительный инструмент: всегда требует явного разрешения',
+                                  child: Icon(Icons.warning_amber, size: 20),
+                                ),
+                              Switch(
+                                value: plugin.enabled,
+                                onChanged: working
+                                    ? null
+                                    : (value) => _run(() => controller
+                                        .setPluginEnabled(plugin.id, value)),
+                              ),
+                            ],
+                          ),
+                          Text(plugin.description),
+                          const SizedBox(height: 5),
+                          Text('GitHub: ${plugin.repository} • ветка ${plugin.defaultBranch}'),
+                          Text('Тип: ${plugin.kind.name} • разрешения: $permissions'),
+                          Text(plugin.sourceInstalled
+                              ? 'Исходники синхронизированы: ${plugin.installedCommit.length > 8 ? plugin.installedCommit.substring(0, 8) : plugin.installedCommit}'
+                              : 'Используется встроенный адаптер; исходники ещё не синхронизированы'),
+                          if (plugin.updateAvailable)
+                            Text('Доступно обновление: ${plugin.latestCommit.substring(0, 8)}',
+                                style: const TextStyle(fontWeight: FontWeight.bold)),
+                          if (plugin.lastError.isNotEmpty)
+                            Text('Ошибка: ${plugin.lastError}',
+                                style: TextStyle(
+                                    color: Theme.of(context).colorScheme.error)),
+                          const SizedBox(height: 6),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 6,
+                            children: [
+                              FilledButton.tonalIcon(
+                                onPressed: working ||
+                                        controller.pluginOperationStatus.active
+                                    ? null
+                                    : () => _run(() => controller
+                                        .installOrUpdatePlugin(plugin.id)),
+                                icon: const Icon(Icons.download),
+                                label: Text(plugin.sourceInstalled
+                                    ? 'Обновить'
+                                    : 'Синхронизировать'),
+                              ),
+                              if (plugin.kind == AgentPluginKind.reference)
+                                OutlinedButton.icon(
+                                  onPressed: () async {
+                                    final queryController = TextEditingController();
+                                    final query = await showDialog<String>(
+                                      context: context,
+                                      builder: (_) => AlertDialog(
+                                        title: Text('Поиск: ${plugin.name}'),
+                                        content: TextField(
+                                          controller: queryController,
+                                          autofocus: true,
+                                          decoration: const InputDecoration(
+                                              labelText: 'Запрос'),
+                                          onSubmitted: (value) =>
+                                              Navigator.pop(context, value),
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                              onPressed: () => Navigator.pop(context),
+                                              child: const Text('Отмена')),
+                                          FilledButton(
+                                              onPressed: () => Navigator.pop(
+                                                  context, queryController.text),
+                                              child: const Text('Найти')),
+                                        ],
+                                      ),
+                                    );
+                                    queryController.dispose();
+                                    if (query == null || query.trim().isEmpty || !mounted) return;
+                                    final result = await controller.runPluginTool(
+                                        plugin.toolName, query);
+                                    if (!mounted) return;
+                                    await showDialog<void>(
+                                      context: context,
+                                      builder: (_) => AlertDialog(
+                                        title: Text(plugin.name),
+                                        content: SizedBox(
+                                          width: 760,
+                                          height: 560,
+                                          child: SingleChildScrollView(
+                                              child: SelectableText(result)),
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                              onPressed: () => Navigator.pop(context),
+                                              child: const Text('Закрыть')),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                  icon: const Icon(Icons.search),
+                                  label: const Text('Поиск по документации'),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть')),
       ],
     );
   }

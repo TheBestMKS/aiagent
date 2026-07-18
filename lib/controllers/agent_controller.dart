@@ -4,10 +4,34 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../core/app_constants.dart';
 import '../core/models.dart';
 import '../core/runtime_types.dart';
+import '../agent_core/context/tool_output_compactor.dart';
+import '../agent_core/dependencies/cpp_dependency_preflight.dart';
+import '../agent_core/build/build_failure_analyzer.dart';
+import '../agent_core/build/build_working_directory_resolver.dart';
+import '../agent_core/build/cmake_command_resolver.dart';
+import '../agent_core/build/cpp_build_command_builder.dart';
+import '../agent_core/memory/local_memory_service.dart';
+import '../agent_core/planning/task_intent_analyzer.dart';
+import '../agent_core/retrieval/web_content_extractor.dart';
+import '../agent_core/runs/adaptive_agent_budget.dart';
+import '../agent_core/runs/agent_run_checkpoint.dart';
+import '../agent_core/runs/agent_run_checkpoint_store.dart';
+import '../agent_core/safety/tool_call_contract.dart';
+import '../agent_core/safety/tool_call_json_repair.dart';
+import '../agent_core/safety/tool_execution_guard.dart';
+import '../agent_core/safety/unsupported_success_claim_guard.dart';
+import '../agent_core/security/secret_redactor.dart';
+import '../agent_core/terminal/interactive_terminal_service.dart';
+import '../agent_core/verification/task_completion_gate.dart';
+import '../agent_core/verification/task_evidence_ledger.dart';
+import '../agent_core/verification/verification_command_classifier.dart';
+import '../plugins/plugin_manager.dart';
+import '../plugins/plugin_models.dart';
 import '../document_tools/office_document_tools.dart' as office;
 import '../utils/path_utils.dart';
 import '../utils/process_utils.dart';
@@ -17,6 +41,50 @@ class AgentController {
   Directory configRoot = Directory('config');
   Directory distribRoot = Directory('distrib');
   Directory toolsRoot = Directory('tools');
+  Directory pluginsRoot = Directory('plugins');
+  LocalMemoryService? localMemory;
+  PluginManager? pluginManager;
+  AgentRunCheckpointStore? taskCheckpointStore;
+  AgentRunCheckpoint? activeRunCheckpoint;
+  AgentRunCheckpoint? interruptedRunCheckpoint;
+  final ToolExecutionGuard toolExecutionGuard = ToolExecutionGuard();
+  final TaskEvidenceLedger taskEvidenceLedger = TaskEvidenceLedger();
+  final TaskIntentAnalyzer taskIntentAnalyzer = const TaskIntentAnalyzer();
+  final WebContentExtractor webContentExtractor = const WebContentExtractor();
+  TaskIntentProfile? activeTaskIntent;
+  String activeRelevantMemoryContext = '';
+  final InteractiveTerminalService terminalService =
+      InteractiveTerminalService();
+  final BuildFailureAnalyzer buildFailureAnalyzer =
+      const BuildFailureAnalyzer();
+  BuildFailureAnalysis? lastBuildFailureAnalysis;
+  int buildFailureRevision = 0;
+  final Map<String, int> fileReadAtBuildFailureRevision = <String, int>{};
+  final Map<String, String> fileReadRangesAtBuildFailureRevision =
+      <String, String>{};
+  final Set<String> buildDiagnosticsRun = <String>{};
+  int consecutiveTaskStatusCalls = 0;
+  int consecutiveCircuitBreakerBlocks = 0;
+  int consecutiveInvalidToolCalls = 0;
+  CppDependencyAvailability? currentCppDependencyAvailability;
+  final Set<String> autoLearnedVerificationCommands = <String>{};
+  bool buildRetryRequired = false;
+  String requiredBuildRetryCommand = '';
+  String requiredBuildRetryWorkingDirectory = '';
+  bool buildMutationAwaitingRetry = false;
+  bool pluginAutoCheckEnabled = true;
+  bool pluginAutoUpdateEnabled = false;
+  bool toolOutputCompactionEnabled = true;
+  bool taskCheckpointingEnabled = true;
+  bool toolCircuitBreakerEnabled = true;
+  bool autoLearnVerifiedRunsEnabled = true;
+  PluginOperationStatus pluginOperationStatus =
+      const PluginOperationStatus.idle();
+  List<PluginUpdateInfo> pendingPluginUpdates = const [];
+  Future<List<String>?> Function(List<PluginUpdateInfo> updates)?
+      pluginUpdateSelector;
+  List<AgentPlugin> get plugins =>
+      pluginManager?.plugins ?? const <AgentPlugin>[];
   Directory get downloadsRoot =>
       Directory(pathJoin(toolsRoot.path, 'downloads'));
   String appRootPath = Directory.current.path;
@@ -131,6 +199,8 @@ class AgentController {
   int problemSolvingAttempts = 0;
   int autoRecoveryAttempts = 0;
   int taskInternetActions = 0;
+  int currentAgentIteration = 0;
+  int taskProgressRevision = 0;
   String lastFinalAnswerQualityIssue = '';
   final List<ConsoleQuickAction> generatedConsoleQuickActions = [];
   final Map<String, int> taskFileMutationAttempts = {};
@@ -172,7 +242,8 @@ class AgentController {
   void log(String message) {
     if (!loggingEnabled) return;
     final time = DateTime.now().toIso8601String();
-    final line = '[$time] $message';
+    final safeMessage = SecretRedactor.redact(message);
+    final line = '[$time] $safeMessage';
     executionLog.add(line);
     if (executionLog.length > 4000) {
       executionLog.removeRange(0, executionLog.length - 4000);
@@ -233,7 +304,7 @@ class AgentController {
       'action': action,
       ...data,
     };
-    final encoded = jsonEncode(payload);
+    final encoded = jsonEncode(SecretRedactor.redactObject(payload));
     try {
       currentActionLogFile?.writeAsStringSync('$encoded\n',
           mode: FileMode.append, encoding: utf8);
@@ -974,7 +1045,7 @@ class AgentController {
     status = 'Запуск приложения...';
     notifyUi();
     try {
-      appRootPath = resolveDefaultAppRootPath();
+      appRootPath = await resolvePersistentAppRootPath();
       await Directory(appRootPath).create(recursive: true);
       log('APP START: $appName');
       log('CHECK platform=${Platform.operatingSystem} currentDirectory=${safeCurrentDirectoryPath()} appRoot=$appRootPath');
@@ -983,6 +1054,7 @@ class AgentController {
       projectsRoot = Directory(pathJoin(appRootPath, 'Projects'));
       distribRoot = Directory(pathJoin(appRootPath, 'distrib'));
       toolsRoot = Directory(pathJoin(appRootPath, 'tools'));
+      pluginsRoot = Directory(pathJoin(appRootPath, 'plugins'));
       await loadAppSettings(defaultProjectsRoot: projectsRoot.path);
       unawaited(configureWindowsTrayBridge());
       try {
@@ -1002,7 +1074,24 @@ class AgentController {
       await Directory(pathJoin(
               toolsRoot.path, Platform.operatingSystem, hostArchSegment))
           .create(recursive: true);
-      log('CHECK folders: Projects=${projectsRoot.path}; config=${configRoot.path}; distrib=${distribRoot.path}; tools=${toolsRoot.path}');
+      await pluginsRoot.create(recursive: true);
+      localMemory = LocalMemoryService(configRoot: configRoot);
+      await localMemory!.initialize();
+      await localMemory!.migrateLegacy(
+        knowledgeBase: knowledgeBaseFile(),
+        solutionMemory: solutionMemoryFile,
+      );
+      pluginManager = PluginManager(
+        pluginsRoot: pluginsRoot,
+        networkAllowed: () => allowInternetUse,
+        onStatus: (value) {
+          pluginOperationStatus = value;
+          notifyUi();
+        },
+        onChanged: notifyUi,
+      );
+      await pluginManager!.initialize();
+      log('CHECK folders: Projects=${projectsRoot.path}; config=${configRoot.path}; distrib=${distribRoot.path}; tools=${toolsRoot.path}; plugins=${pluginsRoot.path}');
       if (!Platform.isAndroid) {
         await logStartupLlamaScan().timeout(const Duration(seconds: 3),
             onTimeout: () {
@@ -1044,8 +1133,20 @@ class AgentController {
           : 'Открыт проект: ${currentProject!.name}';
       log('APP READY: projects=${projects.length}; profiles=${profiles.length}; selectedProfile=$selectedProfileId');
       notifyUi();
+      if (pluginAutoCheckEnabled && allowInternetUse) {
+        unawaited(checkPluginUpdatesOnStartup());
+      }
     } catch (e, st) {
       markInitializationFailed(e, st);
+    }
+  }
+
+  Future<String> resolvePersistentAppRootPath() async {
+    if (!Platform.isAndroid) return resolveDefaultAppRootPath();
+    try {
+      return (await getApplicationSupportDirectory()).path;
+    } catch (_) {
+      return resolveDefaultAppRootPath();
     }
   }
 
@@ -1087,6 +1188,18 @@ class AgentController {
       final data = jsonDecode(await file.readAsString(encoding: utf8))
           as Map<String, dynamic>;
       appLanguage = data['language']?.toString() ?? appLanguage;
+      loggingEnabled = data['loggingEnabled'] is bool
+          ? data['loggingEnabled'] as bool
+          : loggingEnabled;
+      qualityCheckEnabled = data['qualityCheckEnabled'] is bool
+          ? data['qualityCheckEnabled'] as bool
+          : qualityCheckEnabled;
+      maxAgentIterations = (data['maxAgentIterations'] is num
+              ? (data['maxAgentIterations'] as num).toInt()
+              : int.tryParse(data['maxAgentIterations']?.toString() ?? '') ??
+                  maxAgentIterations)
+          .clamp(1, 1000)
+          .toInt();
       uiScale = (data['uiScale'] is num
               ? (data['uiScale'] as num).toDouble()
               : double.tryParse(data['uiScale']?.toString() ?? '') ?? uiScale)
@@ -1123,6 +1236,25 @@ class AgentController {
       isolatedToolsEnabled = data['isolatedToolsEnabled'] is bool
           ? data['isolatedToolsEnabled'] as bool
           : isolatedToolsEnabled;
+      pluginAutoCheckEnabled = data['pluginAutoCheckEnabled'] is bool
+          ? data['pluginAutoCheckEnabled'] as bool
+          : pluginAutoCheckEnabled;
+      pluginAutoUpdateEnabled = data['pluginAutoUpdateEnabled'] is bool
+          ? data['pluginAutoUpdateEnabled'] as bool
+          : pluginAutoUpdateEnabled;
+      toolOutputCompactionEnabled = data['toolOutputCompactionEnabled'] is bool
+          ? data['toolOutputCompactionEnabled'] as bool
+          : toolOutputCompactionEnabled;
+      taskCheckpointingEnabled = data['taskCheckpointingEnabled'] is bool
+          ? data['taskCheckpointingEnabled'] as bool
+          : taskCheckpointingEnabled;
+      toolCircuitBreakerEnabled = data['toolCircuitBreakerEnabled'] is bool
+          ? data['toolCircuitBreakerEnabled'] as bool
+          : toolCircuitBreakerEnabled;
+      autoLearnVerifiedRunsEnabled =
+          data['autoLearnVerifiedRunsEnabled'] is bool
+              ? data['autoLearnVerifiedRunsEnabled'] as bool
+              : autoLearnVerifiedRunsEnabled;
       emailAccounts = (data['emailAccounts'] as List<dynamic>? ?? [])
           .whereType<Map>()
           .map((m) => EmailAccountConfig.fromJson(
@@ -1192,6 +1324,9 @@ class AgentController {
     await file.writeAsString(
       const JsonEncoder.withIndent('  ').convert({
         'language': appLanguage,
+        'loggingEnabled': loggingEnabled,
+        'qualityCheckEnabled': qualityCheckEnabled,
+        'maxAgentIterations': maxAgentIterations,
         'uiScale': uiScale,
         'defaultPermissionMode': defaultPermissionMode.name,
         'defaultCreationMode': defaultCreationMode.name,
@@ -1208,6 +1343,12 @@ class AgentController {
         'llamaProcessLoggingEnabled': llamaProcessLoggingEnabled,
         'llamaAutoRestartEnabled': llamaAutoRestartEnabled,
         'isolatedToolsEnabled': isolatedToolsEnabled,
+        'pluginAutoCheckEnabled': pluginAutoCheckEnabled,
+        'pluginAutoUpdateEnabled': pluginAutoUpdateEnabled,
+        'toolOutputCompactionEnabled': toolOutputCompactionEnabled,
+        'taskCheckpointingEnabled': taskCheckpointingEnabled,
+        'toolCircuitBreakerEnabled': toolCircuitBreakerEnabled,
+        'autoLearnVerifiedRunsEnabled': autoLearnVerifiedRunsEnabled,
         'emailAccounts': emailAccounts.map((a) => a.toJson()).toList(),
         'apiOutputTemplates':
             apiOutputTemplates.map((a) => a.toJson()).toList(),
@@ -1256,6 +1397,11 @@ class AgentController {
         buffer.writeln('- ${t.name}: ${t.description}');
       }
     }
+    buffer.writeln(
+        'Local memory: typed, versioned, provenance-aware; golden paths require a passing check and a ruled-out approach.');
+    buffer.writeln('Enabled plugins:');
+    buffer.writeln(pluginManager?.catalogSummaryForPrompt() ??
+        '(plugin manager is not initialized)');
     final text = buffer.toString().trim();
     return text.isEmpty ? '(automation settings are empty)' : text;
   }
@@ -1841,7 +1987,8 @@ class AgentController {
         'task_plan.md',
         'context_summary.md',
         'context.json',
-        'last_context.json'
+        'last_context.json',
+        'runs/active.json'
       ]) {
         final file = File(pathJoin(agentDir.path, name));
         if (await file.exists()) await file.delete();
@@ -1854,6 +2001,8 @@ class AgentController {
       resetTaskState();
       lastContextCompressionBoundaryId = null;
       liveProgressMessageId = null;
+      activeRunCheckpoint = null;
+      interruptedRunCheckpoint = null;
       status = 'Диалог и контекст очищены: ${project.name}';
       recalculateContext();
       notifyUi();
@@ -1946,18 +2095,25 @@ class AgentController {
     }
     projectLoading = true;
     currentProject = project;
+    taskCheckpointStore = null;
+    activeRunCheckpoint = null;
+    interruptedRunCheckpoint = null;
     messages = [];
     status = 'Загрузка проекта: ${project.name}...';
     notifyUi();
     setupProjectLogging(project);
+    await terminalService.configureProject(project.path);
     await loadProjectPermissions(project);
     log('Открыт проект: ${project.path}');
     await Directory(pathJoin(project.path, '.cppagent', 'sessions'))
         .create(recursive: true);
     await loadLatestSessionForCurrentProject();
+    await initializeTaskCheckpointStore(project);
     recalculateContext();
     projectLoading = false;
-    status = 'Открыт проект: ${project.name}';
+    if (interruptedRunCheckpoint == null) {
+      status = 'Открыт проект: ${project.name}';
+    }
     notifyUi();
   }
 
@@ -2518,6 +2674,7 @@ class AgentController {
 
   Future<void> shutdown() async {
     automationSchedulerTimer?.cancel();
+    await terminalService.dispose();
     await stopLocalLlama(reason: 'application shutdown');
   }
 
@@ -3119,7 +3276,8 @@ class AgentController {
         Directory(pathJoin(project.path, '.cppagent', 'sessions'));
     await sessionsDir.create(recursive: true);
     final file = File(pathJoin(sessionsDir.path, 'session.jsonl'));
-    await file.writeAsString('${jsonEncode(message.toJson())}\n',
+    final safeMessage = SecretRedactor.redactObject(message.toJson());
+    await file.writeAsString('${jsonEncode(safeMessage)}\n',
         mode: FileMode.append, encoding: utf8);
   }
 
@@ -3132,6 +3290,8 @@ class AgentController {
     lastCommandText = '';
     lastCommandResultText = '';
     activeTaskText = '';
+    activeTaskIntent = null;
+    activeRelevantMemoryContext = '';
     pendingFileChanges.clear();
     taskFileChanges.clear();
     taskActionSummaries.clear();
@@ -3139,106 +3299,614 @@ class AgentController {
     problemSolvingAttempts = 0;
     autoRecoveryAttempts = 0;
     taskInternetActions = 0;
+    currentAgentIteration = 0;
+    taskProgressRevision = 0;
     lastFinalAnswerQualityIssue = '';
+    lastBuildFailureAnalysis = null;
+    buildFailureRevision = 0;
+    fileReadAtBuildFailureRevision.clear();
+    fileReadRangesAtBuildFailureRevision.clear();
+    buildDiagnosticsRun.clear();
+    consecutiveTaskStatusCalls = 0;
+    consecutiveCircuitBreakerBlocks = 0;
+    consecutiveInvalidToolCalls = 0;
+    currentCppDependencyAvailability = null;
+    autoLearnedVerificationCommands.clear();
+    buildRetryRequired = false;
+    requiredBuildRetryCommand = '';
+    requiredBuildRetryWorkingDirectory = '';
+    buildMutationAwaitingRetry = false;
+    toolExecutionGuard.reset();
+    taskEvidenceLedger.reset();
+  }
+
+  Future<void> initializeTaskCheckpointStore(ProjectInfo project) async {
+    try {
+      taskCheckpointStore = AgentRunCheckpointStore(
+        projectRoot: Directory(project.path),
+      );
+      await taskCheckpointStore!.initialize();
+      if (!taskCheckpointingEnabled) {
+        interruptedRunCheckpoint = null;
+        return;
+      }
+      interruptedRunCheckpoint = await taskCheckpointStore!.loadInterrupted();
+      if (interruptedRunCheckpoint != null) {
+        final checkpoint = interruptedRunCheckpoint!;
+        status =
+            'Обнаружена незавершённая задача: итерация ${checkpoint.iteration}/${checkpoint.maxIterations}';
+        log(
+          'TASK CHECKPOINT RECOVERED: run=${checkpoint.runId}; '
+          'iteration=${checkpoint.iteration}; status=${checkpoint.status.name}',
+        );
+        logAction('task_checkpoint_recovered', checkpoint.toJson());
+      }
+    } catch (error) {
+      taskCheckpointStore = null;
+      interruptedRunCheckpoint = null;
+      log('TASK CHECKPOINT INITIALIZATION ERROR: $error');
+    }
+  }
+
+  Future<void> beginTaskCheckpoint(
+    String prompt, {
+    AgentRunCheckpoint? resumeFrom,
+  }) async {
+    if (!taskCheckpointingEnabled || currentProject == null) return;
+    try {
+      taskCheckpointStore ??= AgentRunCheckpointStore(
+        projectRoot: Directory(currentProject!.path),
+      );
+      if (resumeFrom != null) {
+        activeRunCheckpoint = resumeFrom.copyWith(
+          status: AgentRunStatus.running,
+          maxIterations: maxAgentIterations,
+          updatedAt: DateTime.now(),
+        );
+        await taskCheckpointStore!.save(activeRunCheckpoint!);
+        logAction('task_checkpoint_resumed', activeRunCheckpoint!.toJson());
+      } else {
+        activeRunCheckpoint = await taskCheckpointStore!.begin(
+          prompt: prompt,
+          maxIterations: maxAgentIterations,
+        );
+        logAction('task_checkpoint_started', activeRunCheckpoint!.toJson());
+      }
+      interruptedRunCheckpoint = null;
+      notifyUi();
+    } catch (error) {
+      activeRunCheckpoint = null;
+      log('TASK CHECKPOINT START ERROR: $error');
+    }
+  }
+
+  void restoreTaskStateFromCheckpoint(AgentRunCheckpoint checkpoint) {
+    taskToolActions = checkpoint.toolActions;
+    taskFileMutations = checkpoint.fileMutations;
+    taskCommandRuns = checkpoint.commandRuns;
+    taskFailedCommands = checkpoint.failedCommands;
+    taskInternetActions = checkpoint.internetActions;
+    taskProgressRevision = checkpoint.progressRevision;
+    currentAgentIteration =
+        checkpoint.iteration.clamp(0, maxAgentIterations).toInt();
+    lastToolName = checkpoint.lastTool;
+    lastToolResultText = checkpoint.lastToolResultPreview;
+    lastCommandText = checkpoint.lastCommand;
+    lastCommandResultText = checkpoint.lastCommandResultPreview;
+    lastCommandExitCode = checkpoint.lastCommandExitCode;
+    taskEvidenceLedger.restoreFromJson(checkpoint.evidenceItems);
+    toolExecutionGuard.restore(checkpoint.toolGuardState);
+    final restoredFailureKind = BuildFailureKind.values.firstWhere(
+      (value) => value.name == checkpoint.buildFailureKind,
+      orElse: () => BuildFailureKind.none,
+    );
+    if (restoredFailureKind != BuildFailureKind.none) {
+      lastBuildFailureAnalysis = BuildFailureAnalysis(
+        kind: restoredFailureKind,
+        summary: checkpoint.buildFailureSummary,
+        recommendedAction: checkpoint.buildFailureRecommendedAction,
+        implicatedFiles: checkpoint.buildFailureImplicatedFiles,
+        implicatedLines: checkpoint.buildFailureImplicatedLines,
+        suggestedDiagnosticCommand:
+            checkpoint.buildSuggestedDiagnostic.trim().isEmpty
+                ? null
+                : checkpoint.buildSuggestedDiagnostic,
+        suggestedRecoveryCommand:
+            checkpoint.buildSuggestedRecovery.trim().isEmpty
+                ? null
+                : checkpoint.buildSuggestedRecovery,
+        missingDependency: checkpoint.buildMissingDependency,
+        locatedDependencyPath: checkpoint.buildLocatedDependencyPath,
+      );
+    } else {
+      lastBuildFailureAnalysis = null;
+    }
+    buildRetryRequired = checkpoint.buildRetryRequired;
+    requiredBuildRetryCommand = checkpoint.requiredBuildRetryCommand;
+    requiredBuildRetryWorkingDirectory =
+        checkpoint.requiredBuildRetryWorkingDirectory;
+    buildMutationAwaitingRetry = checkpoint.buildMutationAwaitingRetry;
+    buildFailureRevision = checkpoint.buildFailureRevision;
+    buildDiagnosticsRun
+      ..clear()
+      ..addAll(checkpoint.buildDiagnosticsRun);
+    fileReadAtBuildFailureRevision
+      ..clear()
+      ..addAll(checkpoint.fileReadAtBuildFailureRevision);
+    fileReadRangesAtBuildFailureRevision
+      ..clear()
+      ..addAll(checkpoint.fileReadRangesAtBuildFailureRevision);
+    activeRunCheckpoint = checkpoint;
+  }
+
+  Future<void> updateTaskCheckpoint(
+    AgentRunStatus status, {
+    String? plan,
+    String lastError = '',
+  }) async {
+    if (!taskCheckpointingEnabled || activeRunCheckpoint == null) return;
+    final checkpoint = activeRunCheckpoint!.copyWith(
+      status: status,
+      iteration: currentAgentIteration,
+      maxIterations: maxAgentIterations,
+      plan: plan == null
+          ? null
+          : truncateMiddle(SecretRedactor.redact(plan), 20000),
+      toolActions: taskToolActions,
+      fileMutations: taskFileMutations,
+      commandRuns: taskCommandRuns,
+      failedCommands: taskFailedCommands,
+      internetActions: taskInternetActions,
+      progressRevision: taskProgressRevision,
+      lastTool: lastToolName,
+      lastToolResultPreview:
+          truncateMiddle(SecretRedactor.redact(lastToolResultText), 6000),
+      lastCommand: truncateMiddle(SecretRedactor.redact(lastCommandText), 4000),
+      lastCommandResultPreview:
+          truncateMiddle(SecretRedactor.redact(lastCommandResultText), 8000),
+      lastCommandExitCode: lastCommandExitCode,
+      lastError: SecretRedactor.redact(lastError),
+      evidenceSummary:
+          truncateMiddle(taskEvidenceLedger.summary(maxItems: 10), 30000),
+      evidenceItems: taskEvidenceLedger.toJsonItems(maxItems: 120),
+      toolGuardState: toolExecutionGuard.snapshot(),
+      messageCount: messages.length,
+      buildFailureKind:
+          lastBuildFailureAnalysis?.kind.name ?? BuildFailureKind.none.name,
+      buildFailureSummary: truncateMiddle(
+        lastBuildFailureAnalysis?.summary ?? '',
+        3000,
+      ),
+      buildFailureRecommendedAction: truncateMiddle(
+        lastBuildFailureAnalysis?.recommendedAction ?? '',
+        5000,
+      ),
+      buildFailureImplicatedFiles:
+          lastBuildFailureAnalysis?.implicatedFiles.take(100).toList() ??
+              const <String>[],
+      buildFailureImplicatedLines: lastBuildFailureAnalysis == null
+          ? const <String, int>{}
+          : Map<String, int>.from(
+              lastBuildFailureAnalysis!.implicatedLines,
+            ),
+      buildSuggestedDiagnostic:
+          lastBuildFailureAnalysis?.suggestedDiagnosticCommand ?? '',
+      buildSuggestedRecovery:
+          lastBuildFailureAnalysis?.suggestedRecoveryCommand ?? '',
+      buildMissingDependency: lastBuildFailureAnalysis?.missingDependency ?? '',
+      buildLocatedDependencyPath:
+          lastBuildFailureAnalysis?.locatedDependencyPath ?? '',
+      buildRetryRequired: buildRetryRequired,
+      requiredBuildRetryCommand:
+          truncateMiddle(requiredBuildRetryCommand, 8000),
+      requiredBuildRetryWorkingDirectory: requiredBuildRetryWorkingDirectory,
+      buildMutationAwaitingRetry: buildMutationAwaitingRetry,
+      buildFailureRevision: buildFailureRevision,
+      buildDiagnosticsRun: buildDiagnosticsRun.take(100).toList(),
+      fileReadAtBuildFailureRevision:
+          Map<String, int>.from(fileReadAtBuildFailureRevision),
+      fileReadRangesAtBuildFailureRevision:
+          Map<String, String>.from(fileReadRangesAtBuildFailureRevision),
+      updatedAt: DateTime.now(),
+    );
+    activeRunCheckpoint = checkpoint;
+    try {
+      await taskCheckpointStore?.save(checkpoint);
+    } catch (error) {
+      log('TASK CHECKPOINT SAVE ERROR: $error');
+    }
+    notifyUi();
+  }
+
+  Future<void> completeTaskCheckpoint(
+    AgentRunStatus status, {
+    String error = '',
+  }) async {
+    if (activeRunCheckpoint == null) return;
+    final terminalStatus = status.isTerminal ? status : AgentRunStatus.failed;
+    if (taskCheckpointingEnabled) {
+      await updateTaskCheckpoint(terminalStatus, lastError: error);
+    } else {
+      activeRunCheckpoint = activeRunCheckpoint!.copyWith(
+        status: terminalStatus,
+        lastError: error,
+        updatedAt: DateTime.now(),
+      );
+    }
+    final checkpoint = activeRunCheckpoint!;
+    try {
+      await taskCheckpointStore?.archiveAndClear(checkpoint);
+      logAction('task_checkpoint_archived', checkpoint.toJson());
+    } catch (archiveError) {
+      log('TASK CHECKPOINT ARCHIVE ERROR: $archiveError');
+    }
+    activeRunCheckpoint = null;
+    interruptedRunCheckpoint = null;
+    notifyUi();
+  }
+
+  Future<void> dismissInterruptedTask() async {
+    final checkpoint = interruptedRunCheckpoint;
+    if (checkpoint == null) return;
+    final dismissed = checkpoint.copyWith(
+      status: AgentRunStatus.cancelled,
+      lastError: 'Dismissed by user without resuming',
+      updatedAt: DateTime.now(),
+    );
+    try {
+      await taskCheckpointStore?.archiveAndClear(dismissed);
+    } catch (error) {
+      log('TASK CHECKPOINT DISMISS ERROR: $error');
+    }
+    interruptedRunCheckpoint = null;
+    status = currentProject == null
+        ? 'Готово'
+        : 'Открыт проект: ${currentProject!.name}';
+    notifyUi();
+  }
+
+  bool isContinuationIntent(String value) {
+    final normalized = value
+        .toLowerCase()
+        .replaceAll('ё', 'е')
+        .replaceAll(RegExp(r'[^a-zа-я0-9]+'), ' ')
+        .trim();
+    return const <String>{
+      'продолжай',
+      'продолжи',
+      'продолжить',
+      'продолжай работу',
+      'продолжи работу',
+      'continue',
+      'resume',
+      'keep going',
+    }.contains(normalized);
+  }
+
+  String buildCheckpointRecoveryNote(AgentRunCheckpoint checkpoint) {
+    final note = StringBuffer()
+      ..writeln('Восстановление после прерванного запуска ${checkpoint.runId}.')
+      ..writeln(
+        'Предыдущий статус: ${checkpoint.status.label}; '
+        'итерация ${checkpoint.iteration}/${checkpoint.maxIterations}.',
+      )
+      ..writeln(
+        'Действия: ${checkpoint.toolActions}; '
+        'изменения файлов: ${checkpoint.fileMutations}; '
+        'команды: ${checkpoint.commandRuns}; '
+        'ошибки команд: ${checkpoint.failedCommands}.',
+      );
+    if (checkpoint.plan.trim().isNotEmpty) {
+      note
+        ..writeln('Предыдущий план:')
+        ..writeln(checkpoint.plan.trim());
+    }
+    if (checkpoint.lastTool.trim().isNotEmpty) {
+      note
+        ..writeln('Последний инструмент: ${checkpoint.lastTool}')
+        ..writeln(checkpoint.lastToolResultPreview);
+    }
+    if (checkpoint.lastCommand.trim().isNotEmpty) {
+      note
+        ..writeln('Последняя команда: ${checkpoint.lastCommand}')
+        ..writeln('Exit code: ${checkpoint.lastCommandExitCode ?? 'unknown'}')
+        ..writeln(checkpoint.lastCommandResultPreview);
+    }
+    if (checkpoint.buildRetryRequired) {
+      note
+        ..writeln('Незавершённая диагностика сборки:')
+        ..writeln('Тип: ${checkpoint.buildFailureKind}')
+        ..writeln(checkpoint.buildFailureSummary)
+        ..writeln(
+            'Требуется повторить: ${checkpoint.requiredBuildRetryCommand}');
+    }
+    if (checkpoint.evidenceSummary.trim().isNotEmpty) {
+      note
+        ..writeln('Сохранённые доказательства:')
+        ..writeln(checkpoint.evidenceSummary);
+    }
+    note.writeln(
+      'Не начинай задачу заново. Продолжи с сохранённого состояния, '
+      'сначала устрани последнюю неподтверждённую ошибку и повтори проверку.',
+    );
+    return note.toString();
+  }
+
+  Future<void> resumeInterruptedTask() async {
+    final checkpoint = interruptedRunCheckpoint;
+    if (checkpoint == null || busy) return;
+    await sendPrompt(
+      checkpoint.prompt,
+      '',
+      displayPrompt:
+          'Продолжить незавершённую задачу: ${truncateMiddle(checkpoint.prompt, 400)}',
+      recoveryNote: buildCheckpointRecoveryNote(checkpoint),
+      resumeCheckpoint: checkpoint,
+    );
+  }
+
+  TaskCompletionAssessment currentTaskCompletionAssessment() {
+    return TaskCompletionGate.assess(
+      evidence: taskEvidenceLedger,
+      expectsMutation: taskLooksLikeRequiresFiles(),
+      expectsVerification:
+          taskLooksLikeRequiresCommand() || taskFileMutations > 0,
+      expectsResearch: taskLooksLikeWebResearchTask(),
+      lastCommandExitCode: lastCommandExitCode,
+      circuitBreakerBlocks:
+          toolCircuitBreakerEnabled ? toolExecutionGuard.blockedCalls : 0,
+    );
+  }
+
+  String currentTaskStatusReport() {
+    final checkpoint = activeRunCheckpoint ?? interruptedRunCheckpoint;
+    final isInterruptedOnly = activeRunCheckpoint == null && checkpoint != null;
+    final iteration =
+        isInterruptedOnly ? checkpoint.iteration : currentAgentIteration;
+    final maxIterations = checkpoint?.maxIterations ?? maxAgentIterations;
+    final actions =
+        isInterruptedOnly ? checkpoint.toolActions : taskToolActions;
+    final files =
+        isInterruptedOnly ? checkpoint.fileMutations : taskFileMutations;
+    final commands =
+        isInterruptedOnly ? checkpoint.commandRuns : taskCommandRuns;
+    final failedCommands =
+        isInterruptedOnly ? checkpoint.failedCommands : taskFailedCommands;
+    final internetActions =
+        isInterruptedOnly ? checkpoint.internetActions : taskInternetActions;
+    final buffer = StringBuffer()
+      ..writeln('TASK_STATUS')
+      ..writeln('iteration=$iteration/$maxIterations')
+      ..writeln(
+        'actions=$actions; files=$files; commands=$commands; '
+        'failed_commands=$failedCommands; internet_actions=$internetActions',
+      );
+    if (isInterruptedOnly) {
+      buffer
+        ..writeln('TOOL_GUARD: restored after Continue')
+        ..writeln(checkpoint.evidenceSummary.isEmpty
+            ? 'TASK_EVIDENCE: none'
+            : checkpoint.evidenceSummary);
+    } else {
+      buffer
+        ..writeln(toolExecutionGuard.statusSummary())
+        ..writeln(taskEvidenceLedger.summary(maxItems: 18));
+    }
+    if (!isInterruptedOnly) {
+      final buildAnalysis = lastBuildFailureAnalysis;
+      if (buildAnalysis != null) {
+        buffer.writeln(buildAnalysis.toPromptBlock());
+      }
+      if (buildRetryRequired) {
+        buffer.writeln(
+          'BUILD_RETRY_REQUIRED: повтори сборку после исправления. '
+          'Предпочтительная команда: ${requiredBuildRetryCommand.isEmpty ? 'run_tests' : requiredBuildRetryCommand}',
+        );
+      }
+      buffer.writeln(currentTaskCompletionAssessment().summary);
+    }
+    if (checkpoint != null) {
+      buffer
+        ..writeln('checkpoint_run=${checkpoint.runId}')
+        ..writeln('checkpoint_status=${checkpoint.status.name}');
+      if (checkpoint.plan.trim().isNotEmpty) {
+        buffer
+          ..writeln('PLAN')
+          ..writeln(checkpoint.plan.trim());
+      }
+    }
+    return buffer.toString().trimRight();
+  }
+
+  Future<List<AgentRunCheckpoint>> recentTaskRuns({int maxItems = 30}) async {
+    final project = currentProject;
+    if (project == null) return const <AgentRunCheckpoint>[];
+    taskCheckpointStore ??= AgentRunCheckpointStore(
+      projectRoot: Directory(project.path),
+    );
+    return taskCheckpointStore!.loadRecent(maxItems: maxItems);
+  }
+
+  Future<void> clearTaskRunHistory() async {
+    final project = currentProject;
+    if (project == null) return;
+    taskCheckpointStore ??= AgentRunCheckpointStore(
+      projectRoot: Directory(project.path),
+    );
+    await taskCheckpointStore!.clearHistory();
+    logAction('task_history_cleared', {'project': project.path});
+    notifyUi();
+  }
+
+  bool toolResultLooksSuccessful(String toolName, String result) {
+    final lower = result.toLowerCase();
+    if (toolName == 'run_command' || toolName == 'run_tests') {
+      return commandOutputHasSuccessfulExit(result) ||
+          lower.contains('final_status: success') ||
+          lower.contains('build_artifact_ok');
+    }
+    if (lower.contains('permission denied') ||
+        lower.contains('tool_circuit_breaker') ||
+        lower.contains('_blocked') ||
+        lower.contains('_requires_') ||
+        lower.contains('_required') ||
+        lower.contains('_mismatch') ||
+        lower.contains('_failed') ||
+        lower.startsWith('failed') ||
+        lower.startsWith('error') ||
+        lower.contains('exception:')) {
+      return false;
+    }
+    if (lower.contains('not found') &&
+        const {
+          'read_file',
+          'read_device_text_file',
+          'read_document_structure',
+          'extract_zip',
+          'extract_zip_to_tools',
+          'inspect_zip',
+        }.contains(toolName)) {
+      return false;
+    }
+    return result.trim().isNotEmpty;
+  }
+
+  Future<void> autoLearnVerifiedRun() async {
+    if (!autoLearnVerifiedRunsEnabled || localMemory == null) return;
+    if (!taskEvidenceLedger.hasSuccessfulMutation ||
+        !taskEvidenceLedger.hasPassingVerification ||
+        lastCommandExitCode != 0) {
+      return;
+    }
+    final project = currentProject;
+    final memoryPrompt = (activeRunCheckpoint?.prompt ?? activeTaskText).trim();
+    if (project == null || memoryPrompt.isEmpty) return;
+    final confidence = taskEvidenceLedger.confidence(
+      expectsMutation: true,
+      expectsVerification: true,
+      expectsResearch: taskLooksLikeWebResearchTask(),
+    );
+    final content = StringBuffer()
+      ..writeln('Задача: ${truncateMiddle(memoryPrompt, 4000)}')
+      ..writeln('Проверка: последняя команда завершилась с EXIT_CODE: 0.')
+      ..writeln('Инструменты: $taskToolActions; команды: $taskCommandRuns.')
+      ..writeln()
+      ..writeln(taskEvidenceLedger.summary(maxItems: 20));
+    await localMemory!.remember(
+      type: AgentMemoryType.learning,
+      key: 'verified_run:${truncateMiddle(memoryPrompt, 240)}',
+      title: 'Проверенное выполнение: ${truncateMiddle(memoryPrompt, 180)}',
+      content: content.toString().trimRight(),
+      scope: 'project',
+      projectPath: project.path,
+      source: activeRunCheckpoint?.runId ?? 'agent-run',
+      provenance: 'verified-agent-run',
+      confidence: confidence,
+      verified: true,
+      verification: 'EXIT_CODE: 0; evidence ledger confirmed',
+      failedApproaches: taskEvidenceLedger.failedApproaches(),
+      tags: const ['automatic-learning', 'verified-run'],
+    );
+    log('AUTO MEMORY: verified run stored for ${project.name}');
+  }
+
+  Future<void> persistTaskAttemptMemory(
+      AgentRunStatus status, String error) async {
+    final memory = localMemory;
+    final project = currentProject;
+    if (memory == null || project == null || taskEvidenceLedger.items.isEmpty) {
+      return;
+    }
+    final prompt = (activeRunCheckpoint?.prompt ?? activeTaskText).trim();
+    if (prompt.isEmpty) return;
+    final runId = activeRunCheckpoint?.runId ??
+        'run_${DateTime.now().microsecondsSinceEpoch}';
+    final verified = status == AgentRunStatus.completed &&
+        (taskEvidenceLedger.hasPassingVerification ||
+            taskEvidenceLedger.hasSuccessfulResearch ||
+            (!activeTaskIntent!.expectsMutation &&
+                taskEvidenceLedger.items.any((item) => item.successful)));
+    final content = StringBuffer()
+      ..writeln('Задача: ${truncateMiddle(prompt, 5000)}')
+      ..writeln('Статус: ${status.name}')
+      ..writeln(
+          'Ошибка: ${error.trim().isEmpty ? '(нет)' : truncateMiddle(error, 2000)}')
+      ..writeln()
+      ..writeln(taskEvidenceLedger.decisionContext(maxItems: 36));
+    await memory.remember(
+      type: verified ? AgentMemoryType.learning : AgentMemoryType.observation,
+      key: 'task-attempt:$runId',
+      title: 'Ход задачи (${status.name}): ${truncateMiddle(prompt, 180)}',
+      content: content.toString().trimRight(),
+      scope: 'project',
+      projectPath: project.path,
+      source: runId,
+      provenance: 'automatic-attempt-journal',
+      confidence: verified ? 0.9 : 0.65,
+      verified: verified,
+      verification: verified
+          ? taskEvidenceLedger.groundedVerificationSummary
+          : 'Завершение не подтверждено; использовать как журнал попыток.',
+      failedApproaches: taskEvidenceLedger.failedApproaches(maxItems: 12),
+      tags: [
+        'attempt-journal',
+        status.name,
+        ...?activeTaskIntent?.domains.map((domain) => domain.name),
+      ],
+    );
+  }
+
+  Future<String> relevantMemoryForPrompt(String prompt) async {
+    final memory = localMemory;
+    final project = currentProject;
+    if (memory == null || project == null) return '(релевантной памяти нет)';
+    try {
+      return truncateMiddle(
+        await memory.formatSearchResults(prompt,
+            maxResults: 8, projectPath: project.path),
+        18000,
+      );
+    } catch (error) {
+      log('RELEVANT MEMORY LOAD ERROR: $error');
+      return '(не удалось загрузить релевантную память: $error)';
+    }
   }
 
   String classifyTaskKind(String prompt) {
-    final lower = prompt.toLowerCase();
-    if (lower.contains('почт') ||
-        lower.contains('email') ||
-        lower.contains('e-mail') ||
-        lower.contains('imap') ||
-        lower.contains('smtp')) return 'email';
-    if (lower.contains('презентац') ||
-        lower.contains('pptx') ||
-        lower.contains('слайды')) return 'presentation';
-    if (lower.contains('документ') ||
-        lower.contains('docx') ||
-        lower.contains('xlsx') ||
-        lower.contains('pdf') ||
-        lower.contains('требован')) return 'document_work';
-    if (lower.contains('папк') ||
-        lower.contains('файл') ||
-        lower.contains('архив') ||
-        lower.contains('o:\\') ||
-        lower.contains('удали') ||
-        lower.contains('создай файл')) return 'device_files';
-    if (lower.contains('ssh') ||
-        lower.contains('telnet') ||
-        lower.contains('powershell') ||
-        lower.contains('настрой') ||
-        lower.contains('сервер')) return 'system_admin';
-    if (lower.contains('c++') ||
-        lower.contains('python') ||
-        lower.contains('flutter') ||
-        lower.contains('php') ||
-        lower.contains('html') ||
-        lower.contains('програм') ||
-        lower.contains('код') ||
-        lower.contains('скомпил')) return 'software';
-    return 'general';
+    return taskIntentAnalyzer.analyze(prompt).primaryDomain.name;
   }
 
-  bool taskLooksLikeSoftwareCreation(String prompt) =>
-      classifyTaskKind(prompt) == 'software';
+  bool taskLooksLikeSoftwareCreation(String prompt) {
+    final intent = activeTaskIntent ?? taskIntentAnalyzer.analyze(prompt);
+    return intent.hasDomain(TaskDomain.software) && intent.expectsMutation;
+  }
 
   bool taskNeedsProjectPreflight(String prompt) {
-    final lower = prompt.toLowerCase();
-    if (classifyTaskKind(prompt) != 'software') return false;
-    if (lower.contains('найди документ') ||
-        lower.contains('найти документ') ||
-        lower.contains('на компьютере')) return false;
-    return true;
+    final intent = activeTaskIntent ?? taskIntentAnalyzer.analyze(prompt);
+    return intent.requiresProjectAudit;
   }
 
   Future<String> projectPreflightAudit(String prompt) async {
     final project = currentProject;
     if (project == null) return '';
-    if (!taskNeedsProjectPreflight(prompt)) return '';
-    final kind = classifyTaskKind(prompt);
+    final intent = activeTaskIntent ?? taskIntentAnalyzer.analyze(prompt);
     final entries = <String>[];
-    try {
-      for (final entity in Directory(project.path)
-          .listSync(recursive: false, followLinks: false)) {
-        final name = pathBasename(entity.path);
-        if (name == '.cppagent') continue;
-        entries.add(entity is Directory ? 'DIR:$name' : 'FILE:$name');
+    if (intent.requiresProjectAudit) {
+      try {
+        for (final entity in Directory(project.path)
+            .listSync(recursive: false, followLinks: false)) {
+          final name = pathBasename(entity.path);
+          if (name == '.cppagent') continue;
+          entries.add(entity is Directory ? 'DIR:$name' : 'FILE:$name');
+        }
+      } catch (e) {
+        entries.add('PROJECT_LIST_ERROR:$e');
       }
-    } catch (e) {
-      entries.add('PROJECT_LIST_ERROR:$e');
     }
-    final obviousBuildTrash = entries
-        .where((e) =>
-            e.contains('CMakeFiles') ||
-            e.contains('CMakeCache.txt') ||
-            e.contains('cmake_install.cmake') ||
-            e.contains('build.ninja'))
-        .join(', ');
-    final hasUserFiles = entries
-        .any((e) => !e.contains('CMakeFiles') && !e.contains('CMakeCache.txt'));
-    final buffer = StringBuffer();
-    buffer.writeln('[PROJECT_PREFLIGHT_AUDIT]');
-    buffer.writeln('task_kind=$kind');
-    buffer.writeln('project=${project.path}');
-    buffer.writeln('root_entries=${entries.take(80).join(' | ')}');
-    if (obviousBuildTrash.isNotEmpty)
-      buffer.writeln('obvious_build_artifacts=$obviousBuildTrash');
-    buffer.writeln('rules:');
-    buffer.writeln(
-        '- Сначала определи, соответствуют ли существующие файлы задаче пользователя.');
-    buffer.writeln(
-        '- Если файлов нет или они не относятся к задаче, создай нужную структуру с нуля.');
-    buffer.writeln(
-        '- Если файлы явно чужие/мусорные для текущей задачи, используй move_path в `.cppagent/reserved_before_task/<timestamp>/`, затем создавай правильный проект.');
-    buffer.writeln(
-        '- Не переписывай один файл десятки раз. После 2-4 изменений запускай run_tests/run_command или читай ошибку и исправляй точечно.');
-    buffer.writeln(
-        '- Для разработки ПО обязательный порядок: audit -> план -> файлы -> сборка/запуск -> исправления -> повторная проверка -> итог.');
-    buffer.writeln(
-        '- Для работы с документами/файлами устройства используй специальные инструменты чтения/поиска, а не компиляцию.');
-    buffer.writeln('has_user_files=$hasUserFiles');
-    buffer.writeln('[/PROJECT_PREFLIGHT_AUDIT]');
-    return buffer.toString();
+    return intent.toPromptBlock(
+      projectPath: project.path,
+      projectEntries: entries,
+    );
   }
 
   Future<void> reserveObviousStaleBuildArtifacts(String prompt) async {
@@ -3281,11 +3949,39 @@ class AgentController {
     }
   }
 
-  Future<void> sendPrompt(String rawPrompt, String attachmentPath) async {
+  Future<void> sendPrompt(
+    String rawPrompt,
+    String attachmentPath, {
+    String displayPrompt = '',
+    String recoveryNote = '',
+    AgentRunCheckpoint? resumeCheckpoint,
+  }) async {
     final project = currentProject;
     if (project == null) return;
-    final prompt = rawPrompt.trim();
+    var prompt = rawPrompt.trim();
     if (prompt.isEmpty) return;
+    var effectiveDisplayPrompt = displayPrompt;
+    var effectiveRecoveryNote = recoveryNote;
+    var effectiveResumeCheckpoint = resumeCheckpoint;
+    if (effectiveResumeCheckpoint == null && isContinuationIntent(prompt)) {
+      taskCheckpointStore ??= AgentRunCheckpointStore(
+        projectRoot: Directory(project.path),
+      );
+      await taskCheckpointStore!.initialize();
+      effectiveResumeCheckpoint = interruptedRunCheckpoint ??
+          await taskCheckpointStore!.loadLatestResumableHistory();
+      if (effectiveResumeCheckpoint != null) {
+        final checkpoint = effectiveResumeCheckpoint;
+        prompt = checkpoint.prompt;
+        effectiveDisplayPrompt =
+            'Продолжить предыдущую задачу: ${truncateMiddle(checkpoint.prompt, 400)}';
+        effectiveRecoveryNote = buildCheckpointRecoveryNote(checkpoint);
+        log(
+          'CONTINUATION INTENT RESOLVED: restored run=${checkpoint.runId}; '
+          'status=${checkpoint.status.name}; iteration=${checkpoint.iteration}',
+        );
+      }
+    }
     busy = true;
     cancelRequested = false;
     status = 'Агент выполняет задачу...';
@@ -3293,20 +3989,43 @@ class AgentController {
     expandedActionKey = null;
     expandedCodeBlockKey = null;
     resetTaskState();
+    final isRecovery = effectiveResumeCheckpoint != null;
+    if (effectiveResumeCheckpoint != null) {
+      restoreTaskStateFromCheckpoint(effectiveResumeCheckpoint);
+    }
+    activeTaskIntent = taskIntentAnalyzer.analyze(prompt);
+    activeRelevantMemoryContext = await relevantMemoryForPrompt(prompt);
+    if (CppDependencyPreflight.taskLooksLikeImageMl(prompt)) {
+      currentCppDependencyAvailability =
+          CppDependencyPreflight.probe(toolsRoot);
+      log(
+        'CPP DEPENDENCY PREFLIGHT: '
+        'opencv=${currentCppDependencyAvailability!.openCvConfirmed}; '
+        'libtorch=${currentCppDependencyAvailability!.libTorchConfirmed}; '
+        'onnx=${currentCppDependencyAvailability!.onnxRuntimeConfirmed}; '
+        'entries=${currentCppDependencyAvailability!.inspectedEntries}',
+      );
+    }
     log('USER PROMPT (${project.name}): ${truncateMiddle(prompt, 8000)}');
     log('AGENT RIGHTS: permission=${permissionMode.label}; creationMode=${creationMode.label}; qualityCheck=$qualityCheckEnabled');
     logAction('user_prompt', {
       'project_name': project.name,
-      'prompt': truncateMiddle(prompt, 20000),
+      'prompt': truncateMiddle(SecretRedactor.redact(prompt), 20000),
       'permission_mode': permissionMode.name,
       'creation_mode': creationMode.name,
       'quality_check': qualityCheckEnabled
     });
-    await reserveObviousStaleBuildArtifacts(prompt);
-    final preflightAudit = await projectPreflightAudit(prompt);
+    if (!isRecovery) await reserveObviousStaleBuildArtifacts(prompt);
+    final taskExecutionFrame = await projectPreflightAudit(prompt);
     final serviceContext = StringBuffer();
-    if (preflightAudit.trim().isNotEmpty) {
-      serviceContext.writeln(preflightAudit.trim());
+    if (effectiveRecoveryNote.trim().isNotEmpty) {
+      serviceContext.writeln('[RECOVERY_CONTEXT]');
+      serviceContext.writeln(effectiveRecoveryNote.trim());
+      serviceContext.writeln('[/RECOVERY_CONTEXT]');
+      serviceContext.writeln();
+    }
+    if (taskExecutionFrame.trim().isNotEmpty) {
+      serviceContext.writeln(taskExecutionFrame.trim());
       serviceContext.writeln();
     }
     final attachments = <String>[...attachedFiles];
@@ -3367,10 +4086,17 @@ class AgentController {
     activeTaskText = hiddenTaskContext.isEmpty
         ? prompt
         : '$prompt\n\n[HIDDEN_TASK_CONTEXT]\n$hiddenTaskContext\n[/HIDDEN_TASK_CONTEXT]';
+    await beginTaskCheckpoint(prompt, resumeFrom: effectiveResumeCheckpoint);
     final profileForLimits = currentProfile;
-    if (profileForLimits != null)
+    if (profileForLimits != null) {
       runtimeLimitsCache.remove(runtimeCacheKey(profileForLimits));
-    final userMessage = ChatMessage(role: 'user', content: prompt);
+    }
+    final userMessage = ChatMessage(
+      role: 'user',
+      content: effectiveDisplayPrompt.trim().isEmpty
+          ? prompt
+          : effectiveDisplayPrompt.trim(),
+    );
     messages.add(userMessage);
     await appendSession(userMessage);
     await startLiveProgress('⏳ Задача получена. Готовлю действия агента...');
@@ -3389,11 +4115,14 @@ ${localToolsCompactSummary(maxItems: 80)}
 **C++/CMake:** `run_tests` теперь сам ищет `*.cpp` в проекте и подпапках, создаёт/исправляет минимальный `CMakeLists.txt` только для сборки найденного исходника и использует CMake/Visual Studio, если нет `g++`.''';
       await finishLiveProgress(text, actionSummaries: currentActionSummaries());
       status = 'Готово';
+      await completeTaskCheckpoint(AgentRunStatus.completed);
       busy = false;
       recalculateContext();
       notifyUi();
       return;
     }
+    var runStatus = AgentRunStatus.completed;
+    var runError = '';
     try {
       if (await tryDirectDeviceArchiveTask(prompt, selectedLocationSnapshot)) {
         status = 'Готово';
@@ -3401,9 +4130,14 @@ ${localToolsCompactSummary(maxItems: 80)}
       }
       await tryDirectDocumentSearchTask(prompt, selectedLocationSnapshot);
       await tryDirectComputerWideSearchTask(prompt);
-      await runAgentLoop();
+      final startIteration = isRecovery
+          ? (currentAgentIteration + 1).clamp(1, maxAgentIterations).toInt()
+          : 1;
+      await runAgentLoop(startIteration: startIteration);
       status = 'Готово';
     } catch (error, stack) {
+      runStatus = AgentRunStatus.failed;
+      runError = error.toString();
       await removeLiveProgress();
       final message =
           ChatMessage(role: 'assistant', content: 'Ошибка агента: $error');
@@ -3412,6 +4146,27 @@ ${localToolsCompactSummary(maxItems: 80)}
       log('AGENT ERROR: $error\n$stack');
       status = 'Ошибка';
     } finally {
+      final wasCancelled = cancelRequested;
+      if (runStatus != AgentRunStatus.failed &&
+          qualityCheckEnabled &&
+          taskIncompleteReason().isNotEmpty) {
+        runStatus = AgentRunStatus.failed;
+        runError = taskIncompleteReason();
+      }
+      if (wasCancelled) runStatus = AgentRunStatus.cancelled;
+      if (runStatus == AgentRunStatus.completed) {
+        try {
+          await autoLearnVerifiedRun();
+        } catch (error) {
+          log('AUTO MEMORY ERROR: $error');
+        }
+      }
+      try {
+        await persistTaskAttemptMemory(runStatus, runError);
+      } catch (error) {
+        log('ATTEMPT MEMORY ERROR: $error');
+      }
+      await completeTaskCheckpoint(runStatus, error: runError);
       busy = false;
       cancelRequested = false;
       final pendingProject = pendingProjectOpenAfterTask;
@@ -3640,11 +4395,40 @@ ${localToolsCompactSummary(maxItems: 80)}
     return false;
   }
 
-  Future<void> runAgentLoop() async {
-    var continued = false;
+  Future<void> runAgentLoop({int startIteration = 1}) async {
+    var continued = startIteration > 1;
     var emptyModelResponses = 0;
     var noActionRetries = 0;
-    for (var iteration = 1; iteration <= maxAgentIterations; iteration++) {
+    var repeatedNoActionResponses = 0;
+    var lastNoActionFingerprint = '';
+    final firstIteration = startIteration.clamp(1, 2000).toInt();
+    final budget = AdaptiveAgentBudget(configuredWindow: maxAgentIterations);
+    if (firstIteration >= budget.currentLimit) {
+      budget.currentLimit =
+          (firstIteration + budget.extensionSize).clamp(8, 2000).toInt();
+    }
+    for (var iteration = firstIteration;; iteration++) {
+      if (!budget.canRunIteration(iteration)) {
+        final reason = budget.runtimeExpired
+            ? 'Достигнут предельный срок одного запуска агента.'
+            : 'Адаптивный бюджет исчерпан без нового измеримого прогресса.';
+        await finishLiveProgress(
+          '$reason Задача сохранена в контрольной точке и может быть продолжена.',
+          fileChanges: takeTaskFileChanges(),
+          actionSummaries: currentActionSummaries(),
+        );
+        log('AGENT LOOP STOP: $reason ${budget.statusSummary(iteration: iteration, progressRevision: taskProgressRevision)}');
+        logAction('task_stopped_adaptive_budget', {
+          'reason': reason,
+          'budget': budget.statusSummary(
+              iteration: iteration, progressRevision: taskProgressRevision),
+        });
+        break;
+      }
+      currentAgentIteration = iteration;
+      budget.observe(
+          iteration: iteration, progressRevision: taskProgressRevision);
+      await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
       if (cancelRequested) {
         await finishLiveProgress('⛔ Выполнение остановлено пользователем.',
             fileChanges: takeTaskFileChanges());
@@ -3652,11 +4436,12 @@ ${localToolsCompactSummary(maxItems: 80)}
         logAction('task_cancelled_by_user', taskStateJson());
         break;
       }
-      log('AGENT ITERATION $iteration/$maxAgentIterations state=actions:$taskToolActions files:$taskFileMutations commands:$taskCommandRuns failedCommands:$taskFailedCommands lastExit:$lastCommandExitCode');
-      await ensureLiveProgress(iteration == 1
+      log('AGENT ITERATION $iteration/${budget.currentLimit} state=actions:$taskToolActions files:$taskFileMutations commands:$taskCommandRuns failedCommands:$taskFailedCommands lastExit:$lastCommandExitCode');
+      await ensureLiveProgress(iteration == firstIteration
           ? '🤖 Запрашиваю модель...'
           : '🤖 Продолжаю выполнение задачи, итерация $iteration...');
       final assistantText = await callModel();
+      await updateTaskCheckpoint(AgentRunStatus.running);
       if (cancelRequested) {
         await finishLiveProgress(
             '⛔ Выполнение остановлено пользователем после ответа модели.',
@@ -3667,6 +4452,21 @@ ${localToolsCompactSummary(maxItems: 80)}
       }
       final actions = await processAssistantText(assistantText);
       if (!actions.didAction) {
+        final fingerprint =
+            normalizeRepeatedText(stripToolCalls(assistantText));
+        if (fingerprint.isNotEmpty && fingerprint == lastNoActionFingerprint) {
+          repeatedNoActionResponses++;
+        } else {
+          lastNoActionFingerprint = fingerprint;
+          repeatedNoActionResponses = fingerprint.isEmpty ? 0 : 1;
+        }
+        if (repeatedNoActionResponses >= 3) {
+          cancelRequested = true;
+          lastFinalAnswerQualityIssue =
+              'AGENT_STALLED_STOP: модель трижды повторила один и тот же '
+              'текст без выполненного инструмента.';
+          log(lastFinalAnswerQualityIssue);
+        }
         if (lastContextMismatch ||
             lastModelFinishReason == 'context_mismatch') {
           await finishLiveProgress(
@@ -3688,7 +4488,7 @@ ${localToolsCompactSummary(maxItems: 80)}
         if (assistantText.contains('<tool_call>') &&
             actions.toolCallCount == 0 &&
             actions.fileWriteCount == 0 &&
-            noActionRetries < 8) {
+            noActionRetries < 3) {
           noActionRetries++;
           log('AGENT LOOP: malformed raw tool_call hidden; requesting one valid tool call retry=$noActionRetries');
           final retryPrompt = ChatMessage(
@@ -3703,7 +4503,7 @@ ${localToolsCompactSummary(maxItems: 80)}
           continue;
         }
 
-        if (assistantText.trim().isEmpty && emptyModelResponses < 4) {
+        if (assistantText.trim().isEmpty && emptyModelResponses < 2) {
           emptyModelResponses++;
           noActionRetries++;
           log('AGENT LOOP: модель вернула пустой content без tool-call, запрашиваю видимый ответ/действия повторно ($emptyModelResponses).');
@@ -3718,9 +4518,10 @@ ${localToolsCompactSummary(maxItems: 80)}
           continue;
         }
 
+        await updateTaskCheckpoint(AgentRunStatus.verifying);
         final incompleteReason =
             qualityCheckEnabled ? taskIncompleteReason() : '';
-        if (incompleteReason.isNotEmpty && noActionRetries < 8) {
+        if (incompleteReason.isNotEmpty && noActionRetries < 3) {
           noActionRetries++;
           log('AGENT LOOP: visible answer without required action. reason=$incompleteReason retry=$noActionRetries');
           final retryPrompt = ChatMessage(
@@ -3781,6 +4582,8 @@ ${localToolsCompactSummary(maxItems: 80)}
 
       noActionRetries = 0;
       emptyModelResponses = 0;
+      repeatedNoActionResponses = 0;
+      lastNoActionFingerprint = '';
       if (lastToolResultCompletesReadOnlyTask()) {
         await finishLiveProgress(buildReadOnlyToolFinalText(),
             fileChanges: takeTaskFileChanges(),
@@ -3789,17 +4592,30 @@ ${localToolsCompactSummary(maxItems: 80)}
             'task_finished_after_successful_tool', {'tool': lastToolName});
         break;
       }
-      if (iteration == maxAgentIterations) {
-        final message = ChatMessage(
-          role: 'assistant',
-          content:
-              'Достигнут лимит действий агента ($maxAgentIterations). Задача может быть не завершена полностью.',
+      if (iteration >= budget.currentLimit) {
+        final extended = budget.extendIfProgressing(
+          iteration: iteration,
+          progressRevision: taskProgressRevision,
+          taskComplete: false,
         );
-        messages.add(message);
-        await appendSession(message);
-        log('AGENT LOOP STOP: maxAgentIterations reached.');
-        logAction('task_stopped_max_iterations', taskStateJson());
-        break;
+        if (!extended) {
+          final message = ChatMessage(
+            role: 'assistant',
+            content:
+                'Агент остановил текущий запуск: в последнем окне действий не было нового измеримого прогресса. Выполненные шаги и результаты сохранены; продолжение не начнёт задачу заново.',
+          );
+          messages.add(message);
+          await appendSession(message);
+          log('AGENT LOOP STOP: adaptive window exhausted without progress.');
+          logAction('task_stopped_no_recent_progress', taskStateJson());
+          break;
+        }
+        log('AGENT LOOP EXTENDED: ${budget.statusSummary(iteration: iteration, progressRevision: taskProgressRevision)}');
+        logAction('agent_loop_extended', {
+          'iteration': iteration,
+          'new_limit': budget.currentLimit,
+          'progress_revision': taskProgressRevision,
+        });
       }
       final continuation = ChatMessage(
         role: 'user',
@@ -3838,7 +4654,12 @@ ${localToolsCompactSummary(maxItems: 80)}
       role: 'user',
       internal: true,
       content:
-          'Автоматическое восстановление выполнило run_tests. Продолжай исходную задачу: если сборка/запуск успешны и есть BUILD_ARTIFACT_OK/FINAL_STATUS SUCCESS — дай итог; если есть BUILD_ARTIFACT_MISSING, EXIT_CODE не 0 или в исходниках есть заглушки/TODO — не объявляй задачу выполненной, исправь команду/код через инструменты и повтори проверку.',
+          'Автоматическое восстановление выполнило run_tests. Продолжай исходную задачу: '
+          'если сборка успешна и есть BUILD_ARTIFACT_OK/FINAL_STATUS SUCCESS — дай итог. '
+          'При ошибке сначала используй BUILD_FAILURE_ANALYSIS. Не изменяй исходники для '
+          'buildConfiguration/toolUsage/environment/dependency/artifact; выполни предложенный '
+          '--help, исправь окружение или CMake и повтори сборку. Исходник разрешено менять '
+          'только для sourceCompile после read_file указанного файла.',
     );
     messages.add(continuation);
     await appendSession(continuation);
@@ -3861,7 +4682,16 @@ ${localToolsCompactSummary(maxItems: 80)}
       buffer.writeln(
           'Обнаружена ошибка выполнения. Попытка решения проблемы №$problemSolvingAttempts.');
       buffer.writeln(
-          'Разбей исправление на подзадачи: 1) определить тип ошибки, 2) проверить tools/list_local_tools, 3) выбрать действие: исправить код, скачать/распаковать ПО в tools, создать venv или запустить альтернативную команду, 4) повторить проверку.');
+          'Вызови get_task_status не более одного раза, затем обязательно выполни '
+          'диагностическое или исправляющее действие. Определи тип ошибки по блоку '
+          'BUILD_FAILURE_ANALYSIS: sourceCompile разрешает точечную правку только указанного '
+          'файла после read_file; buildConfiguration разрешает исправлять CMakeLists/пути; '
+          'toolUsage требует сначала выполнить предложенный --help; environment/dependency '
+          'требуют исправления окружения. После любого изменения обязательно повтори ту же сборку.');
+      final failureAnalysis = lastBuildFailureAnalysis;
+      if (failureAnalysis != null) {
+        buffer.writeln(failureAnalysis.toPromptBlock());
+      }
       if (isEnvironmentProblemOutput(lastCommandResultText) ||
           isBuildConfigurationProblemOutput(lastCommandResultText)) {
         if (isBuildConfigurationProblemOutput(lastCommandResultText)) {
@@ -3889,8 +4719,16 @@ ${localToolsCompactSummary(maxItems: 80)}
     if (taskCommandRuns > 0)
       buffer.write(
           ' Команд выполнено: $taskCommandRuns, последний exit code: ${lastCommandExitCode ?? 'unknown'}.');
-    if (taskFailedCommands > 0)
+    if (taskFailedCommands > 0) {
       buffer.write(' Команд с ошибками: $taskFailedCommands.');
+    }
+    final completion = currentTaskCompletionAssessment();
+    if (completion.ready) {
+      buffer.write(' Результат подтверждён журналом выполнения; уверенность '
+          '${(completion.confidence * 100).round()}%.');
+    } else if (completion.missingEvidence.isNotEmpty) {
+      buffer.write(' ${completion.userMessage}');
+    }
     return buffer.toString();
   }
 
@@ -3952,9 +4790,30 @@ ${localToolsCompactSummary(maxItems: 80)}
         'problem_solving_attempts': problemSolvingAttempts,
         'internet_tool_actions': taskInternetActions,
         'last_quality_issue': lastFinalAnswerQualityIssue,
+        'checkpoint_run_id': activeRunCheckpoint?.runId,
+        'checkpoint_iteration': currentAgentIteration,
+        'task_intent': activeTaskIntent?.toJson(),
+        'tool_guard': toolExecutionGuard.statusSummary(),
+        'evidence':
+            truncateMiddle(taskEvidenceLedger.summary(maxItems: 12), 8000),
+        'attempt_memory': truncateMiddle(
+            taskEvidenceLedger.decisionContext(maxItems: 20), 16000),
+        'completion_gate': currentTaskCompletionAssessment().summary,
       };
 
   bool taskLooksLikeRequiresFiles() {
+    final intent = activeTaskIntent;
+    if (intent != null) {
+      return intent.expectsMutation &&
+          intent.domains.intersection(const {
+            TaskDomain.software,
+            TaskDomain.documents,
+            TaskDomain.spreadsheets,
+            TaskDomain.presentations,
+            TaskDomain.diagrams,
+            TaskDomain.fileOperations,
+          }).isNotEmpty;
+    }
     final text = activeTaskText.toLowerCase();
     final readOnlyMarkers = [
       'выведи содержимое',
@@ -3996,6 +4855,8 @@ ${localToolsCompactSummary(maxItems: 80)}
   }
 
   bool taskLooksLikeRequiresCommand() {
+    final intent = activeTaskIntent;
+    if (intent != null) return intent.expectsVerification;
     final text = activeTaskText.toLowerCase();
     final markers = [
       'проверь',
@@ -4013,6 +4874,12 @@ ${localToolsCompactSummary(maxItems: 80)}
   }
 
   bool taskLooksLikeDeviceFileReadTask() {
+    final intent = activeTaskIntent;
+    if (intent != null &&
+        intent.hasDomain(TaskDomain.deviceSearch) &&
+        intent.readOnly) {
+      return true;
+    }
     final text = activeTaskText.toLowerCase();
     return (text.contains('выведи содержимое') ||
             text.contains('прочитай') ||
@@ -4067,6 +4934,8 @@ ${localToolsCompactSummary(maxItems: 80)}
   }
 
   bool taskLooksLikeWebResearchTask() {
+    final intent = activeTaskIntent;
+    if (intent != null) return intent.hasDomain(TaskDomain.webResearch);
     final lower = activeTaskText.toLowerCase();
     return lower.contains('найди информацию') ||
         lower.contains('найти информацию') ||
@@ -4195,6 +5064,19 @@ ${localToolsCompactSummary(maxItems: 80)}
         taskCommandRuns == 0) {
       return 'после изменения/создания файлов не была выполнена проверка, сборка или запуск через run_command/run_tests';
     }
+    if (toolExecutionGuard.blockedCalls > 0 &&
+        (taskLooksLikeRequiresCommand() || taskFileMutations > 0) &&
+        !taskEvidenceLedger.hasPassingVerification) {
+      return 'защита от циклических действий заблокировала повторяющийся вызов, '
+          'а успешная проверка результата ещё не получена. Нужно выполнить '
+          'предложенную диагностику, прочитать конкретную ошибку и применить другую проверку';
+    }
+    if (buildRetryRequired) {
+      final analysis = lastBuildFailureAnalysis;
+      return 'после ошибки сборки ещё не получена успешная повторная сборка. '
+          '${analysis?.recommendedAction ?? 'Исправь подтверждённую причину и повтори сборку.'} '
+          'Предпочтительная команда: ${requiredBuildRetryCommand.isEmpty ? 'run_tests' : requiredBuildRetryCommand}';
+    }
     if (taskCommandRuns > 0 &&
         lastCommandExitCode != null &&
         lastCommandExitCode != 0) {
@@ -4213,6 +5095,13 @@ ${localToolsCompactSummary(maxItems: 80)}
         return 'последняя команда завершилась ошибкой окружения, а не ошибкой кода: не найден компилятор/инструмент. Не переписывай исходники из-за этой ошибки; попробуй другой компилятор через run_tests/run_command или дай понятное сообщение, что нужно установить MinGW/Visual Studio Build Tools/clang++';
       }
       return 'последняя команда завершилась с ошибкой exit code $lastCommandExitCode, нужно исправить ошибку по stdout/stderr и повторить проверку';
+    }
+    final completion = currentTaskCompletionAssessment();
+    if (!completion.ready &&
+        (taskFileMutations > 0 ||
+            taskCommandRuns > 0 ||
+            taskInternetActions > 0)) {
+      return completion.userMessage;
     }
     return '';
   }
@@ -4236,7 +5125,7 @@ ${localToolsCompactSummary(maxItems: 80)}
             },
           },
         };
-    return [
+    final definitions = <Map<String, Object?>>[
       fn('write_file',
           'Создать или полностью перезаписать файл внутри проекта.', {
         'path': strProp('Относительный путь внутри проекта'),
@@ -4262,8 +5151,16 @@ ${localToolsCompactSummary(maxItems: 80)}
         'old_text',
         'new_text'
       ]),
-      fn('read_file', 'Прочитать текстовый файл из проекта.',
-          {'path': strProp('Относительный путь')}, ['path']),
+      fn(
+        'read_file',
+        'Прочитать текстовый файл из проекта целиком или указанный диапазон строк.',
+        {
+          'path': strProp('Относительный путь'),
+          'line_start': strProp('Необязательная первая строка, начиная с 1'),
+          'line_end': strProp('Необязательная последняя строка включительно'),
+        },
+        ['path'],
+      ),
       fn('list_files', 'Показать файлы в папке проекта.',
           {'path': strProp('Относительный путь папки')}, []),
       fn('project_map', 'Показать дерево проекта.',
@@ -4316,6 +5213,11 @@ ${localToolsCompactSummary(maxItems: 80)}
           [
             'plan'
           ]),
+      fn(
+          'get_task_status',
+          'Получить текущий план, прогресс, доказательства выполнения и состояние защиты от циклических вызовов.',
+          {},
+          []),
       fn(
           'duckduckgo_search',
           'Найти информацию в интернете через DuckDuckGo HTML/API-совместимый поиск. Для персон/биографий используй точное ФИО и затем обязательно открывай страницы через web_fetch/web_deep_fetch.',
@@ -4421,7 +5323,7 @@ ${localToolsCompactSummary(maxItems: 80)}
           ]),
       fn(
           'read_document_structure',
-          'Прочитать структуру и текст документа RTF/DOCX/XLSX/PPTX/ODT/ODS/ODP/ODC. Используй для анализа приложений и документов устройства вместо команд оболочки.',
+          'Прочитать структуру, текст и расположение элементов RTF/DOCX/XLSX/PPTX/VSDX/ODT/ODS/ODP/ODC. Возвращает стили, таблицы, формулы, координаты фигур/слайдов и связи диаграмм. Используй до редактирования и после него для проверки.',
           {
             'path': strProp('Абсолютный или проектный путь документа'),
             'max_chars': strProp('Максимум символов текста')
@@ -4431,7 +5333,7 @@ ${localToolsCompactSummary(maxItems: 80)}
           ]),
       fn(
           'create_document_from_text',
-          'Создать документ DOCX/XLSX/PPTX/ODT/ODS/ODP/ODC/RTF из обычного текста. Формат выбирается по расширению path.',
+          'Создать документ DOCX/XLSX/PPTX/VSDX/ODT/ODS/ODP/ODC/RTF из полного обычного/Markdown-текста. Формат выбирается по расширению path; Markdown-таблицы и реальные пути изображений поддерживаются в DOCX.',
           {
             'path': strProp(
                 'Путь выходного файла, абсолютный или относительный к проекту'),
@@ -4444,7 +5346,7 @@ ${localToolsCompactSummary(maxItems: 80)}
           ]),
       fn(
           'edit_document_text',
-          'Редактировать документ DOCX/XLSX/PPTX/ODT/ODS/ODP/ODC/RTF: replace_all, append, prepend или replace_text.',
+          'Редактировать документ DOCX/XLSX/PPTX/VSDX/ODT/ODS/ODP/ODC/RTF: replace_all, append, prepend или replace_text. Для точечной замены сохраняет исходную XML-структуру и расположение.',
           {
             'path': strProp('Абсолютный или проектный путь документа'),
             'mode': strProp('replace_all | append | prepend | replace_text'),
@@ -4543,7 +5445,11 @@ ${localToolsCompactSummary(maxItems: 80)}
             'problem': strProp('Краткое описание проблемы'),
             'solution': strProp('Что помогло'),
             'tags': strProp(
-                'Теги через запятую: cpp, python, windows, build и т.п.')
+                'Теги через запятую: cpp, python, windows, build и т.п.'),
+            'verification': strProp(
+                'Фактическая успешная проверка: тест, exit code 0, чистая сборка'),
+            'failed_approaches':
+                strProp('Исключённые нерабочие подходы, по одному на строку')
           },
           [
             'problem',
@@ -4572,6 +5478,54 @@ ${localToolsCompactSummary(maxItems: 80)}
         'from',
         'to'
       ]),
+      fn(
+          'terminal_open',
+          'Открыть общую интерактивную PTY-сессию, видимую пользователю во вкладке «Консоль». Используй для SSH, telnet, msfconsole, REPL и долгоживущих оболочек.',
+          {
+            'session_id': strProp(
+                'Стабильный идентификатор, например ssh-prod или msf-lab; если пусто, будет создан автоматически'),
+            'name': strProp('Понятное название вкладки консоли'),
+            'cwd': strProp(
+                'Рабочая папка внутри проекта или разрешённый абсолютный путь'),
+            'shell': strProp(
+                'Необязательный исполняемый файл оболочки; по умолчанию cmd.exe или /bin/bash'),
+            'initial_command': strProp(
+                'Необязательная первая команда, например ssh -tt user@host или msfconsole')
+          },
+          []),
+      fn(
+          'terminal_write',
+          'Отправить ввод в существующую интерактивную терминальную сессию и получить появившийся вывод. Сессия остаётся запущенной.',
+          {
+            'session_id': strProp('Идентификатор из terminal_open/list'),
+            'input': strProp('Команда или управляющий ввод'),
+            'submit': boolProp('Добавить Enter; по умолчанию true'),
+            'sensitive': boolProp(
+                'Не записывать введённое значение в журнал команд, например пароль'),
+            'wait_seconds': strProp(
+                'Сколько максимум ждать первичный вывод, от 1 до 120 секунд')
+          },
+          [
+            'session_id',
+            'input'
+          ]),
+      fn(
+          'terminal_read',
+          'Прочитать актуальный хвост вывода интерактивной терминальной сессии без отправки ввода.',
+          {
+            'session_id': strProp('Идентификатор сессии'),
+            'max_chars': strProp('Максимум символов, по умолчанию 30000')
+          },
+          [
+            'session_id'
+          ]),
+      fn('terminal_list', 'Показать все терминальные сессии и их состояние.',
+          const <String, Object?>{}, const <String>[]),
+      fn(
+          'terminal_close',
+          'Закрыть интерактивную терминальную сессию. Не закрывай SSH/msfconsole автоматически, если пользователь может продолжить работу вручную.',
+          {'session_id': strProp('Идентификатор сессии')},
+          ['session_id']),
       fn(
           'run_command',
           'Запустить команду в корне проекта или в указанной подпапке проекта.',
@@ -4615,7 +5569,72 @@ ${localToolsCompactSummary(maxItems: 80)}
           'Совместимый алиас: прочитать структуру и текст XLSX через read_document_structure.',
           {'path': strProp('Путь к XLSX')},
           ['path']),
+      fn(
+          'memory_recall',
+          'Найти релевантные факты, решения, процедуры и события во встроенной локальной памяти.',
+          {
+            'query': strProp('Что нужно вспомнить'),
+            'max_results': strProp('Максимальное количество результатов')
+          },
+          [
+            'query'
+          ]),
+      fn(
+          'memory_remember',
+          'Сохранить локальную память с типом, происхождением и уверенностью. Секреты автоматически удаляются.',
+          {
+            'type': strProp(
+                'Тип: instruction, fact, decision, goal, learning, observation, artifact, procedure и др.'),
+            'title': strProp('Краткий заголовок'),
+            'content': strProp('Содержание'),
+            'source': strProp('Источник/происхождение'),
+            'confidence': strProp('Уверенность 0..1'),
+            'tags': strProp('Теги через запятую')
+          },
+          [
+            'type',
+            'title',
+            'content'
+          ]),
+      fn(
+          'memory_conflicts',
+          'Показать противоречащие или заменённые версии локальной памяти.',
+          const <String, Object?>{},
+          const <String>[]),
+      fn(
+          'promote_golden_path',
+          'Сохранить проверенную повторяемую процедуру. Требуются успешная проверка и хотя бы один исключённый тупиковый подход.',
+          {
+            'problem': strProp('Повторяемая проблема или шаблон отказа'),
+            'solution': strProp('Проверенная процедура решения'),
+            'verification': strProp(
+                'Фактическая успешная проверка: тест, exit code 0, чистая сборка и т.п.'),
+            'failed_approaches':
+                strProp('Исключённые подходы, по одному на строку'),
+            'tags': strProp('Теги через запятую')
+          },
+          [
+            'problem',
+            'solution',
+            'verification',
+            'failed_approaches'
+          ]),
+      fn(
+          'plugin_list',
+          'Показать установленные/доступные плагины, их состояние и разрешения.',
+          const <String, Object?>{},
+          const <String>[]),
     ];
+    for (final plugin in plugins.where((item) => item.enabled)) {
+      definitions.add(fn(plugin.toolName, plugin.toolDescription, {
+        'input': strProp(plugin.kind == AgentPluginKind.reference
+            ? 'Запрос для поиска по локально синхронизированной документации'
+            : 'Аргументы или запрос для плагина')
+      }, [
+        'input'
+      ]));
+    }
+    return definitions;
   }
 
   String buildNoActionRetryPrompt(
@@ -4635,7 +5654,8 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
 - если ты написал «Изменён файл», «создан файл», «исправил файл» или показал код, но не вызвал write_file/append_file/replace_text, это не считается действием. Немедленно вызови настоящий tool-call для файла.
 - если нужно создать/изменить файлы — используй write_file/append_file/replace_text;
 - если нужно собрать, проверить или запустить — используй run_command или run_tests;
-- если команда завершилась ошибкой компиляции кода — используй переданный stdout/stderr/exit code, прочитай/исправь файлы и повтори команду;
+- если BUILD_FAILURE_ANALYSIS имеет kind=sourceCompile — прочитай указанный файл и участок, внеси минимальную правку и повтори ту же команду;
+- если kind=buildConfiguration/toolUsage/environment/dependency/artifact/unknown — не изменяй исходники; выполни suggested_diagnostic, исправь CMake/параметры/окружение и повтори сборку;
 - если stdout/stderr говорит, что не найден компилятор/команда, это ошибка окружения, а не исходного кода: не переписывай код, попробуй другой компилятор или сообщи, что его нужно установить;
 - если Python сообщает ModuleNotFoundError или нужны пакеты, используй pip install: агент установит пакеты в `.cppagent/python_venv`, не в общий Python;
 - если не хватает программы/компилятора, используй list_local_tools, затем при необходимости download_to_tools/extract_zip_to_tools и настройку через run_command;
@@ -5171,6 +6191,84 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
     }
   }
 
+  String activeDomainGuidance() {
+    final intent = activeTaskIntent ??
+        taskIntentAnalyzer.analyze(
+            activeTaskText.trim().isEmpty ? 'general task' : activeTaskText);
+    final buffer = StringBuffer()
+      ..writeln('Активные домены: '
+          '${intent.domains.map((domain) => domain.name).join(', ')}.')
+      ..writeln('Критерии завершения:')
+      ..writeln(intent.completionCriteria.map((item) => '- $item').join('\n'))
+      ..writeln('Рекомендуемые первые инструменты: '
+          '${intent.recommendedInitialTools.join(', ')}.');
+
+    if (intent.hasDomain(TaskDomain.software)) {
+      buffer.writeln('''
+Разработка ПО:
+- Сначала прочитай карту и ключевые файлы существующего проекта, затем составь изменяемый план.
+- Вноси минимально связанные изменения, запускай подходящие тесты/сборку и исправляй фактическую диагностику. Ошибку окружения не маскируй переписыванием исходников.
+- Не объявляй результат готовым без успешной проверки и ожидаемого артефакта. Не оставляй TODO, omitted, conceptual example или фиктивное содержимое.''');
+    }
+    if (intent.domains.intersection(const {
+      TaskDomain.documents,
+      TaskDomain.spreadsheets,
+      TaskDomain.presentations,
+      TaskDomain.diagrams,
+    }).isNotEmpty) {
+      buffer.writeln('''
+Документы и визуальные форматы:
+- Перед правкой прочитай структуру: абзацы/стили/таблицы DOCX, формулы/ячейки XLSX, координаты объектов PPTX, страницы/фигуры/связи VSDX.
+- Для точечной замены сохраняй исходный XML-пакет и расположение. Для создания передавай полный материал; запрещены многоточия вместо разделов и текстовые метки вместо требуемых изображений.
+- Таблицы задавай реальными строками, изображения реальными доступными путями. После записи снова прочитай документ и проверь структуру, текст и обязательные элементы.''');
+    }
+    if (intent.hasDomain(TaskDomain.webResearch)) {
+      buffer.writeln('''
+Веб-исследование:
+- Сформулируй несколько дополняющих запросов, открой первичные источники и извлеки основное DOM-содержимое, метаданные, таблицы и JSON-LD.
+- Сверяй идентичность сущностей и даты, отделяй факты от вывода, не заполняй пробелы догадками. В итог включай URL и отмечай неопределённость.
+- Не запускай компиляцию и не создавай проект, если задача ограничена исследованием.''');
+    }
+    if (intent.domains.intersection(const {
+      TaskDomain.remoteAccess,
+      TaskDomain.systemAdministration,
+      TaskDomain.securityAssessment,
+    }).isNotEmpty) {
+      buffer.writeln('''
+Удалённые и интерактивные операции:
+- Используй постоянные terminal_open/terminal_write/terminal_read для SSH, telnet, REPL и msfconsole. Один session_id означает один живой контекст; не повторяй подключение, если сессия уже работает.
+- Оставляй полезную сессию открытой для пользователя и фиксируй команды/результаты в общей консоли. Для перехода через промежуточный узел продолжай ввод в той же PTY либо создай ясно названную отдельную сессию.
+- Перед изменяющим или потенциально разрушительным действием проверь целевой хост, область разрешения и ожидаемый эффект. Для проверки безопасности работай только в явно разрешённой пользователем области.''');
+    }
+    if (intent.hasDomain(TaskDomain.email)) {
+      buffer.writeln('''
+Почта:
+- Используй настроенный аккаунт и критерии запроса для поиска/анализа, сохраняй связи сообщений и вложений. Не своди задачу анализа почты к файловому или программному проекту.
+- Черновик можно подготовить инструментом почты; фактическую отправку выполняй только после требуемого подтверждения.''');
+    }
+    if (intent.domains.intersection(const {
+      TaskDomain.deviceSearch,
+      TaskDomain.fileOperations,
+    }).isNotEmpty) {
+      buffer.writeln('''
+Файлы устройства:
+- Для внешних расположений используй индекс и специальные file/document tools, а не компиляцию. Ищи по именам и содержимому, затем читай только релевантные кандидаты.
+- Не изменяй найденные файлы, если пользователь просил только поиск или анализ. Сохраняй точные пути и критерии совпадения.''');
+    }
+    if (intent.hasDomain(TaskDomain.applicationControl)) {
+      buffer.writeln('''
+Приложения:
+- Диагностируй доступный способ управления и используй живую консоль для долгих процессов. После запуска переводи интерфейс на подходящую вкладку и оставляй пользователю управляемое состояние.''');
+    }
+    buffer.writeln('''
+Общая адаптация:
+- Исходная формулировка пользователя и последующие корректировки выше любых эвристик. Не переписывай задачу уточняющим шаблоном.
+- На каждом шаге выбирай действие по текущему препятствию. Если результат опроверг план, сформулируй новую гипотезу; не повторяй тот же вызов без изменения аргументов, состояния или доказательств.
+- Уточняй одним коротким нейтральным вопросом только факт, без которого невозможно безопасно продолжить. Всё остальное выясняй инструментами.
+- Успешные подзадачи переиспользуй, а не выполняй заново.''');
+    return buffer.toString().trimRight();
+  }
+
   List<Map<String, String>> buildMessagesForModel() {
     final project = currentProject;
     final activeTaskBlock = activeTaskText.trim().isEmpty
@@ -5180,10 +6278,20 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
         const JsonEncoder.withIndent('  ').convert(taskStateJson());
     final environmentBlock = hostEnvironmentSummary();
     final localToolsBlock = localToolsCompactSummary(maxItems: 12);
+    final cppDependencyBlock =
+        currentCppDependencyAvailability?.toPromptBlock() ?? '';
     final projectStructureBlock = projectStructureCompactSummary(maxItems: 140);
     final automationBlock = automationSummaryForPrompt();
+    final intentBlock = const JsonEncoder.withIndent('  ')
+        .convert(activeTaskIntent?.toJson() ?? const <String, Object?>{});
+    final attemptMemoryBlock = taskEvidenceLedger.decisionContext(maxItems: 24);
+    final domainGuidanceBlock = activeDomainGuidance();
+    final pluginToolNames = plugins
+        .where((plugin) => plugin.enabled)
+        .map((plugin) => plugin.toolName)
+        .join(', ');
     final system =
-        '''Ты локальный Codex/OpenCode-подобный агент программирования внутри Flutter-оболочки.
+        '''Ты универсальный локальный агент выполнения задач внутри Flutter-оболочки. Работай на уровне сильного инженерного агента: сохраняй точную цель пользователя, выбирай инструменты по фактической задаче, выполняй работу до проверяемого результата и меняй стратегию по новым данным.
 Текущий проект: ${project?.path ?? ''}
 Среда выполнения агента:
 $environmentBlock
@@ -5191,11 +6299,27 @@ $environmentBlock
 Локальные программы пользователя из папки tools, доступные с приоритетом:
 $localToolsBlock
 
+$cppDependencyBlock
+
 Текущая структура проекта, чтобы учитывать уже существующие файлы:
 $projectStructureBlock
 
 Память найденных решений и подсказки по прошлым ошибкам:
 ${solutionMemoryCompactSummary(maxItems: 30)}
+
+Релевантные записи прошлых задач, включая успешные и неудачные попытки:
+$activeRelevantMemoryContext
+- Для точного поиска по локальной типизированной памяти используй memory_recall.
+- Не сохраняй догадку как проверенную процедуру. promote_golden_path допустим только после реального успешного теста и с перечислением хотя бы одного исключённого нерабочего подхода.
+- memory_remember сохраняет происхождение и уверенность, а секреты перед записью маскируются.
+
+Многопрофильный разбор текущей задачи (это подсказка маршрутизации, а не замена исходного запроса):
+$intentBlock
+
+Журнал уже выполненных попыток и результатов:
+$attemptMemoryBlock
+- Не повторяй неудачный вызов с теми же аргументами без нового факта, изменения состояния или другой гипотезы.
+- Повторно используй подтверждённые результаты. Не начинай заново уже выполненную подзадачу.
 
 Automation, indexing, API outputs and custom tools:
 $automationBlock
@@ -5220,37 +6344,16 @@ Python-среда:
 Работай только внутри текущего проекта, если пользователь явно не приложил внешний файл для чтения/распаковки.
 Не используй встроенные предметные шаблоны. Создавай и меняй файлы строго по заданию пользователя.
 
-Гибкий порядок работы по типам задач:
-- Для задач разработки в проекте используй PROJECT_PREFLIGHT_AUDIT, если он есть в скрытом контексте. Для поиска по компьютеру, чтения документов, интернет-справки и работы с приложенными файлами не подменяй запрос аудитом проекта.
-- Если проект пустой — создай структуру с нуля. Если файлы явно от другой задачи — перенеси их в `.cppagent/reserved_before_task/<timestamp>/` через move_path и только потом создавай нужные файлы.
-- Для создания ПО: project_map/list_files/read_file -> set_task_plan -> write_file/replace_text -> run_tests/run_command -> исправление ошибок -> повторная сборка/запуск.
-- Для анализа/редактирования файлов устройства: list_device_directory/read_device_* или search_device_documents; не используй компиляцию.
-- Для настройки систем/серверов: сначала диагностика окружения, затем команды через run_command/ssh/powershell, затем проверка результата.
-- Для документов/таблиц/презентаций: read_document_structure для анализа структуры и текста, create_document_from_text для создания, edit_document_text для правок; затем проверь наличие результата чтением структуры или списка файлов.
-- Для почты: используй email_list_accounts, подготовь письмо через email_draft_smtp, не отправляй без подтверждения пользователя.
-- Не переписывай один и тот же файл много раз. Если файл изменён 2-4 раза — переходи к сборке/проверке или читай конкретную ошибку.
+Адаптивная стратегия текущей задачи:
+$domainGuidanceBlock
 
-
-Интернет, зависимости и самостоятельная реализация:
-- Если пользователь явно пишет «не используй дополнительные библиотеки», «пиши код самостоятельно», «сам реализуй», «без библиотек», то НЕ скачивай и НЕ подключай сторонние библиотеки для основной логики. Реализуй алгоритм сам: разбей задачу на подзадачи, пиши рабочие модули, тестируй части, соединяй, компилируй и запускай.
-- Если пользователь не запретил интернет и не запретил зависимости, а задача объективно требует тяжёлую библиотеку/SDK/инструмент, сначала используй duckduckgo_search, web_fetch и web_deep_fetch для поиска официальной документации/загрузки, затем download_to_tools/download_to_project и подключение через файлы проекта. Если скачать/подключить не получилось — реализуй минимально рабочий вариант самостоятельно.
-- Если пишешь собственную библиотеку, можешь искать подсказки, статьи, форумы и книги через интернет-инструменты, но итоговый код должен быть адаптирован, проверен и собран в проекте. Сохраняй полезные выводы в knowledge_store.
-- При сложных задачах дроби план рекурсивно: задача → подзадачи → мелкие проверяемые шаги; тестируй отдельные модули, затем соединяй и тестируй всё вместе.
-- Если нужно найти похожие реализации на компьютере и это разрешено настройками, используй filesystem_search. Если поиск по компьютеру запрещён, не пытайся обходить запрет.
-- Если пользователь просит вывести содержимое внешней папки/файлов, например `O:\\...`, не используй `run_command dir/type` как основной способ. Используй `list_device_directory`, `read_device_text_file` или `read_device_folder_texts`, потому что они читают файлы через API приложения и корректно работают с кириллицей/пробелами в путях. Для фразы «и подпапок» передавай recursive=true. Инструмент должен читать txt/csv/html/xml/rtf/doc/docx/xls/xlsx/ppt/pptx/pdf и файлы внутри zip/7z/rar best-effort.
-- Если пользователь просит найти документ в папке и процитировать требования/пункты/дату утверждения, НЕ выводи просто список файлов и НЕ печатай все файлы подряд. Используй search_device_documents с query по смыслу запроса, затем читай только релевантные найденные документы и цитируй нужные пункты слово в слово.
-- Если пользователь просит «упакуй/заархивируй каждую игру/папку/файл в отдельный архив» во внешней или выбранной папке, используй `archive_device_children`, а не создавай пустые папки внутри проекта. Если путь не указан, используй последнее выбранное или прочитанное расположение устройства.
-- Если пользователь просит «найди реализацию в интернете и установи в проект», используй duckduckgo_search, web_fetch, download_to_project, inspect_zip/extract_zip и затем адаптируй код в проекте. Не копируй неизвестный код вслепую: читай файл, подключай осознанно, собирай и запускай проверку.
-- Не отвечай «для этого нужны тяжёлые библиотеки» как финальный отказ. Это только диагностический вывод: после него нужно либо установить/подключить зависимость, либо написать самописную реализацию.
-- Не используй фиктивные значения вроде `cmake_file_content`, `main_cpp_content`, `code_here`. В write_file всегда передавай полный реальный текст файла.
-- Для поиска людей и биографий строго проверяй полное ФИО. Если пользователь просит «Редина Максима Юрьевича», результаты про «Максима Игоревича» или другого человека НЕ подходят. Не подменяй отчество/имя; такие совпадения помечай как чужие и не составляй по ним биографию запрошенного человека.
-- Для людей используй только публично доступные источники, не обходи приватность и не выдавай предположения о родственниках/друзьях/отношениях как доказанные факты без прямого источника. Если связь или отношение не подтверждены, помечай как непроверенное совпадение.
-- Не включай в итоговый список источников URL про других людей. Если web_research пометил источник как REJECTED_SIMILAR_OR_UNCONFIRMED_SOURCES, его можно упомянуть только в отдельном разделе «Отсеянные похожие совпадения», но нельзя выдавать как источник по искомому человеку.
-- Изображения/фото выводи только если web_fetch/web_research вернул их в IMAGES или RELEVANT_IMAGES и они относятся к точному запросу. К каждому фото добавь краткое описание и URL.
-- Поисковые задачи выполняй углублённо: по умолчанию используй web_research. Если нужно вручную — сначала duckduckgo_search, затем web_fetch/web_deep_fetch, переход по полезным внутренним и внешним ссылкам, follow-up запросы по найденным профилям/работе/контактам/связанным людям/терминам, сверка точного запроса с найденными фактами, только потом итог. Если точного совпадения нет — так и напиши, без биографии по однофамильцам.
-- Для чистого интернет-поиска, биографии, справки о человеке, организации или сайте НЕ запускай run_command/run_tests, НЕ создавай исходники и НЕ компилируй проект. После web_research дай итог по источникам и остановись.
-- Перед финальным ответом сделай внутреннюю проверку качества: ответ должен соответствовать точной задаче пользователя, содержать источники/URL для найденных фактов, перечислять отсеянные похожие совпадения и уровень уверенности. Не дублируй одинаковые ссылки.
-- После успешного результата инструмента не запускай задачу повторно. Если инструмент уже вернул полный требуемый текст/список/результат, дай итог и остановись.
+Интернет, зависимости и инструменты:
+- Соблюдай явные ограничения пользователя на интернет и сторонние библиотеки.
+- Если нужна внешняя информация, предпочитай первичные источники: поиск -> чтение релевантных страниц -> сравнение фактов -> итог со ссылками.
+- Перед скачиванием или установкой проверь локальные tools и downloads. Не устанавливай в системные папки без разрешения.
+- Не копируй неизвестный код вслепую: изучи лицензию и интерфейс, адаптируй, затем проверь результат.
+- Не используй фиктивные параметры или содержимое. Каждый tool-call должен иметь полные обязательные аргументы.
+- После подтверждённого успешного результата не повторяй ту же подзадачу.
 
 Служебная папка `.cppagent`:
 - `.cppagent` предназначена только для внутренних данных агента: логи, планы, память, сессии, временные файлы, python_venv.
@@ -5275,33 +6378,19 @@ $stateBlock
 Режим создания проекта: ${creationMode.label}.
 Проверка качества результата: ${qualityCheckEnabled ? 'включена' : 'отключена'}.
 Лимиты профиля: context window=$maxContextTokens токенов; max output=$maxOutputTokens токенов. Это разные настройки.
-Доступные tools: project_map, list_files, list_local_tools, rebuild_device_index, search_device_index, recognize_image_text, run_custom_tool, duckduckgo_search, web_fetch, web_deep_fetch, web_research, filesystem_search, list_device_directory, read_device_text_file, read_device_folder_texts, search_device_documents, read_document_structure, create_document_from_text, edit_document_text, archive_device_children, knowledge_search, knowledge_store, email_list_accounts, email_draft_smtp, download_to_project, set_task_plan, download_to_tools, extract_zip_to_tools, remember_solution, read_file, write_file, create_file, append_file, replace_text, make_dir, delete_path, copy_path, move_path, run_command, run_tests, inspect_zip, extract_zip, read_docx_text, read_xlsx_text.
+Доступные tools: project_map, list_files, list_local_tools, rebuild_device_index, search_device_index, recognize_image_text, run_custom_tool, duckduckgo_search, web_fetch, web_deep_fetch, web_research, filesystem_search, list_device_directory, read_device_text_file, read_device_folder_texts, search_device_documents, read_document_structure, create_document_from_text, edit_document_text, archive_device_children, knowledge_search, knowledge_store, memory_recall, memory_remember, memory_conflicts, promote_golden_path, plugin_list, email_list_accounts, email_draft_smtp, download_to_project, set_task_plan, get_task_status, download_to_tools, extract_zip_to_tools, remember_solution, read_file, write_file, create_file, append_file, replace_text, make_dir, delete_path, copy_path, move_path, terminal_open, terminal_write, terminal_read, terminal_list, terminal_close, run_command, run_tests, inspect_zip, extract_zip, read_docx_text, read_xlsx_text${pluginToolNames.isEmpty ? '' : ', $pluginToolNames'}.
 
 Правила полноценного агента:
-1. Если задача требует файлов, не ограничивайся планом — в том же ответе вызывай инструменты.
-2. После записи кода сам запускай проверку/сборку/запуск через run_command или run_tests, если это применимо. Если создал подпапку проекта, укажи cwd или запускай команду с правильным -S/-B.
-3. Если команда завершилась с ошибкой, исправь файлы и повтори команду.
-4. Не оставляй content пустым: если не можешь выполнить задачу, ответь видимым текстом почему.
-5. После каждого tool-result продолжай исходную задачу, пока она реально не завершена и проверена.
-6. Финальный ответ давай только после проверки результата или после честного объяснения невозможности.
-6.1. Если tool-result содержит `FINAL_STATUS: SUCCESS` или `[AUTO_BUILD_FALLBACK_SUCCESS]`, считай проверку успешной: не запускай снова неудачную CMake-команду, дай краткий итог.
-7. Если пишешь план, сразу после плана начни делать действия инструментами; не останавливайся на плане.
-8. Пути для write_file/read_file/delete_path должны быть относительными к проекту. Не используй `.cppagent` для пользовательских файлов: эта папка зарезервирована агентом.
-9. Если stdout/stderr говорит, что не найден g++, cl, clang++, cmake, flutter, npm или другая команда, это ошибка окружения, а не ошибка исходного кода. В такой ситуации не переписывай рабочий файл на заглушку; попробуй альтернативную команду или честно сообщи, какой инструмент нужно установить.
-10. Не ухудшай реализацию после ошибки окружения: не заменяй полноценный код на placeholder/conceptual example.
-11. Для команд и компиляции сначала используй программы из tools/$hostOsSegment/$hostArchSegment и других подпапок tools: агент добавляет эти папки в PATH перед системным PATH.
-12. Если не найден g++, cl, clang++, python, cmake или другой инструмент, сначала проверь список через list_local_tools/run_tests. Только если подходящих программ в tools нет — сообщай пользователю, что инструмент отсутствует. Если CMake ругается на отсутствующий main.cpp или CMakeLists.txt, это проблема структуры сборки: исправь CMakeLists.txt или используй run_tests, который умеет собрать найденный .cpp.
-21. Если в tools найден g++.exe/clang++.exe, предпочитай прямую компиляцию через run_tests; не называй отсутствие cmake ошибкой, когда доступен C++ компилятор.
-22. На Windows для MinGW/MSYS2 не заключай простые относительные пути исходников C++ в кавычки: используй `g++.exe -std=c++17 -O2 src\\main.cpp -o build\\app.exe`, а не `g++.exe "src/main.cpp" ...`.
-23. Не объявляй C++ задачу завершённой, если последняя проверка содержит `BUILD_ARTIFACT_MISSING`, `EXIT_CODE` не равен 0, или в исходниках остались слова вроде `заглушка`, `conceptual`, `omitted`, `TODO`, `оставим позже`. Сначала исправь код и повтори run_tests.
-13. Учитывай ОС и архитектуру из блока среды: на Windows x64 используй .exe/.bat/.cmd и команды cmd.exe; на Linux/macOS используй sh-команды.
-14. Для Python-зависимостей не используй глобальный pip. Устанавливай пакеты только через проектное окружение `.cppagent/python_venv`; агент сам создаст его и перепишет команду.
-15. Сложные задачи разбивай на подзадачи через set_task_plan: анализ среды, план файлов, создание/изменение, проверка, исправление ошибок, повторная проверка, финальный итог.
-16. При ошибке не останавливайся сразу: спроси себя через модель, какое следующее действие поможет — проверить tools, скачать ПО в tools, распаковать, настроить PATH/venv, исправить код, повторить команду.
-17. Когда нашёл рабочий способ решения ошибки или сборки, вызови remember_solution, чтобы агент подсказывал этот способ в следующих задачах.
-18. Останавливайся и проси вмешательство пользователя только после исчерпания разумных способов: локальные tools, альтернативные команды, скачивание/распаковка в tools, настройка окружения проекта, исправление кода по stdout/stderr.
-19. Перед изменением существующего проекта сначала изучи его структуру через project_map/list_files и прочитай важные существующие файлы через read_file. Не перезаписывай существующий рабочий файл вслепую: сначала прочитай его, затем используй replace_text или осознанный write_file.
-20. План выполнения задачи должен учитывать существующие файлы проекта, текущие CMakeLists.txt/package files/config files и прошлые результаты команд. Если задача продолжает предыдущую, используй уже созданные файлы, а не начинай заново в случайной подпапке.
+1. Сохраняй исходную цель и все последующие поправки пользователя; внутренний классификатор не может их заменить.
+2. Для сложной задачи веди план с проверяемыми подзадачами и сразу выполняй следующий доступный пункт, а не останавливайся на плане.
+3. После каждого результата обновляй гипотезу и журнал доказательств. Не повторяй неудачный вызов без нового факта или изменения подхода.
+4. Не выдавай намерение за действие: создание, редактирование, запуск и проверка должны подтверждаться соответствующим tool-result.
+5. Продолжай до выполнения критериев завершения. Лимит итераций адаптивный и расширяется при измеримом прогрессе.
+6. Проверяй созданный результат способом, соответствующим домену: тестом, повторным чтением документа, сверкой источников, диагностикой сервиса или наблюдаемым состоянием приложения.
+7. Сохраняй удачные процедуры через remember_solution/memory_remember и используй текущий ATTEMPT_MEMORY вместо повторного исследования.
+8. Если действие заблокировано правами, отсутствующим адресом/учётными данными или реальным внешним условием, задай один минимальный вопрос и сохрани всю уже выполненную работу.
+9. Не оставляй content пустым. Финальный ответ должен честно перечислять выполненное, проверку и остающееся внешнее ограничение, если оно есть.
+10. Рабочие файлы пользователя не размещай в `.cppagent`; эта папка хранит только состояние, журналы, память и окружение агента.
 ''';
     final contextMessages = <Map<String, String>>[
       {'role': 'system', 'content': system}
@@ -5386,7 +6475,8 @@ $stateBlock
         Directory(pathJoin(project.path, '.cppagent', 'sessions'));
     sessionsDir.createSync(recursive: true);
     final file = File(pathJoin(sessionsDir.path, 'session.jsonl'));
-    file.writeAsStringSync('${jsonEncode(message.toJson())}\n',
+    final safeMessage = SecretRedactor.redactObject(message.toJson());
+    file.writeAsStringSync('${jsonEncode(safeMessage)}\n',
         mode: FileMode.append, encoding: utf8);
   }
 
@@ -5395,6 +6485,64 @@ $stateBlock
     if (content.startsWith('Tool result'))
       return truncateMiddle(content, 12000);
     return truncateMiddle(content, 18000);
+  }
+
+  String? dependencyMutationBlockReason(ToolCall call) {
+    if (!const <String>{
+      'write_file',
+      'create_file',
+      'append_file',
+      'replace_text',
+    }.contains(call.name)) {
+      return null;
+    }
+    final path = (call.args['path'] ?? '').toString().replaceAll('\\', '/');
+    if (!path.toLowerCase().endsWith('cmakelists.txt')) return null;
+    final text = call.name == 'replace_text'
+        ? (call.args['new_text'] ?? '').toString()
+        : (call.args['content'] ?? '').toString();
+    if (text.trim().isEmpty) return null;
+    return CppDependencyPreflight.mutationPathBlockReason(text);
+  }
+
+  Future<String> rejectInvalidToolCall(
+    ToolCall call,
+    String message,
+  ) async {
+    taskToolActions++;
+    consecutiveInvalidToolCalls++;
+    consecutiveCircuitBreakerBlocks++;
+    var result = message;
+    if (consecutiveInvalidToolCalls >= 3 ||
+        consecutiveCircuitBreakerBlocks >= 3) {
+      cancelRequested = true;
+      result += '\nAGENT_STALLED_STOP: три некорректных или запрещённых '
+          'вызова инструмента подряд. Запуск остановлен вместо бесконечного '
+          'повтора; продолжение возможно с исправленным планом.';
+    }
+    lastToolName = call.name;
+    lastToolResultText = result;
+    taskEvidenceLedger.recordTool(
+      toolName: call.name,
+      args: call.args,
+      result: result,
+      successful: false,
+    );
+    if (toolCircuitBreakerEnabled) {
+      toolExecutionGuard.recordBlockedAttempt(
+        progressRevision: taskProgressRevision,
+      );
+    }
+    log('TOOL CONTRACT BLOCKED: ${call.name}; '
+        '${truncateMiddle(message, 3000)}');
+    logAction('tool_contract_blocked', {
+      'tool': call.name,
+      'args': sanitizeToolArgsForLog(call.name, call.args),
+      'message': result,
+      'consecutive_invalid': consecutiveInvalidToolCalls,
+    });
+    await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
+    return result;
   }
 
   Future<AgentProcessResult> processAssistantText(String assistantText) async {
@@ -5416,6 +6564,22 @@ $stateBlock
       visibleText = '';
     }
     if (visibleText.isNotEmpty) {
+      final unsupportedClaim = UnsupportedSuccessClaimGuard.blockReason(
+        text: visibleText,
+        completionReady: currentTaskCompletionAssessment().ready,
+        hasActionsInResponse: toolCalls.isNotEmpty || extractedFiles.isNotEmpty,
+      );
+      if (unsupportedClaim != null) {
+        lastFinalAnswerQualityIssue = unsupportedClaim;
+        log('UNSUPPORTED SUCCESS CLAIM BLOCKED: $unsupportedClaim');
+        await updateLiveProgress(
+          '⚠️ Модель заявила об успехе без выполненного действия. '
+          'Запрашиваю настоящий tool-call...',
+        );
+        visibleText = '';
+      }
+    }
+    if (visibleText.isNotEmpty) {
       visibleText = deduplicateVisibleUrls(visibleText);
       if (allowFollowUpSuggestions &&
           !containsFollowUpSuggestions(visibleText) &&
@@ -5429,6 +6593,8 @@ $stateBlock
         await updateLiveProgress(
             '🔎 Ответ не прошёл проверку качества: $qualityIssue');
         visibleText = '';
+      } else {
+        lastFinalAnswerQualityIssue = '';
       }
     }
     if (visibleText.isNotEmpty) {
@@ -5470,17 +6636,44 @@ $stateBlock
           'Tool result for markdown_file ${file.path}\nok: ${allowed ? 'true' : 'false'}\n$result\n');
       log('MARKDOWN FILE ${file.path}: $result');
     }
-    for (final call in toolCalls) {
+    for (final rawCall in toolCalls) {
       if (cancelRequested) {
-        log('PROCESS ASSISTANT TEXT: cancelled before tool ${call.name}');
+        log('PROCESS ASSISTANT TEXT: cancelled before tool ${rawCall.name}');
         break;
       }
+      final contract = ToolCallContract.resolve(
+        rawCall,
+        buildFailureAnalysis: lastBuildFailureAnalysis,
+      );
+      final call = contract.call;
       await updateLiveProgress('⚙️ Выполняю ${call.name}...');
-      final repeatBlock = repeatedMutationBlockReason(call);
-      final result = repeatBlock ?? await executeTool(call);
+      String result;
+      if (!contract.valid) {
+        result = await rejectInvalidToolCall(call, contract.message);
+      } else {
+        final dependencyBlock = dependencyMutationBlockReason(call);
+        final repeatBlock = repeatedMutationBlockReason(call);
+        if (dependencyBlock != null) {
+          result = await rejectInvalidToolCall(call, dependencyBlock);
+        } else if (repeatBlock != null) {
+          result = await rejectInvalidToolCall(call, repeatBlock);
+        } else {
+          result = await executeTool(call);
+          if (toolResultLooksSuccessful(call.name, result)) {
+            consecutiveInvalidToolCalls = 0;
+          }
+          if (contract.repaired && contract.message.isNotEmpty) {
+            result = '${contract.message}\n$result';
+          }
+        }
+      }
       didAction = true;
       recordActionAttempt(call, result);
-      toolResultBuffer.writeln('Tool result for ${call.name}\n$result\n');
+      final contextResult = toolOutputCompactionEnabled
+          ? const ToolOutputCompactor().compact(call.name, result)
+          : result;
+      toolResultBuffer
+          .writeln('Tool result for ${call.name}\n$contextResult\n');
       log('TOOL ${call.name}: ${truncateMiddle(result, 8000)}');
     }
     final fileChanges = takePendingFileChanges();
@@ -5689,17 +6882,29 @@ $stateBlock
     return 'Действие: $name';
   }
 
-  bool toolResultLooksSuccessful(String toolName, String result) {
-    if (toolName == 'run_command' || toolName == 'run_tests') {
-      final match = RegExp(r'EXIT_CODE:\s*(-?\d+)', caseSensitive: false)
-          .firstMatch(result);
-      return match != null && int.tryParse(match.group(1) ?? '') == 0;
+  Map<String, dynamic>? decodeToolCallJson(String source) {
+    final trimmed = source.trim();
+    if (trimmed.isEmpty) return null;
+    final candidates = <String>[trimmed];
+    final trailingCommaRepaired =
+        ToolCallJsonRepair.removeTrailingCommas(trimmed);
+    if (trailingCommaRepaired != trimmed) {
+      candidates.add(trailingCommaRepaired);
     }
-    final lower = result.toLowerCase();
-    return !lower.contains('permission denied') &&
-        !lower.contains('error:') &&
-        !lower.contains('failed') &&
-        !lower.contains('ошибка');
+    for (var index = 0; index < candidates.length; index++) {
+      try {
+        final decoded = jsonDecode(candidates[index]);
+        if (decoded is Map) {
+          if (index > 0) {
+            log('TOOL_CALL_JSON_REPAIRED: removed trailing comma before } or ]');
+          }
+          return decoded.map(
+            (key, value) => MapEntry(key.toString(), value),
+          );
+        }
+      } catch (_) {}
+    }
+    return null;
   }
 
   List<ToolCall> parseToolCalls(String text) {
@@ -5719,14 +6924,15 @@ $stateBlock
     for (final match in xmlBlocks) {
       final block = (match.group(1) ?? '').trim();
       if (block.isEmpty) continue;
-      try {
-        final data = jsonDecode(block) as Map<String, dynamic>;
-        final name = data['name']?.toString() ?? '';
-        if (name.isNotEmpty)
-          addIfUnique(ToolCall(name: name, args: normalizeArgs(data['args'])));
+      final decodedBlock = decodeToolCallJson(block);
+      if (decodedBlock != null) {
+        final name = decodedBlock['name']?.toString() ?? '';
+        if (name.isNotEmpty) {
+          addIfUnique(
+            ToolCall(name: name, args: normalizeArgs(decodedBlock['args'])),
+          );
+        }
         continue;
-      } catch (_) {
-        // fallback ниже
       }
       final legacyNamed =
           RegExp(r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{[\s\S]*\})\s*$')
@@ -5734,26 +6940,26 @@ $stateBlock
       if (legacyNamed != null) {
         final name = legacyNamed.group(1) ?? '';
         final body = legacyNamed.group(2) ?? '';
-        try {
-          addIfUnique(
-              ToolCall(name: name, args: normalizeArgs(jsonDecode(body))));
-          continue;
-        } catch (_) {
-          final args = parseLegacyToolArgs(body.substring(1, body.length - 1));
-          if (name.isNotEmpty && args.isNotEmpty)
-            addIfUnique(ToolCall(name: name, args: args));
+        final decodedBody = decodeToolCallJson(body);
+        if (decodedBody != null) {
+          addIfUnique(ToolCall(name: name, args: normalizeArgs(decodedBody)));
           continue;
         }
+        final args = parseLegacyToolArgs(body.substring(1, body.length - 1));
+        if (name.isNotEmpty && args.isNotEmpty) {
+          addIfUnique(ToolCall(name: name, args: args));
+        }
+        continue;
       }
       final maybeJson = RegExp(r'\{[\s\S]*\}').firstMatch(block)?.group(0);
       if (maybeJson != null) {
-        try {
-          final data = jsonDecode(maybeJson) as Map<String, dynamic>;
-          final name = data['name']?.toString() ?? '';
-          if (name.isNotEmpty)
-            addIfUnique(
-                ToolCall(name: name, args: normalizeArgs(data['args'])));
-        } catch (_) {}
+        final data = decodeToolCallJson(maybeJson);
+        final name = data?['name']?.toString() ?? '';
+        if (name.isNotEmpty) {
+          addIfUnique(
+            ToolCall(name: name, args: normalizeArgs(data?['args'])),
+          );
+        }
       }
     }
 
@@ -5762,11 +6968,13 @@ $stateBlock
         r'<tool_call>\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{[\s\S]*?\})\s*(?:<tool_call\|>|\)\))',
         caseSensitive: false);
     for (final match in loose.allMatches(text)) {
-      try {
+      final decoded = decodeToolCallJson(match.group(2) ?? '');
+      if (decoded != null) {
         addIfUnique(ToolCall(
-            name: match.group(1)!,
-            args: normalizeArgs(jsonDecode(match.group(2)!))));
-      } catch (_) {}
+          name: match.group(1)!,
+          args: normalizeArgs(decoded),
+        ));
+      }
     }
 
     final legacy = RegExp(
@@ -5830,10 +7038,10 @@ $stateBlock
     if (!isFileMutationToolName(call.name)) return null;
     final path = mutationPathForTool(call).replaceAll('\\', '/');
     if (path.isEmpty) return null;
-    final key = '${call.name}:$path';
+    final key = path.toLowerCase();
     final count = (taskFileMutationAttempts[key] ?? 0) + 1;
     taskFileMutationAttempts[key] = count;
-    if (count <= 6) return null;
+    if (count <= 3) return null;
     if (taskCommandRuns == 0) {
       return 'REPEATED_FILE_MUTATION_BLOCKED: файл/путь `$path` уже изменялся $count раз инструментом `${call.name}`, но проверка/сборка ещё ни разу не запускалась. Нельзя бесконечно переписывать один файл. Следующее действие: project_map/read_file для проверки структуры или run_tests/run_command для сборки/проверки.';
     }
@@ -5904,57 +7112,91 @@ $stateBlock
     for (final entry in args.entries) {
       final key = entry.key;
       final value = entry.value;
+      if (key == 'input' && args['sensitive'] == true) {
+        copy[key] = '[SENSITIVE INPUT REDACTED]';
+        continue;
+      }
       if (key == 'content' || key == 'new_text' || key == 'old_text') {
         copy[key] = truncateMiddle(value?.toString() ?? '', 4000);
       } else {
         copy[key] = value is String ? truncateMiddle(value, 4000) : value;
       }
     }
-    return copy;
+    final redacted = SecretRedactor.redactObject(copy);
+    if (redacted is Map) {
+      return redacted.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+    }
+    return <String, Object?>{};
   }
 
-  bool isReadOnlyTool(String name) => const {
-        'project_map',
-        'list_files',
-        'read_file',
-        'list_local_tools',
-        'duckduckgo_search',
-        'web_fetch',
-        'web_deep_fetch',
-        'web_research',
-        'filesystem_search',
-        'list_device_directory',
-        'read_device_text_file',
-        'read_device_folder_texts',
-        'search_device_documents',
-        'read_document_structure',
-        'knowledge_search',
-        'email_list_accounts',
-        'inspect_zip',
-        'read_docx_text',
-        'read_xlsx_text',
-        'search_device_index',
-        'recognize_image_text',
-      }.contains(name);
+  bool isReadOnlyTool(String name) {
+    final plugin = pluginManager?.byToolName(name);
+    if (plugin != null) return plugin.kind == AgentPluginKind.reference;
+    return const {
+      'project_map',
+      'list_files',
+      'read_file',
+      'list_local_tools',
+      'get_task_status',
+      'duckduckgo_search',
+      'web_fetch',
+      'web_deep_fetch',
+      'web_research',
+      'filesystem_search',
+      'list_device_directory',
+      'read_device_text_file',
+      'read_device_folder_texts',
+      'search_device_documents',
+      'read_document_structure',
+      'knowledge_search',
+      'email_list_accounts',
+      'inspect_zip',
+      'read_docx_text',
+      'read_xlsx_text',
+      'search_device_index',
+      'recognize_image_text',
+      'memory_recall',
+      'memory_conflicts',
+      'plugin_list',
+      'terminal_read',
+      'terminal_list',
+    }.contains(name);
+  }
 
-  bool isCriticalTool(String name) => const {
-        'run_command',
-        'run_tests',
-        'delete_path',
-        'move_path',
-        'copy_path',
-        'extract_zip',
-        'download_to_tools',
-        'extract_zip_to_tools',
-        'download_to_project',
-        'knowledge_store',
-        'archive_device_children',
-        'create_document_from_text',
-        'edit_document_text',
-        'email_draft_smtp',
-        'rebuild_device_index',
-        'run_custom_tool',
-      }.contains(name);
+  bool isCriticalTool(String name) {
+    final plugin = pluginManager?.byToolName(name);
+    if (plugin != null) {
+      if (plugin.kind == AgentPluginKind.reference) return false;
+      return plugin.sensitive ||
+          plugin.requiresNetwork ||
+          plugin.requiresProcess;
+    }
+    return const {
+      'run_command',
+      'run_tests',
+      'delete_path',
+      'move_path',
+      'copy_path',
+      'extract_zip',
+      'download_to_tools',
+      'extract_zip_to_tools',
+      'download_to_project',
+      'knowledge_store',
+      'archive_device_children',
+      'create_document_from_text',
+      'edit_document_text',
+      'email_draft_smtp',
+      'rebuild_device_index',
+      'run_custom_tool',
+      'memory_remember',
+      'promote_golden_path',
+      'terminal_open',
+      'terminal_write',
+      'terminal_close',
+    }.contains(name);
+  }
 
   String describeToolCall(ToolCall call) {
     final args = sanitizeToolArgsForLog(call.name, call.args);
@@ -6001,6 +7243,19 @@ $stateBlock
                 ? 'изменение файлов внутри проекта'
                 : 'действие агента';
 
+    final requestedPlugin = pluginManager?.byToolName(call.name);
+    if (requestedPlugin != null) {
+      if (!requestedPlugin.enabled) {
+        log('PERMISSION BLOCKED: ${call.name}; plugin is disabled');
+        return false;
+      }
+      if (requestedPlugin.kind != AgentPluginKind.reference &&
+          requestedPlugin.requiresNetwork &&
+          !allowInternetUse) {
+        log('PERMISSION BLOCKED: ${call.name}; plugin requires network but internet is disabled');
+        return false;
+      }
+    }
     if (const {
           'duckduckgo_search',
           'web_fetch',
@@ -6024,6 +7279,14 @@ $stateBlock
       final rawRoot = call.args['root']?.toString().trim() ?? '';
       if (rawRoot.isNotEmpty && !isPathInsideAllowedSandbox(rawRoot))
         externalFilePathNeedingPermission = rawRoot;
+    }
+    if (call.name == 'terminal_open') {
+      final rawCwd = call.args['cwd']?.toString().trim() ?? '';
+      if (rawCwd.isNotEmpty &&
+          isAbsolutePath(rawCwd) &&
+          !isPathInsideAllowedSandbox(rawCwd)) {
+        externalFilePathNeedingPermission = rawCwd;
+      }
     }
     if (const {
       'list_device_directory',
@@ -6106,40 +7369,282 @@ $stateBlock
 
   Future<String> executeTool(ToolCall call) async {
     taskToolActions++;
+    final beforeFileMutations = taskFileMutations;
+    final beforeCommandRuns = taskCommandRuns;
+    final beforeInternetActions = taskInternetActions;
+    final previousResult = lastToolResultText;
+
+    if (buildMutationAwaitingRetry &&
+        buildRetryRequired &&
+        !isRequiredBuildRetryToolCall(call)) {
+      final blocked =
+          'BUILD_RETRY_REQUIRED_NEXT: после подтверждённой правки следующим '
+          'действием должна быть исходная команда сборки:\n'
+          '$requiredBuildRetryCommand\n'
+          'Инструмент `${call.name}` не выполнен. Используй run_tests без команды '
+          'либо run_command/run_tests с этой же командой.';
+      lastToolName = call.name;
+      lastToolResultText = blocked;
+      consecutiveCircuitBreakerBlocks++;
+      if (consecutiveCircuitBreakerBlocks >= 3) {
+        cancelRequested = true;
+      }
+      taskEvidenceLedger.recordTool(
+        toolName: call.name,
+        args: call.args,
+        result: blocked,
+        successful: false,
+      );
+      if (toolCircuitBreakerEnabled) {
+        toolExecutionGuard.record(
+          toolName: call.name,
+          args: call.args,
+          result: blocked,
+          progressRevision: taskProgressRevision,
+          successful: false,
+        );
+      }
+      log('BUILD RETRY NEXT ACTION BLOCK: ${call.name}');
+      logAction('build_retry_next_action_blocked', {
+        'tool': call.name,
+        'required_command': requiredBuildRetryCommand,
+      });
+      await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
+      return blocked;
+    }
+
+    if (call.name == 'get_task_status') {
+      consecutiveTaskStatusCalls++;
+      if (consecutiveTaskStatusCalls > 1) {
+        final blocked = 'STATUS_LOOP_BLOCKED: get_task_status уже вызван '
+            '$consecutiveTaskStatusCalls раз подряд без исправления или диагностики. '
+            'Следующее действие должно быть одним из: выполнить предложенную диагностическую '
+            'команду, прочитать конкретный файл из ошибки, исправить конфигурацию сборки или '
+            'повторить сборку с изменённой стратегией.';
+        consecutiveCircuitBreakerBlocks++;
+        var effectiveBlocked = blocked;
+        if (consecutiveCircuitBreakerBlocks >= 3) {
+          cancelRequested = true;
+          effectiveBlocked += '\nAGENT_STALLED_STOP: три действия подряд были '
+              'заблокированы без прогресса. Запуск остановлен, чтобы не '
+              'расходовать итерации на цикл.';
+        }
+        lastToolName = call.name;
+        lastToolResultText = effectiveBlocked;
+        taskEvidenceLedger.recordTool(
+          toolName: call.name,
+          args: call.args,
+          result: effectiveBlocked,
+          successful: false,
+        );
+        if (toolCircuitBreakerEnabled) {
+          toolExecutionGuard.recordBlockedAttempt(
+            progressRevision: taskProgressRevision,
+          );
+        }
+        await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
+        return effectiveBlocked;
+      }
+    } else {
+      consecutiveTaskStatusCalls = 0;
+    }
+
+    if (toolCircuitBreakerEnabled) {
+      final decision = toolExecutionGuard.evaluate(
+        toolName: call.name,
+        args: call.args,
+        progressRevision: taskProgressRevision,
+      );
+      if (!decision.allowed) {
+        consecutiveCircuitBreakerBlocks++;
+        var blocked = decision.message;
+        toolExecutionGuard.recordBlockedAttempt(
+          progressRevision: taskProgressRevision,
+        );
+        if (consecutiveCircuitBreakerBlocks >= 3) {
+          cancelRequested = true;
+          blocked += '\nAGENT_STALLED_STOP: три вызова инструментов были '
+              'заблокированы без измеримого прогресса. Текущий запуск '
+              'остановлен; продолжение возможно после изменения стратегии.';
+        }
+        lastToolName = call.name;
+        lastToolResultText = blocked;
+        taskEvidenceLedger.recordTool(
+          toolName: call.name,
+          args: call.args,
+          result: blocked,
+          successful: false,
+        );
+        log(
+          'TOOL CIRCUIT BREAKER: ${call.name} '
+          'args=${truncateMiddle(jsonEncode(call.args), 3000)}',
+        );
+        logAction('tool_circuit_breaker', {
+          'tool': call.name,
+          'args': sanitizeToolArgsForLog(call.name, call.args),
+          'message': blocked,
+          'consecutive_blocks': consecutiveCircuitBreakerBlocks,
+        });
+        await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
+        return blocked;
+      }
+    }
+
+    await updateTaskCheckpoint(AgentRunStatus.executingTool);
+    final allowed = await checkToolPermission(call);
+    if (!allowed) {
+      final denied = 'Permission denied for tool: ${call.name}';
+      log(
+        'PERMISSION DENIED: ${call.name} '
+        'args=${truncateMiddle(jsonEncode(call.args), 4000)}',
+      );
+      logAction('permission_denied', {'tool': call.name, 'args': call.args});
+      taskEvidenceLedger.add(
+        type: TaskEvidenceType.permission,
+        title: call.name,
+        detail: denied,
+        successful: false,
+      );
+      if (toolCircuitBreakerEnabled) {
+        toolExecutionGuard.record(
+          toolName: call.name,
+          args: call.args,
+          result: denied,
+          progressRevision: taskProgressRevision,
+          successful: false,
+        );
+      }
+      lastToolName = call.name;
+      lastToolResultText = denied;
+      await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
+      return denied;
+    }
+
     if (call.name == 'web_research') {
       taskInternetActions += 3;
     } else if (const {'duckduckgo_search', 'web_fetch', 'web_deep_fetch'}
         .contains(call.name)) {
       taskInternetActions++;
     }
-    final allowed = await checkToolPermission(call);
-    if (!allowed) {
-      final denied = 'Permission denied for tool: ${call.name}';
-      log('PERMISSION DENIED: ${call.name} args=${truncateMiddle(jsonEncode(call.args), 4000)}');
-      logAction('permission_denied', {'tool': call.name, 'args': call.args});
-      lastToolName = call.name;
-      lastToolResultText = denied;
-      return denied;
-    }
+
     logAction('tool_start', {
       'tool': call.name,
-      'args': sanitizeToolArgsForLog(call.name, call.args)
+      'args': sanitizeToolArgsForLog(call.name, call.args),
     });
     try {
       final result = await executeToolAllowed(call);
+      final successful = toolResultLooksSuccessful(call.name, result);
+      final novelResult = toolCircuitBreakerEnabled
+          ? toolExecutionGuard.isNovelResult(
+              toolName: call.name,
+              args: call.args,
+              result: result,
+            )
+          : result != previousResult;
+      final fileStateChanged = taskFileMutations != beforeFileMutations;
+      final commandStateChanged =
+          taskCommandRuns != beforeCommandRuns && (successful || novelResult);
+      final internetStateChanged =
+          taskInternetActions != beforeInternetActions && novelResult;
+      final passiveTool = const {
+        'get_task_status',
+        'plugin_list',
+        'memory_conflicts',
+      }.contains(call.name);
+      final stateChanged = fileStateChanged ||
+          commandStateChanged ||
+          internetStateChanged ||
+          (!passiveTool && successful && novelResult);
+      if (stateChanged) {
+        taskProgressRevision++;
+        consecutiveCircuitBreakerBlocks = 0;
+      }
+
+      taskEvidenceLedger.recordTool(
+        toolName: call.name,
+        args: call.args,
+        result: result,
+        successful: successful,
+      );
+      await maybeAutoLearnVerifiedRun(call, successful);
+      if (toolCircuitBreakerEnabled) {
+        toolExecutionGuard.record(
+          toolName: call.name,
+          args: call.args,
+          result: result,
+          progressRevision: taskProgressRevision,
+          successful: successful,
+        );
+      }
       lastToolName = call.name;
       lastToolResultText = result;
-      logAction('tool_finish',
-          {'tool': call.name, 'result': truncateMiddle(result, 8000)});
+      logAction('tool_finish', {
+        'tool': call.name,
+        'successful': successful,
+        'progress_revision': taskProgressRevision,
+        'result': truncateMiddle(result, 8000),
+      });
+      await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
       return result;
     } catch (error, stack) {
       log('TOOL ERROR ${call.name}: $error\n$stack');
       logAction('tool_error', {'tool': call.name, 'error': error.toString()});
       final failed = 'Tool ${call.name} failed: $error';
+      taskEvidenceLedger.recordTool(
+        toolName: call.name,
+        args: call.args,
+        result: failed,
+        successful: false,
+      );
+      if (toolCircuitBreakerEnabled) {
+        toolExecutionGuard.record(
+          toolName: call.name,
+          args: call.args,
+          result: failed,
+          progressRevision: taskProgressRevision,
+          successful: false,
+        );
+      }
       lastToolName = call.name;
       lastToolResultText = failed;
+      await updateTaskCheckpoint(
+        AgentRunStatus.waitingForModel,
+        lastError: error.toString(),
+      );
       return failed;
     }
+  }
+
+  Future<void> maybeAutoLearnVerifiedRun(
+    ToolCall call,
+    bool successful,
+  ) async {
+    if (!autoLearnVerifiedRunsEnabled ||
+        !successful ||
+        taskFailedCommands <= 0) {
+      return;
+    }
+    if (!const {'run_command', 'run_tests'}.contains(call.name)) return;
+    if (lastCommandExitCode != 0) return;
+    var command = call.args['command']?.toString().trim() ?? '';
+    if (command.isEmpty) command = lastCommandText.trim();
+    if (command.isEmpty ||
+        !VerificationCommandClassifier.isVerificationCommand(command) ||
+        VerificationCommandClassifier.isConfigurationOnlyCommand(command) ||
+        !taskEvidenceLedger.hasPassingVerification) {
+      return;
+    }
+    final key = normalizeBuildCommandForComparison(command);
+    if (!autoLearnedVerificationCommands.add(key)) return;
+    final failures = taskEvidenceLedger.failedApproaches();
+    if (failures.isEmpty) return;
+    await rememberSolution(
+      'Проверенное восстановление после ошибки сборки или тестирования',
+      'Проверенная команда: $command',
+      'golden-path,auto,command,${Platform.operatingSystem},$hostArchSegment',
+      verification: taskEvidenceLedger.groundedVerificationSummary,
+      failedApproaches: failures,
+    );
   }
 
   bool lastToolResultCompletesReadOnlyTask() {
@@ -6253,9 +7758,10 @@ $stateBlock
   }
 
   bool commandOutputHasSuccessfulExit(String output) {
-    final matches = RegExp(r'EXIT_CODE:\s*(-?\d+)', caseSensitive: false)
-        .allMatches(output)
-        .toList();
+    final matches = RegExp(
+      r'(?:^|\n)EXIT_CODE:\s*(-?\d+)(?:\r?\n|$)',
+      caseSensitive: false,
+    ).allMatches(output).toList();
     if (matches.isEmpty) return false;
     final last = int.tryParse(matches.last.group(1) ?? '');
     return last == 0;
@@ -6283,7 +7789,20 @@ $fallback
         return localToolsCompactSummary(
             purpose: call.args['purpose']?.toString() ?? 'all', maxItems: 80);
       case 'set_task_plan':
-        return setTaskPlan(call.args['plan']?.toString() ?? '');
+        {
+          final plan = call.args['plan']?.toString() ?? '';
+          final availability = currentCppDependencyAvailability;
+          if (availability != null) {
+            final block = CppDependencyPreflight.planBlockReason(
+              plan,
+              availability,
+            );
+            if (block != null) return block;
+          }
+          return setTaskPlan(plan);
+        }
+      case 'get_task_status':
+        return currentTaskStatusReport();
       case 'rebuild_device_index':
         return await rebuildDeviceIndex();
       case 'search_device_index':
@@ -6398,13 +7917,55 @@ $fallback
             call.args['dest']?.toString() ?? 'downloads/extracted');
       case 'remember_solution':
         return rememberSolution(
-            call.args['problem']?.toString() ?? '',
-            call.args['solution']?.toString() ?? '',
-            call.args['tags']?.toString() ?? '');
+          call.args['problem']?.toString() ?? '',
+          call.args['solution']?.toString() ?? '',
+          call.args['tags']?.toString() ?? '',
+          verification: call.args['verification']?.toString() ?? '',
+          failedApproaches:
+              _splitLines(call.args['failed_approaches']?.toString() ?? ''),
+        );
+      case 'memory_recall':
+        return memoryRecall(
+          call.args['query']?.toString() ?? '',
+          maxResults:
+              int.tryParse(call.args['max_results']?.toString() ?? '') ?? 8,
+        );
+      case 'memory_remember':
+        return memoryRemember(
+          type: call.args['type']?.toString() ?? 'fact',
+          title: call.args['title']?.toString() ?? '',
+          content: call.args['content']?.toString() ?? '',
+          source: call.args['source']?.toString() ?? '',
+          confidence:
+              double.tryParse(call.args['confidence']?.toString() ?? '') ??
+                  0.65,
+          tags: call.args['tags']?.toString() ?? '',
+        );
+      case 'memory_conflicts':
+        {
+          final memory = localMemory;
+          if (memory == null) return 'MEMORY_NOT_INITIALIZED';
+          return memory.formatConflicts();
+        }
+      case 'promote_golden_path':
+        return promoteGoldenPath(
+          problem: call.args['problem']?.toString() ?? '',
+          solution: call.args['solution']?.toString() ?? '',
+          verification: call.args['verification']?.toString() ?? '',
+          failedApproaches:
+              _splitLines(call.args['failed_approaches']?.toString() ?? ''),
+          tags: call.args['tags']?.toString() ?? '',
+        );
+      case 'plugin_list':
+        return pluginListText();
       case 'list_files':
         return listFiles(call.args['path']?.toString() ?? '.');
       case 'read_file':
-        return readRelativeFile(call.args['path']?.toString() ?? '');
+        return readRelativeFile(
+          call.args['path']?.toString() ?? '',
+          lineStart: int.tryParse(call.args['line_start']?.toString() ?? ''),
+          lineEnd: int.tryParse(call.args['line_end']?.toString() ?? ''),
+        );
       case 'write_file':
       case 'create_file':
         {
@@ -6445,30 +8006,79 @@ $fallback
         return copyRelativePath(call.args['from']?.toString() ?? '',
             call.args['to']?.toString() ?? '',
             move: true);
+      case 'terminal_open':
+        {
+          final snapshot = await terminalService.open(
+            sessionId: call.args['session_id']?.toString() ?? '',
+            name: call.args['name']?.toString() ?? '',
+            cwd: call.args['cwd']?.toString() ?? '.',
+            shell: call.args['shell']?.toString() ?? '',
+            environment: buildToolAwareEnvironment(),
+          );
+          final initial = call.args['initial_command']?.toString().trim() ?? '';
+          var initialResult = '';
+          if (initial.isNotEmpty) {
+            initialResult = await terminalService.writeAndCollect(
+              snapshot.id,
+              initial,
+              timeout: const Duration(seconds: 12),
+            );
+          }
+          return '''TERMINAL_OPENED
+SESSION_ID: ${snapshot.id}
+NAME: ${snapshot.name}
+CWD: ${snapshot.cwd}
+SHELL: ${snapshot.shell}
+RUNNING: ${snapshot.running}
+PID: ${snapshot.pid ?? 'n/a'}
+${initialResult.isEmpty ? '' : '\n$initialResult'}''';
+        }
+      case 'terminal_write':
+        return terminalService.writeAndCollect(
+          call.args['session_id']?.toString() ?? '',
+          call.args['input']?.toString() ?? '',
+          submit: call.args['submit'] == null ||
+              parseBoolString(call.args['submit']?.toString() ?? 'true'),
+          sensitive:
+              parseBoolString(call.args['sensitive']?.toString() ?? 'false'),
+          timeout: Duration(
+            seconds:
+                (int.tryParse(call.args['wait_seconds']?.toString() ?? '') ?? 8)
+                    .clamp(1, 120)
+                    .toInt(),
+          ),
+        );
+      case 'terminal_read':
+        return terminalService.read(
+          call.args['session_id']?.toString() ?? '',
+          maxChars:
+              int.tryParse(call.args['max_chars']?.toString() ?? '') ?? 30000,
+        );
+      case 'terminal_list':
+        return terminalService.listSessions();
+      case 'terminal_close':
+        return terminalService.close(call.args['session_id']?.toString() ?? '');
       case 'run_command':
         final command = call.args['command']?.toString() ?? '';
         final cwd = call.args['cwd']?.toString() ?? '';
-        final result = await runCommand(command, relativeWorkingDirectory: cwd);
-        if (taskLooksLikeCppTask() &&
-            isCompilerOrBuildCommand(command) &&
-            (isEnvironmentProblemOutput(result) ||
-                isBuildConfigurationProblemOutput(result))) {
-          log('RUN COMMAND AUTO-FALLBACK: compiler/build command failed; trying tools-aware run_tests with local tools priority.');
-          final fallback = await runDefaultTests(relativeWorkingDirectory: cwd);
-          if (commandOutputHasSuccessfulExit(fallback)) {
-            lastCommandExitCode = 0;
-            lastCommandResultText = buildFallbackSuccessResult(
-                original: result, fallback: fallback);
-            return lastCommandResultText;
-          }
-          return '$result\n\n[AUTO_BUILD_FALLBACK]\n$fallback';
+        if (isCompilerOrBuildCommand(command)) {
+          return runBuildCommandWithRecovery(
+            command,
+            relativeWorkingDirectory: cwd,
+            verificationRequested: false,
+          );
         }
-        return result;
+        return runCommand(command, relativeWorkingDirectory: cwd);
       case 'run_tests':
         final command = call.args['command']?.toString().trim() ?? '';
         final cwd = call.args['cwd']?.toString() ?? '';
-        if (command.isNotEmpty)
-          return runCommand(command, relativeWorkingDirectory: cwd);
+        if (command.isNotEmpty) {
+          return runBuildCommandWithRecovery(
+            command,
+            relativeWorkingDirectory: cwd,
+            verificationRequested: true,
+          );
+        }
         return runDefaultTests(relativeWorkingDirectory: cwd);
       case 'inspect_zip':
         return inspectZip(call.args['path']?.toString() ?? '');
@@ -6482,6 +8092,9 @@ $fallback
         return readDocumentStructure(call.args['path']?.toString() ?? '',
             maxChars: 24000);
       default:
+        if (pluginManager?.byToolName(call.name) != null) {
+          return runPluginTool(call.name, call.args['input']?.toString() ?? '');
+        }
         return 'Unknown tool: ${call.name}';
     }
   }
@@ -6553,15 +8166,39 @@ For C++ use `CMakeLists.txt` in the project root or in a normal project subfolde
 Action `$action` was not executed.''';
   }
 
-  String readRelativeFile(String relativePath) {
+  String readRelativeFile(
+    String relativePath, {
+    int? lineStart,
+    int? lineEnd,
+  }) {
     final root = currentProject;
     if (root == null) return 'No project';
     if (relativePath.isEmpty) return 'path is required';
     final file = File(resolveProjectPath(root.path, relativePath));
     if (!file.existsSync()) return 'File not found: $relativePath';
-    return truncateMiddle(
-        file.readAsStringSync(encoding: const Utf8Codec(allowMalformed: true)),
-        24000);
+    final normalized = normalizeRelativePathForPolicy(relativePath);
+    fileReadAtBuildFailureRevision[normalized] = buildFailureRevision;
+    final text = file.readAsStringSync(
+      encoding: const Utf8Codec(allowMalformed: true),
+    );
+    final lines = text.split('\n');
+    if (lineStart == null && lineEnd == null) {
+      fileReadRangesAtBuildFailureRevision[normalized] =
+          text.length <= 24000 ? '1:${lines.length}' : 'partial';
+      return truncateMiddle(text, 24000);
+    }
+    final start = (lineStart ?? 1).clamp(1, math.max(1, lines.length)).toInt();
+    final requestedEnd = lineEnd ?? start + 80;
+    final end =
+        requestedEnd.clamp(start, math.min(lines.length, start + 399)).toInt();
+    final buffer = StringBuffer(
+      'FILE_RANGE: $relativePath lines $start-$end of ${lines.length}\n',
+    );
+    for (var index = start - 1; index < end; index++) {
+      buffer.writeln('${index + 1} | ${lines[index]}');
+    }
+    fileReadRangesAtBuildFailureRevision[normalized] = '$start:$end';
+    return truncateMiddle(buffer.toString().trimRight(), 30000);
   }
 
   Future<String?> readRelativeFileForEditor(String relativePath) async {
@@ -6640,6 +8277,465 @@ Action `$action` was not executed.''';
     ));
   }
 
+  bool isSourceCodePath(String relativePath) {
+    final lower = normalizeRelativePathForPolicy(relativePath);
+    return RegExp(
+      r'\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|m|mm|rs|go|java|kt|kts|dart|py|js|ts)$',
+    ).hasMatch(lower);
+  }
+
+  bool isBuildConfigurationPath(String relativePath) {
+    final lower = normalizeRelativePathForPolicy(relativePath);
+    final name = lower.split('/').last;
+    return name == 'cmakelists.txt' ||
+        name == 'makefile' ||
+        name == 'meson.build' ||
+        name == 'pubspec.yaml' ||
+        name == 'package.json' ||
+        name == 'cargo.toml' ||
+        name == 'build.gradle' ||
+        name == 'build.gradle.kts' ||
+        name == 'settings.gradle' ||
+        name == 'settings.gradle.kts' ||
+        lower.endsWith('.cmake');
+  }
+
+  bool buildReadRangeIncludesLine(String relativePath, int line) {
+    final normalized = normalizeRelativePathForPolicy(relativePath);
+    final raw = fileReadRangesAtBuildFailureRevision[normalized]?.trim() ?? '';
+    final match = RegExp(r'^(\d+):(\d+)$').firstMatch(raw);
+    if (match == null) return false;
+    final start = int.tryParse(match.group(1) ?? '') ?? 0;
+    final end = int.tryParse(match.group(2) ?? '') ?? 0;
+    return start > 0 && end >= start && line >= start && line <= end;
+  }
+
+  String? buildFailureMutationBlockReason(
+    String relativePath, {
+    required bool fileExists,
+  }) {
+    final analysis = lastBuildFailureAnalysis;
+    if (analysis == null || !buildRetryRequired) {
+      return null;
+    }
+    final normalized = normalizeRelativePathForPolicy(relativePath);
+    final wasRead =
+        fileReadAtBuildFailureRevision[normalized] == buildFailureRevision;
+    if (buildMutationAwaitingRetry &&
+        (isSourceCodePath(relativePath) ||
+            isBuildConfigurationPath(relativePath))) {
+      return 'BUILD_RETRY_REQUIRED_BEFORE_MORE_EDITS: после предыдущей правки '
+          '`$relativePath` необходимо сначала повторить сборку. Нельзя вносить '
+          'несколько предположительных правок подряд без нового stdout/stderr.';
+    }
+
+    if (isSourceCodePath(relativePath)) {
+      if (!analysis.sourceMutationAllowed) {
+        return 'SOURCE_EDIT_BLOCKED_AFTER_BUILD_FAILURE: последняя ошибка имеет тип '
+            '`${analysis.kind.name}` и не указывает на ошибку исходного файла. '
+            'Файл `$relativePath` не изменён. ${analysis.recommendedAction} '
+            'Сначала выполни предложенную диагностику или исправь конфигурацию/окружение, '
+            'затем повтори сборку.';
+      }
+      final implicated = analysis.implicatedFiles
+          .map(normalizeRelativePathForPolicy)
+          .toList(growable: false);
+      final matches = implicated.any(
+        (item) =>
+            item == normalized ||
+            item.endsWith('/$normalized') ||
+            normalized.endsWith('/$item'),
+      );
+      if (implicated.isNotEmpty && !matches) {
+        return 'SOURCE_EDIT_BLOCKED_WRONG_FILE: компилятор указал файлы '
+            '`${analysis.implicatedFiles.join(', ')}`, а модель пытается изменить '
+            '`$relativePath`. Прочитай и исправь только файл, присутствующий в диагностике.';
+      }
+      int? implicatedLine;
+      for (final entry in analysis.implicatedLines.entries) {
+        final item = normalizeRelativePathForPolicy(entry.key);
+        if (item == normalized ||
+            item.endsWith('/$normalized') ||
+            normalized.endsWith('/$item')) {
+          implicatedLine = entry.value;
+          break;
+        }
+      }
+      if (fileExists &&
+          implicatedLine != null &&
+          (!wasRead ||
+              !buildReadRangeIncludesLine(relativePath, implicatedLine))) {
+        final start = implicatedLine > 20 ? implicatedLine - 20 : 1;
+        final end = implicatedLine + 20;
+        return 'SOURCE_EDIT_REQUIRES_ERROR_RANGE: компилятор указал '
+            '`$relativePath:$implicatedLine`. Перед правкой прочитай этот участок: '
+            'read_file(path=`$relativePath`, line_start=$start, line_end=$end). '
+            'Полное чтение большого файла с усечением не считается подтверждением.';
+      }
+      if (fileExists && !wasRead) {
+        return 'SOURCE_EDIT_REQUIRES_READ: перед исправлением `$relativePath` после ошибки '
+            'компилятора необходимо вызвать read_file для этого файла и прочитать участок, '
+            'указанный компилятором. После чтения внеси минимальную правку и повтори '
+            'ту же команду сборки.';
+      }
+      return null;
+    }
+
+    if (isBuildConfigurationPath(relativePath)) {
+      final diagnostic = analysis.suggestedDiagnosticCommand?.trim() ?? '';
+      if (diagnostic.isNotEmpty &&
+          !buildDiagnosticsRun.contains(diagnostic.toLowerCase())) {
+        return 'BUILD_DIAGNOSTIC_REQUIRED: вывод инструмента предложил `$diagnostic`. '
+            'Сначала выполни эту безопасную диагностическую команду, затем решай, '
+            'нужно ли менять `$relativePath`. Исходники и конфигурацию нельзя менять '
+            'до чтения справки.';
+      }
+      if (!analysis.configurationMutationAllowed) {
+        return 'BUILD_CONFIG_EDIT_BLOCKED: ошибка `${analysis.kind.name}` не доказывает, '
+            'что нужно менять `$relativePath`. ${analysis.recommendedAction}';
+      }
+      if (fileExists && !wasRead) {
+        return 'BUILD_CONFIG_EDIT_REQUIRES_READ: сначала прочитай существующий '
+            '`$relativePath`, затем исправляй только подтверждённую проблему и повторяй сборку.';
+      }
+    }
+    return null;
+  }
+
+  void markBuildRelatedMutation(String relativePath) {
+    if (!buildRetryRequired) return;
+    if (isSourceCodePath(relativePath) ||
+        isBuildConfigurationPath(relativePath)) {
+      buildMutationAwaitingRetry = true;
+    }
+  }
+
+  void updateBuildFailureState({
+    required String command,
+    required String output,
+    required int exitCode,
+    required String relativeWorkingDirectory,
+  }) {
+    if (!isCompilerOrBuildCommand(command)) return;
+    if (isSafeBuildDiagnosticCommand(command)) {
+      if (exitCode == 0) {
+        buildDiagnosticsRun.add(command.trim().toLowerCase());
+      }
+      return;
+    }
+
+    final previousAnalysis = lastBuildFailureAnalysis;
+    final previousRetryCommand = requiredBuildRetryCommand;
+    buildMutationAwaitingRetry = false;
+
+    if (exitCode == 0) {
+      if (CMakeCommandResolver.isCMakeConfigureOnlyCommand(command)) {
+        final previousWasCompilationFailure = previousAnalysis != null &&
+            const {
+              BuildFailureKind.sourceCompile,
+              BuildFailureKind.linker,
+              BuildFailureKind.dependency,
+              BuildFailureKind.artifact,
+            }.contains(previousAnalysis.kind);
+        if (!previousWasCompilationFailure) {
+          lastBuildFailureAnalysis = null;
+          fileReadAtBuildFailureRevision.clear();
+          fileReadRangesAtBuildFailureRevision.clear();
+          buildDiagnosticsRun.clear();
+        }
+        buildRetryRequired = true;
+        requiredBuildRetryCommand =
+            CMakeCommandResolver.isCMakeBuildCommand(previousRetryCommand)
+                ? previousRetryCommand
+                : CMakeCommandResolver.deriveBuildCommandFromConfigure(command);
+        requiredBuildRetryWorkingDirectory =
+            normalizeRelativeDirectory(relativeWorkingDirectory);
+        return;
+      }
+
+      lastBuildFailureAnalysis = null;
+      fileReadAtBuildFailureRevision.clear();
+      fileReadRangesAtBuildFailureRevision.clear();
+      buildDiagnosticsRun.clear();
+      buildRetryRequired = false;
+      requiredBuildRetryCommand = '';
+      requiredBuildRetryWorkingDirectory = '';
+      return;
+    }
+
+    lastBuildFailureAnalysis = buildFailureAnalyzer.analyze(
+      command: command,
+      output: output,
+      projectRoot: currentProject?.path ?? '',
+    );
+    buildFailureRevision++;
+    fileReadAtBuildFailureRevision.clear();
+    fileReadRangesAtBuildFailureRevision.clear();
+    buildDiagnosticsRun.clear();
+    buildRetryRequired = true;
+    requiredBuildRetryCommand = command.trim();
+    requiredBuildRetryWorkingDirectory =
+        normalizeRelativeDirectory(relativeWorkingDirectory);
+  }
+
+  bool isSafeBuildDiagnosticCommand(String command) {
+    final lower = command.trim().toLowerCase();
+    return RegExp(
+      r'^(?:[a-z0-9_+.-]+|"[^"]+")\s+(?:--help|--version|-version|/\?)$',
+    ).hasMatch(lower);
+  }
+
+  Future<String> runSuggestedBuildDiagnostic(
+    BuildFailureAnalysis analysis, {
+    required String relativeWorkingDirectory,
+  }) async {
+    final diagnostic = analysis.suggestedDiagnosticCommand?.trim() ?? '';
+    if (diagnostic.isEmpty) return '';
+    final key = diagnostic.toLowerCase();
+    if (buildDiagnosticsRun.contains(key)) return '';
+    final savedExitCode = lastCommandExitCode;
+    final savedCommand = lastCommandText;
+    final savedResult = lastCommandResultText;
+    final savedAnalysis = lastBuildFailureAnalysis;
+    final savedRevision = buildFailureRevision;
+    final result = await runCommand(
+      diagnostic,
+      allowPythonAutoInstall: false,
+      relativeWorkingDirectory: relativeWorkingDirectory,
+    );
+    final diagnosticSucceeded = lastCommandExitCode == 0;
+    if (diagnosticSucceeded) {
+      buildDiagnosticsRun.add(key);
+    }
+    lastCommandExitCode = savedExitCode;
+    lastCommandText = savedCommand;
+    lastCommandResultText = savedResult;
+    lastBuildFailureAnalysis = savedAnalysis;
+    buildFailureRevision = savedRevision;
+    return '[AUTO_BUILD_DIAGNOSTIC]\nCOMMAND: $diagnostic\n$result\n'
+        '[/AUTO_BUILD_DIAGNOSTIC]';
+  }
+
+  String normalizeBuildCommandForComparison(String command) {
+    return command
+        .trim()
+        .replaceAll('\\', '/')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .toLowerCase();
+  }
+
+  bool isRequiredBuildRetryCommand(String command) {
+    final required = requiredBuildRetryCommand.trim();
+    if (required.isEmpty) return true;
+    return normalizeBuildCommandForComparison(command) ==
+        normalizeBuildCommandForComparison(required);
+  }
+
+  bool isRequiredBuildRetryToolCall(ToolCall call) {
+    if (!buildMutationAwaitingRetry || !buildRetryRequired) return true;
+    if (call.name == 'run_tests') {
+      final command = call.args['command']?.toString().trim() ?? '';
+      return command.isEmpty || isRequiredBuildRetryCommand(command);
+    }
+    if (call.name == 'run_command') {
+      final command = call.args['command']?.toString().trim() ?? '';
+      return command.isNotEmpty && isRequiredBuildRetryCommand(command);
+    }
+    return false;
+  }
+
+  bool shouldAutoRepairMissingCMakeLists(String output) {
+    final lower = output.toLowerCase();
+    return lower.contains('does not appear to contain cmakelists.txt') ||
+        lower.contains('could not find cmakelists.txt');
+  }
+
+  bool shouldAutoRepairMissingCMakeCache(String output) {
+    final lower = output.toLowerCase();
+    return lower.contains('not a cmake build directory') ||
+        lower.contains('missing cmakecache.txt') ||
+        lower.contains('could not load cache');
+  }
+
+  bool shouldAutoRepairLocatedProjectHeader(BuildFailureAnalysis analysis) {
+    return analysis.kind == BuildFailureKind.buildConfiguration &&
+        analysis.missingDependency.trim().isNotEmpty &&
+        analysis.locatedDependencyPath.trim().isNotEmpty;
+  }
+
+  String currentProjectWorkingDirectory(String relativeWorkingDirectory) {
+    final root = currentProject;
+    if (root == null) return '';
+    final workRel = normalizeRelativeDirectory(relativeWorkingDirectory);
+    return workRel.isEmpty ? root.path : resolveProjectPath(root.path, workRel);
+  }
+
+  Future<String> runBuildCommandWithRecovery(
+    String command, {
+    required String relativeWorkingDirectory,
+    bool allowAutomaticRepair = true,
+    bool verificationRequested = false,
+  }) async {
+    var workRel = normalizeRelativeDirectory(relativeWorkingDirectory);
+    final workingDirectoryResolution = BuildWorkingDirectoryResolver.resolve(
+      command: command,
+      projectRoot: currentProject?.path ?? '',
+      requestedRelativeDirectory: workRel,
+    );
+    workRel = workingDirectoryResolution.effectiveRelativeDirectory;
+    var workDir = currentProjectWorkingDirectory(workRel);
+    final sections = <String>[];
+    if (workingDirectoryResolution.changed) {
+      sections.add(
+        '[BUILD_WORKING_DIRECTORY_NORMALIZED]\n'
+        'REQUESTED_CWD: ${workingDirectoryResolution.requestedRelativeDirectory}\n'
+        'EFFECTIVE_CWD: .\n'
+        'REASON: ${workingDirectoryResolution.reason}\n'
+        '[/BUILD_WORKING_DIRECTORY_NORMALIZED]',
+      );
+    }
+    final resolution = workDir.isEmpty
+        ? CMakeCommandResolution(
+            originalCommand: command,
+            effectiveCommand: command,
+          )
+        : CMakeCommandResolver.resolve(
+            command: command,
+            workingDirectory: workDir,
+          );
+    final effectiveCommand = resolution.effectiveCommand;
+
+    if (buildMutationAwaitingRetry &&
+        buildRetryRequired &&
+        requiredBuildRetryCommand.trim().isNotEmpty) {
+      final requiredResolution = workDir.isEmpty
+          ? CMakeCommandResolution(
+              originalCommand: requiredBuildRetryCommand,
+              effectiveCommand: requiredBuildRetryCommand,
+            )
+          : CMakeCommandResolver.resolve(
+              command: requiredBuildRetryCommand,
+              workingDirectory: workDir,
+            );
+      if (!isRequiredBuildRetryCommand(effectiveCommand) &&
+          normalizeBuildCommandForComparison(effectiveCommand) !=
+              normalizeBuildCommandForComparison(
+                requiredResolution.effectiveCommand,
+              )) {
+        return 'BUILD_RETRY_COMMAND_MISMATCH: после изменения, сделанного по '
+            'результатам ошибки сборки, необходимо сначала повторить '
+            'исправленную команду:\n${requiredResolution.effectiveCommand}\n'
+            'Новая команда не запускалась. Если повторная сборка снова '
+            'завершится ошибкой, после новой диагностики можно выбрать '
+            'другую стратегию.';
+      }
+    }
+
+    if (resolution.changed) {
+      sections.add(
+        '[BUILD_COMMAND_NORMALIZED]\n'
+        'ORIGINAL: ${resolution.originalCommand}\n'
+        'EFFECTIVE: ${resolution.effectiveCommand}\n'
+        'REASON: ${resolution.reason}\n'
+        '[/BUILD_COMMAND_NORMALIZED]',
+      );
+    }
+
+    final first = await runCommand(
+      effectiveCommand,
+      relativeWorkingDirectory: workRel,
+    );
+    sections.add(first);
+
+    if (lastCommandExitCode == 0) {
+      if (verificationRequested &&
+          CMakeCommandResolver.isCMakeConfigureOnlyCommand(effectiveCommand)) {
+        final buildCommand =
+            CMakeCommandResolver.deriveBuildCommandFromConfigure(
+          effectiveCommand,
+        );
+        final buildResult = await runCommand(
+          buildCommand,
+          relativeWorkingDirectory: workRel,
+        );
+        sections.add(
+          '[BUILD_AFTER_CONFIGURATION]\n$buildResult\n'
+          '[/BUILD_AFTER_CONFIGURATION]',
+        );
+      }
+      return sections.join('\n\n');
+    }
+    if (!isCompilerOrBuildCommand(effectiveCommand)) {
+      return sections.join('\n\n');
+    }
+
+    final analysis = lastBuildFailureAnalysis;
+    if (analysis == null) return sections.join('\n\n');
+    final diagnostic = await runSuggestedBuildDiagnostic(
+      analysis,
+      relativeWorkingDirectory: workRel,
+    );
+    if (diagnostic.isNotEmpty) sections.add(diagnostic);
+
+    final requiredDiagnostic =
+        analysis.suggestedDiagnosticCommand?.trim().toLowerCase() ?? '';
+    final diagnosticSatisfied = requiredDiagnostic.isEmpty ||
+        buildDiagnosticsRun.contains(requiredDiagnostic);
+    final missingCMakeLists = shouldAutoRepairMissingCMakeLists(first);
+    final missingCMakeCache = shouldAutoRepairMissingCMakeCache(first);
+    final localHeaderNeedsInclude =
+        shouldAutoRepairLocatedProjectHeader(analysis);
+    final safeAutomaticRepair = allowAutomaticRepair &&
+        diagnosticSatisfied &&
+        taskLooksLikeCppTask() &&
+        (missingCMakeLists || missingCMakeCache || localHeaderNeedsInclude);
+
+    if (safeAutomaticRepair) {
+      final source = primarySourceFile(
+        const ['.cpp', '.cc', '.cxx'],
+        preferredNames: const [
+          'main.cpp',
+          'object_recognition.cpp',
+          'object_detector.cpp',
+        ],
+        baseRelativeDirectory: workRel,
+      );
+      if (source != null) {
+        final note = ensureCMakeListsForCppSource(
+          source,
+          baseRelativeDirectory: workRel,
+          forceRepair: localHeaderNeedsInclude,
+        );
+        sections.add(
+          '[AUTO_BUILD_CONFIGURATION_REPAIR]\n$note\n'
+          '[/AUTO_BUILD_CONFIGURATION_REPAIR]',
+        );
+
+        var recoveryCommand = analysis.suggestedRecoveryCommand?.trim() ?? '';
+        if (recoveryCommand.isEmpty) recoveryCommand = effectiveCommand;
+        final repairedResolution = workDir.isEmpty
+            ? CMakeCommandResolution(
+                originalCommand: recoveryCommand,
+                effectiveCommand: recoveryCommand,
+              )
+            : CMakeCommandResolver.resolve(
+                command: recoveryCommand,
+                workingDirectory: workDir,
+              );
+        final retry = await runCommand(
+          repairedResolution.effectiveCommand,
+          relativeWorkingDirectory: workRel,
+        );
+        sections.add(
+          '[BUILD_RETRY_AFTER_CONFIGURATION_REPAIR]\n$retry\n'
+          '[/BUILD_RETRY_AFTER_CONFIGURATION_REPAIR]',
+        );
+        return sections.join('\n\n');
+      }
+    }
+    return sections.join('\n\n');
+  }
+
   Future<String> writeRelativeFile(String relativePath, String content) async {
     final root = currentProject;
     if (root == null) return 'No project';
@@ -6658,23 +8754,24 @@ Action `$action` was not executed.''';
         ? await file.readAsString(
             encoding: const Utf8Codec(allowMalformed: true))
         : '';
-    if (existed &&
-        before.trim().isNotEmpty &&
-        isEnvironmentProblemOutput(lastCommandResultText)) {
-      final blocked =
-          'WRITE BLOCKED: last command failed because a compiler/tool is missing from the environment, not because this source file is wrong. The agent must not overwrite $relativePath after an environment error. Try run_tests/another compiler or report the missing tool.';
-      log(blocked);
-      logAction('file_write_blocked_environment_error', {
+    final buildBlock = buildFailureMutationBlockReason(
+      relativePath,
+      fileExists: existed,
+    );
+    if (buildBlock != null) {
+      log(buildBlock);
+      logAction('file_write_blocked_build_failure', {
         'path': relativePath,
+        'failure_kind': lastBuildFailureAnalysis?.kind.name ?? 'unknown',
         'last_command': lastCommandText,
-        'last_output': truncateMiddle(lastCommandResultText, 4000)
       });
-      return blocked;
+      return buildBlock;
     }
     await file.parent.create(recursive: true);
     await file.writeAsString(content, encoding: utf8);
     recordFileChange(relativePath, before, content);
     taskFileMutations++;
+    markBuildRelatedMutation(relativePath);
     log('FILE WRITE: $relativePath existed=$existed old=${before.length} chars new=${content.length} chars\nOLD_CONTENT:\n${truncateMiddle(before, 5000)}\nNEW_CONTENT:\n${truncateMiddle(content, 5000)}');
     logAction('file_write', {
       'path': relativePath,
@@ -6700,15 +8797,22 @@ Action `$action` was not executed.''';
       return blocked;
     }
     final file = File(resolveProjectPath(root.path, relativePath));
-    final before = (await file.exists())
+    final existed = await file.exists();
+    final before = existed
         ? await file.readAsString(
             encoding: const Utf8Codec(allowMalformed: true))
         : '';
+    final buildBlock = buildFailureMutationBlockReason(
+      relativePath,
+      fileExists: existed,
+    );
+    if (buildBlock != null) return buildBlock;
     await file.parent.create(recursive: true);
     await file.writeAsString(content, mode: FileMode.append, encoding: utf8);
     final after = before + content;
     recordFileChange(relativePath, before, after);
     taskFileMutations++;
+    markBuildRelatedMutation(relativePath);
     log('FILE APPEND: $relativePath appended=${content.length} chars\nCONTENT_APPEND:\n${truncateMiddle(content, 5000)}');
     logAction('file_append', {
       'path': relativePath,
@@ -6734,6 +8838,11 @@ Action `$action` was not executed.''';
     if (oldText.isEmpty) return 'old_text is required';
     final file = File(resolveProjectPath(root.path, relativePath));
     if (!await file.exists()) return 'File not found: $relativePath';
+    final buildBlock = buildFailureMutationBlockReason(
+      relativePath,
+      fileExists: true,
+    );
+    if (buildBlock != null) return buildBlock;
     final before = await file.readAsString(
         encoding: const Utf8Codec(allowMalformed: true));
     final after = all
@@ -6743,6 +8852,7 @@ Action `$action` was not executed.''';
     await file.writeAsString(after, encoding: utf8);
     recordFileChange(relativePath, before, after);
     taskFileMutations++;
+    markBuildRelatedMutation(relativePath);
     log('FILE REPLACE: $relativePath old=${oldText.length} chars new=${newText.length} chars all=$all\nOLD:\n${truncateMiddle(oldText, 3000)}\nNEW:\n${truncateMiddle(newText, 3000)}');
     logAction('file_replace', {
       'path': relativePath,
@@ -6772,6 +8882,20 @@ Action `$action` was not executed.''';
     final type = FileSystemEntity.typeSync(path);
     if (type == FileSystemEntityType.notFound)
       return 'Path not found: $relativePath';
+    if (type == FileSystemEntityType.file) {
+      final buildBlock = buildFailureMutationBlockReason(
+        relativePath,
+        fileExists: true,
+      );
+      if (buildBlock != null) {
+        log(buildBlock);
+        logAction('file_delete_blocked_build_failure', {
+          'path': relativePath,
+          'failure_kind': lastBuildFailureAnalysis?.kind.name ?? 'unknown',
+        });
+        return buildBlock;
+      }
+    }
     final before = type == FileSystemEntityType.file
         ? await File(path)
             .readAsString(encoding: const Utf8Codec(allowMalformed: true))
@@ -6785,6 +8909,9 @@ Action `$action` was not executed.''';
     if (type == FileSystemEntityType.file)
       recordFileChange(relativePath, before, '');
     taskFileMutations++;
+    if (type == FileSystemEntityType.file) {
+      markBuildRelatedMutation(relativePath);
+    }
     logAction('path_delete', {
       'path': relativePath,
       'recursive': recursive,
@@ -6812,6 +8939,23 @@ Action `$action` was not executed.''';
     final dst = resolveProjectPath(root.path, to);
     final type = FileSystemEntity.typeSync(src);
     if (type == FileSystemEntityType.notFound) return 'Path not found: $from';
+    if (type == FileSystemEntityType.file) {
+      final relevantPath = move ? from : to;
+      final relevantExists = move || File(dst).existsSync();
+      final buildBlock = buildFailureMutationBlockReason(
+        relevantPath,
+        fileExists: relevantExists,
+      );
+      if (buildBlock != null) {
+        log(buildBlock);
+        logAction('path_${move ? 'move' : 'copy'}_blocked_build_failure', {
+          'from': from,
+          'to': to,
+          'failure_kind': lastBuildFailureAnalysis?.kind.name ?? 'unknown',
+        });
+        return buildBlock;
+      }
+    }
     log('${move ? 'MOVE' : 'COPY'} PATH: $from -> $to');
     if (type == FileSystemEntityType.directory) {
       await copyDirectory(Directory(src), Directory(dst));
@@ -6822,6 +8966,9 @@ Action `$action` was not executed.''';
       if (move) await File(src).delete();
     }
     taskFileMutations++;
+    if (type == FileSystemEntityType.file) {
+      markBuildRelatedMutation(move ? from : to);
+    }
     logAction(move ? 'path_move' : 'path_copy',
         {'from': from, 'to': to, 'type': type.toString()});
     return '${move ? 'Moved' : 'Copied'}: $from -> $to';
@@ -7265,6 +9412,17 @@ Action `$action` was not executed.''';
     final root = currentProject;
     if (root == null) return 'No project';
     final workRel = normalizeRelativeDirectory(relativeWorkingDirectory);
+    if (buildRetryRequired && requiredBuildRetryCommand.trim().isNotEmpty) {
+      final retryCwd = requiredBuildRetryWorkingDirectory.isNotEmpty
+          ? requiredBuildRetryWorkingDirectory
+          : workRel;
+      log('RUN_TESTS REQUIRED BUILD RETRY: $requiredBuildRetryCommand');
+      return runBuildCommandWithRecovery(
+        requiredBuildRetryCommand,
+        relativeWorkingDirectory: retryCwd,
+        verificationRequested: true,
+      );
+    }
     final cppSource = primarySourceFile([
       '.cpp',
       '.cc',
@@ -7290,7 +9448,11 @@ Action `$action` was not executed.''';
       if (directCompilerAvailable) {
         final command = defaultCppBuildCommand(cppSource);
         log('RUN_TESTS CPP DIRECT BUILD: $command');
-        return runCommand(command, relativeWorkingDirectory: workRel);
+        return runBuildCommandWithRecovery(
+          command,
+          relativeWorkingDirectory: workRel,
+          verificationRequested: true,
+        );
       }
       final cmake = toolCommand(['cmake.exe', 'cmake']);
       if (commandLikelyAvailable(cmake)) {
@@ -7298,10 +9460,17 @@ Action `$action` was not executed.''';
             baseRelativeDirectory: workRel);
         if (cmakeNote.isNotEmpty) log('AUTO CMAKE PREPARE: $cmakeNote');
         final command = cmakeBuildAndRunCommand(cmake);
-        return runCommand(command, relativeWorkingDirectory: workRel);
+        return runBuildCommandWithRecovery(
+          command,
+          relativeWorkingDirectory: workRel,
+          verificationRequested: true,
+        );
       }
-      return runCommand(defaultCppBuildCommand(cppSource),
-          relativeWorkingDirectory: workRel);
+      return runBuildCommandWithRecovery(
+        defaultCppBuildCommand(cppSource),
+        relativeWorkingDirectory: workRel,
+        verificationRequested: true,
+      );
     }
     return runCommand(defaultTestCommand(relativeWorkingDirectory: workRel),
         relativeWorkingDirectory: workRel);
@@ -7325,47 +9494,154 @@ Action `$action` was not executed.''';
     return '$cmake -S . -B build && $cmake --build build && (if [ -x build/agent_app ]; then ./build/agent_app; else echo Build completed but executable agent_app was not found.; exit 1; fi)';
   }
 
-  String ensureCMakeListsForCppSource(String relativeSource,
-      {String baseRelativeDirectory = ''}) {
+  String ensureCMakeListsForCppSource(
+    String relativeSource, {
+    String baseRelativeDirectory = '',
+    bool forceRepair = false,
+  }) {
     final root = currentProject;
     if (root == null) return '';
     final baseRel = normalizeRelativeDirectory(baseRelativeDirectory);
     final baseDir = baseRel.isEmpty
         ? Directory(root.path)
         : Directory(resolveProjectPath(root.path, baseRel));
-    if (!baseDir.existsSync())
+    if (!baseDir.existsSync()) {
       return 'CMake base directory not found: $baseRel';
+    }
+
     final cmakeFile = File(pathJoin(baseDir.path, 'CMakeLists.txt'));
-    final sourceForCmake = normalizeSourcePathForCMake(relativeSource,
-        baseRelativeDirectory: baseRel);
-    var shouldWrite = true;
+    final sources = <String>[];
+    final includeDirectories = <String>{};
+    try {
+      for (final entity
+          in baseDir.listSync(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        final relative =
+            pathRelative(baseDir.path, entity.path).replaceAll('\\', '/');
+        final segments = relative.toLowerCase().split('/');
+        if (segments.any((part) => const {
+              'build',
+              '.cppagent',
+              '.git',
+              '.dart_tool',
+              'dist',
+            }.contains(part))) {
+          continue;
+        }
+        final lower = relative.toLowerCase();
+        if (const ['.cpp', '.cc', '.cxx'].any(lower.endsWith)) {
+          sources.add(relative);
+        } else if (const ['.h', '.hh', '.hpp', '.hxx'].any(lower.endsWith)) {
+          final parent = pathRelative(baseDir.path, entity.parent.path)
+              .replaceAll('\\', '/');
+          if (parent.isNotEmpty && parent != '.') {
+            includeDirectories.add(parent);
+          }
+        }
+      }
+    } catch (error) {
+      return 'Could not scan C++ project for CMake generation: $error';
+    }
+
+    final preferred = normalizeSourcePathForCMake(
+      relativeSource,
+      baseRelativeDirectory: baseRel,
+    );
+    if (!sources.contains(preferred) &&
+        File(pathJoin(baseDir.path, preferred)).existsSync()) {
+      sources.add(preferred);
+    }
+    sources.sort((left, right) {
+      if (left == preferred) return -1;
+      if (right == preferred) return 1;
+      final leftMain = left.toLowerCase().endsWith('/main.cpp') ||
+          left.toLowerCase() == 'main.cpp';
+      final rightMain = right.toLowerCase().endsWith('/main.cpp') ||
+          right.toLowerCase() == 'main.cpp';
+      if (leftMain != rightMain) return leftMain ? -1 : 1;
+      return left.compareTo(right);
+    });
+    if (sources.isEmpty) {
+      return 'No C++ sources found for CMake generation in ${baseDir.path}';
+    }
+
+    var existing = '';
     if (cmakeFile.existsSync()) {
-      final existing = cmakeFile.readAsStringSync(
-          encoding: const Utf8Codec(allowMalformed: true));
+      existing = cmakeFile.readAsStringSync(
+        encoding: const Utf8Codec(allowMalformed: true),
+      );
       final existingSources =
           existingCppSourcesReferencedByCMake(existing, baseDir.path);
-      // Keep an existing CMakeLists only when it references real sources and
-      // builds the predictable target name used by run_tests. Otherwise repair it.
-      if (existing.contains('add_executable') &&
-          existingSources.isNotEmpty &&
-          existing.contains('agent_app')) shouldWrite = false;
+      final targetMatch = RegExp(
+        r'add_executable\s*\(\s*([^\s\)]+)',
+        caseSensitive: false,
+      ).firstMatch(existing);
+      final existingTarget = targetMatch?.group(1)?.trim() ?? '';
+      if (existingTarget.isNotEmpty && existingSources.isNotEmpty) {
+        final normalizedExisting = existing.replaceAll('\\', '/');
+        final missingIncludeDirectories = includeDirectories
+            .where((directory) => !normalizedExisting.contains(directory))
+            .toList(growable: false);
+        if (!forceRepair || missingIncludeDirectories.isEmpty) {
+          return '';
+        }
+        final includeLines = missingIncludeDirectories
+            .map((directory) => '  "\${CMAKE_CURRENT_SOURCE_DIR}/$directory"')
+            .join('\n');
+        final patched = '${existing.trimRight()}\n\n'
+            'target_include_directories($existingTarget PRIVATE\n'
+            '$includeLines\n)\n';
+        cmakeFile.writeAsStringSync(patched, encoding: utf8);
+        final relativeCMakePath =
+            pathRelative(root.path, cmakeFile.path).replaceAll('\\', '/');
+        recordFileChange(relativeCMakePath, existing, patched);
+        taskFileMutations++;
+        markBuildRelatedMutation(relativeCMakePath);
+        logAction('cmake_include_path_repair', {
+          'file': relativeCMakePath,
+          'target': existingTarget,
+          'include_directories': missingIncludeDirectories,
+        });
+        return 'Patched $relativeCMakePath: added include directories to '
+            'target $existingTarget without rewriting the project.';
+      }
     }
-    if (!shouldWrite) return '';
-    final content = '''cmake_minimum_required(VERSION 3.10)
+
+    final sourceLines = sources.map((source) => '  "$source"').join('\n');
+    final includeLines = includeDirectories
+        .map((directory) => '  "\${CMAKE_CURRENT_SOURCE_DIR}/$directory"')
+        .join('\n');
+    final includeBlock = includeDirectories.isEmpty
+        ? ''
+        : '\n\ntarget_include_directories(agent_app PRIVATE\n'
+            '$includeLines\n)';
+    final content = '''cmake_minimum_required(VERSION 3.16)
 project(AgentGeneratedCpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(agent_app "$sourceForCmake")
+set(AGENT_SOURCES
+$sourceLines
+)
+
+add_executable(agent_app \${AGENT_SOURCES})$includeBlock
 ''';
     cmakeFile.writeAsStringSync(content, encoding: utf8);
+    final relativeCMakePath =
+        pathRelative(root.path, cmakeFile.path).replaceAll('\\', '/');
+    recordFileChange(relativeCMakePath, existing, content);
     taskFileMutations++;
+    markBuildRelatedMutation(relativeCMakePath);
     logAction('cmake_auto_write', {
-      'file': pathRelative(root.path, cmakeFile.path),
-      'source': relativeSource
+      'file': relativeCMakePath,
+      'sources': sources,
+      'include_directories': includeDirectories.toList(growable: false),
+      'force_repair': forceRepair,
     });
-    return 'Created/repaired ${pathRelative(root.path, cmakeFile.path)} for source $relativeSource';
+    return 'Created/repaired $relativeCMakePath with ${sources.length} source(s)'
+        '${includeDirectories.isEmpty ? '' : ' and ${includeDirectories.length} include directorie(s)'}.';
   }
 
   List<String> existingCppSourcesReferencedByCMake(
@@ -7523,21 +9799,30 @@ add_executable(agent_app "$sourceForCmake")
       final gpp = findToolExecutable(['g++.exe', 'g++']);
       final clang = findToolExecutable(['clang++.exe', 'clang++']);
       final cl = findToolExecutable(['cl.exe', 'cl']);
-      final prepare =
-          'if not exist build mkdir build & if exist build\\app.exe del /q build\\app.exe';
       if (gpp != null) {
-        const exe = 'build\\app.exe';
-        return '$prepare & ${gpp.name} -std=c++17 -O2 $sourceArgs -o $exe && if exist $exe ($exe) else (echo BUILD_ARTIFACT_MISSING: $exe && exit /b 2)';
+        return CppBuildCommandBuilder.windowsDirect(
+          compiler: gpp.name,
+          sourceArgs: sourceArgs,
+        );
       }
       if (clang != null) {
-        const exe = 'build\\app.exe';
-        return '$prepare & ${clang.name} -std=c++17 -O2 $sourceArgs -o $exe && if exist $exe ($exe) else (echo BUILD_ARTIFACT_MISSING: $exe && exit /b 2)';
+        return CppBuildCommandBuilder.windowsDirect(
+          compiler: clang.name,
+          sourceArgs: sourceArgs,
+        );
       }
       if (cl != null) {
-        const exe = 'build\\app.exe';
-        return '$prepare & ${cl.name} /nologo /EHsc /std:c++17 $sourceArgs /Fe:$exe && if exist $exe ($exe) else (echo BUILD_ARTIFACT_MISSING: $exe && exit /b 2)';
+        return CppBuildCommandBuilder.windowsMsvc(
+          compiler: cl.name,
+          sourceArgs: sourceArgs,
+        );
       }
-      return '$prepare & (where g++ >nul 2>nul && (g++ -std=c++17 -O2 $sourceArgs -o build\\app.exe && if exist build\\app.exe (build\\app.exe) else (echo BUILD_ARTIFACT_MISSING: build\\app.exe && exit /b 2)) || (where clang++ >nul 2>nul && (clang++ -std=c++17 -O2 $sourceArgs -o build\\app.exe && if exist build\\app.exe (build\\app.exe) else (echo BUILD_ARTIFACT_MISSING: build\\app.exe && exit /b 2)) || (where cl >nul 2>nul && (cl /nologo /EHsc /std:c++17 $sourceArgs /Fe:build\\app.exe && if exist build\\app.exe (build\\app.exe) else (echo BUILD_ARTIFACT_MISSING: build\\app.exe && exit /b 2)) || (echo C++ compiler not found in tools/windows/x64 or PATH. Put MinGW/LLVM/MSVC tools into tools\\windows\\x64 or install compiler. && exit /b 9009))))';
+      return '(if not exist build mkdir build) & '
+          '(if exist build\\app.exe del /q build\\app.exe) & '
+          '(where g++ >nul 2>nul && (g++ -std=c++17 -O2 $sourceArgs -o build\\app.exe && if exist build\\app.exe (build\\app.exe) else (echo BUILD_ARTIFACT_MISSING: build\\app.exe && exit /b 2)) || '
+          '(where clang++ >nul 2>nul && (clang++ -std=c++17 -O2 $sourceArgs -o build\\app.exe && if exist build\\app.exe (build\\app.exe) else (echo BUILD_ARTIFACT_MISSING: build\\app.exe && exit /b 2)) || '
+          '(where cl >nul 2>nul && (cl /nologo /EHsc /std:c++17 $sourceArgs /Fe:build\\app.exe && if exist build\\app.exe (build\\app.exe) else (echo BUILD_ARTIFACT_MISSING: build\\app.exe && exit /b 2)) || '
+          '(echo C++ compiler not found in tools/windows/x64 or PATH. Put MinGW/LLVM/MSVC tools into tools\\windows\\x64 or install compiler. && exit /b 9009))))';
     }
     final gpp = findToolExecutable(['g++']);
     final clang = findToolExecutable(['clang++']);
@@ -7792,6 +10077,11 @@ add_executable(agent_app "$sourceForCmake")
       lastCommandExitCode = pkgResult.contains('EXIT_CODE: 0') ? 0 : 1;
       lastCommandText = command;
       lastCommandResultText = pkgResult;
+      unawaited(terminalService.recordCommandTranscript(
+        command: command,
+        cwd: workDir,
+        output: pkgResult,
+      ));
       return pkgResult;
     }
     final prepared =
@@ -7871,6 +10161,18 @@ $stderrText
 [/STDERR]
 ''';
       var enrichedResult = result;
+      updateBuildFailureState(
+        command: command,
+        output: result,
+        exitCode: effectiveExitCode,
+        relativeWorkingDirectory: workRel,
+      );
+      final buildAnalysis = lastBuildFailureAnalysis;
+      if (effectiveExitCode != 0 &&
+          isCompilerOrBuildCommand(command) &&
+          buildAnalysis != null) {
+        enrichedResult += '\n${buildAnalysis.toPromptBlock()}\n';
+      }
       if (effectiveExitCode != 0 &&
           (isEnvironmentProblemOutput(result) ||
               isBuildConfigurationProblemOutput(result) ||
@@ -7897,14 +10199,11 @@ $stderrText
       });
       final commandReturn =
           '${truncateMiddle(enrichedResult, 60000)}\nFULL_OUTPUT_LOG: $outputLogPath';
-      if (effectiveExitCode == 0 &&
-          taskFailedCommands > 0 &&
-          command.trim().isNotEmpty) {
-        await rememberSolution(
-            'После предыдущих ошибок команда успешно выполнилась',
-            'Успешная команда: $command',
-            'auto,command,${Platform.operatingSystem},${hostArchSegment}');
-      }
+      unawaited(terminalService.recordCommandTranscript(
+        command: command,
+        cwd: workDir,
+        output: commandReturn,
+      ));
       if (allowPythonAutoInstall &&
           effectiveExitCode != 0 &&
           isPythonExecutionCommand(effectiveCommand) &&
@@ -7936,6 +10235,11 @@ DETAILS: $error
       log('RUN COMMAND TIMEOUT: ${truncateMiddle(result, 12000)}');
       logAction(
           'command_timeout', {'command': command, 'output_log': outputLogPath});
+      unawaited(terminalService.recordCommandTranscript(
+        command: command,
+        cwd: workDir,
+        output: '$result\nFULL_OUTPUT_LOG: $outputLogPath',
+      ));
       return '$result\nFULL_OUTPUT_LOG: $outputLogPath';
     } catch (error, stack) {
       lastCommandExitCode = -1;
@@ -7957,6 +10261,11 @@ $stack
         'error': error.toString(),
         'output_log': outputLogPath
       });
+      unawaited(terminalService.recordCommandTranscript(
+        command: command,
+        cwd: workDir,
+        output: '$result\nFULL_OUTPUT_LOG: $outputLogPath',
+      ));
       return '$result\nFULL_OUTPUT_LOG: $outputLogPath';
     }
   }
@@ -7974,7 +10283,12 @@ $stack
           .replaceAll(':', '-')
           .replaceAll('.', '-');
       final file = File(pathJoin(dir.path, '${stamp}_command.log'));
-      await file.writeAsString('COMMAND:\n$command\n\n$result', encoding: utf8);
+      final safeCommand = SecretRedactor.redact(command);
+      final safeResult = SecretRedactor.redact(result);
+      await file.writeAsString(
+        'COMMAND:\n$safeCommand\n\n$safeResult',
+        encoding: utf8,
+      );
       return file.path;
     } catch (error) {
       log('COMMAND OUTPUT LOG WRITE ERROR: $error');
@@ -7996,13 +10310,36 @@ $stack
     if (project == null) return 'No project';
     final trimmed = plan.trim();
     if (trimmed.isEmpty) return 'plan is required';
+    final safePlan = SecretRedactor.redact(trimmed);
     final dir = Directory(pathJoin(project.path, '.cppagent'));
     await dir.create(recursive: true);
     final file = File(pathJoin(dir.path, 'task_plan.md'));
-    await file.writeAsString('# План задачи\n\n$trimmed\n', encoding: utf8);
+    if (await file.exists()) {
+      final current = await file.readAsString(
+        encoding: const Utf8Codec(allowMalformed: true),
+      );
+      final normalizedCurrent = current
+          .replaceFirst(RegExp(r'^# План задачи\s*', multiLine: false), '')
+          .trim()
+          .replaceAll(RegExp(r'\s+'), ' ');
+      final normalizedNew = safePlan.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (normalizedCurrent == normalizedNew) {
+        return 'TASK_PLAN_UNCHANGED: этот план уже сохранён. Повторная запись '
+            'не считается прогрессом; выполни следующий проверяемый шаг.';
+      }
+    }
+    await file.writeAsString('# План задачи\n\n$safePlan\n', encoding: utf8);
+    taskProgressRevision++;
+    taskEvidenceLedger.add(
+      type: TaskEvidenceType.plan,
+      title: 'План задачи',
+      detail: safePlan,
+      successful: true,
+    );
+    await updateTaskCheckpoint(AgentRunStatus.running, plan: safePlan);
     logAction('task_plan_set',
-        {'plan': truncateMiddle(trimmed, 12000), 'file': file.path});
-    return 'TASK_PLAN_SET: .cppagent/task_plan.md\n$trimmed';
+        {'plan': truncateMiddle(safePlan, 12000), 'file': file.path});
+    return 'TASK_PLAN_SET: .cppagent/task_plan.md\n$safePlan';
   }
 
   File get solutionMemoryFile =>
@@ -8021,6 +10358,13 @@ $stack
         final tags = data['tags']?.toString() ?? 'general';
         final problem = data['problem']?.toString() ?? '';
         var solution = data['solution']?.toString() ?? '';
+        final verification = (data['verification']?.toString() ?? '').trim();
+        final failedRaw = data['failedApproaches'];
+        final hasFailedApproach = failedRaw is List &&
+            failedRaw.any((item) => item.toString().trim().isNotEmpty);
+        final verified = data['verified'] == true &&
+            verification.isNotEmpty &&
+            hasFailedApproach;
         if (solution.trim().toLowerCase() == 'успешная команда: cd') continue;
         solution = solution.replaceAllMapped(
           RegExp(r'"([^"\r\n]+\.(?:cpp|cc|cxx|c|h|hpp))"',
@@ -8032,7 +10376,10 @@ $stack
                 : path.replaceAll('/', '\\');
           },
         );
-        final rendered = '- [$tags] $problem: $solution';
+        final trustLabel = verified
+            ? 'VERIFIED'
+            : 'TENTATIVE — перепроверь локально, не используй как факт';
+        final rendered = '- [$trustLabel][$tags] $problem: $solution';
         if (seen.add(rendered)) buffer.writeln(rendered);
         if (seen.length >= maxItems) break;
       }
@@ -8046,22 +10393,180 @@ $stack
   }
 
   Future<String> rememberSolution(
-      String problem, String solution, String tags) async {
-    if (problem.trim().isEmpty || solution.trim().isEmpty)
+    String problem,
+    String solution,
+    String tags, {
+    String verification = '',
+    List<String> failedApproaches = const [],
+  }) async {
+    if (problem.trim().isEmpty || solution.trim().isEmpty) {
       return 'problem and solution are required';
-    await configRoot.create(recursive: true);
-    final item = {
-      'time': DateTime.now().toIso8601String(),
-      'project': currentProject?.path,
-      'problem': problem.trim(),
-      'solution': solution.trim(),
-      'tags': tags.trim().isEmpty ? 'general' : tags.trim(),
-      'environment': hostEnvironmentSummary(),
+    }
+    final memory = localMemory;
+    if (memory == null) return 'MEMORY_NOT_INITIALIZED';
+
+    // Verification text supplied by the model is never trusted by itself.
+    // Only a successful verification command recorded after the latest failure
+    // can promote a lesson into an authoritative procedure.
+    final effectiveVerification =
+        taskEvidenceLedger.groundedVerificationSummary.trim();
+    final groundedFailures = taskEvidenceLedger.failedApproaches();
+    final tentativeFailures = <String>{
+      ...groundedFailures,
+      ...failedApproaches.where((item) => item.trim().isNotEmpty),
+    }.toList(growable: false);
+
+    AgentMemoryRecord record;
+    if (effectiveVerification.isNotEmpty && groundedFailures.isNotEmpty) {
+      record = await memory.promoteGoldenPath(
+        problem: problem,
+        solution: solution,
+        verification: effectiveVerification,
+        failedApproaches: groundedFailures,
+        projectPath: currentProject?.path ?? '',
+        tags: _splitTags(tags),
+      );
+    } else {
+      record = await memory.remember(
+        type: AgentMemoryType.learning,
+        title: problem,
+        content: solution,
+        scope: currentProject == null ? 'global' : 'project',
+        projectPath: currentProject?.path ?? '',
+        source: hostEnvironmentSummary(),
+        provenance: 'agent-tentative',
+        confidence: 0.60,
+        verified: false,
+        verification: '',
+        failedApproaches: tentativeFailures,
+        tags: _splitTags(tags),
+      );
+    }
+    final compatibilityItem = {
+      'time': record.updatedAt.toIso8601String(),
+      'project': record.projectPath,
+      'problem': record.title,
+      'solution': record.content,
+      'tags': record.tags.join(','),
+      'verified': record.verified,
+      'verification': record.verification,
+      'failedApproaches': record.failedApproaches,
     };
-    await solutionMemoryFile.writeAsString('${jsonEncode(item)}\n',
+    await solutionMemoryFile.writeAsString('${jsonEncode(compatibilityItem)}\n',
         mode: FileMode.append, encoding: utf8);
-    logAction('solution_remembered', item);
-    return 'Solution remembered: ${item['problem']}';
+    logAction('solution_remembered', {
+      'memory_id': record.id,
+      'problem': problem,
+      'verified': record.verified,
+      'model_claimed_verification_ignored':
+          verification.trim().isNotEmpty && effectiveVerification.isEmpty,
+    });
+    return 'SOLUTION_REMEMBERED: ${record.id}; verified=${record.verified}; '
+        'type=${record.type.name}${record.verified ? '' : '; tentative_until_real_verification'}';
+  }
+
+  List<String> _splitTags(String value) => value
+      .split(RegExp(r'[,;]'))
+      .map((item) => item.trim())
+      .where((item) => item.isNotEmpty)
+      .toList(growable: false);
+
+  List<String> _splitLines(String value) => value
+      .split(RegExp(r'[\r\n]+'))
+      .map((item) => item.replaceFirst(RegExp(r'^\s*[-*]\s*'), '').trim())
+      .where((item) => item.isNotEmpty)
+      .toList(growable: false);
+
+  Future<String> memoryRecall(String query, {int maxResults = 8}) async {
+    if (query.trim().isEmpty) return 'query is required';
+    final memory = localMemory;
+    if (memory == null) return 'MEMORY_NOT_INITIALIZED';
+    return memory.formatSearchResults(
+      query,
+      maxResults: maxResults,
+      projectPath: currentProject?.path ?? '',
+    );
+  }
+
+  Future<String> memoryRemember({
+    required String type,
+    required String title,
+    required String content,
+    String source = '',
+    double confidence = 0.65,
+    String tags = '',
+  }) async {
+    if (title.trim().isEmpty || content.trim().isEmpty) {
+      return 'title and content are required';
+    }
+    final parsedType = AgentMemoryType.values.firstWhere(
+      (value) => value.name == type.trim().toLowerCase(),
+      orElse: () => AgentMemoryType.fact,
+    );
+    final requiresGrounding = const <AgentMemoryType>{
+      AgentMemoryType.learning,
+      AgentMemoryType.procedure,
+    }.contains(parsedType);
+    final grounded = taskEvidenceLedger.hasPassingVerification &&
+        (lastCommandExitCode == null || lastCommandExitCode == 0);
+    final effectiveConfidence = (requiresGrounding && !grounded
+            ? math.min(confidence, 0.55)
+            : confidence)
+        .toDouble();
+    final record = await localMemory?.remember(
+      type: parsedType,
+      title: title,
+      content: content,
+      scope: currentProject == null ? 'global' : 'project',
+      projectPath: currentProject?.path ?? '',
+      source: source,
+      provenance: grounded ? 'agent-tool-grounded' : 'agent-tool-tentative',
+      confidence: effectiveConfidence,
+      verified: false,
+      tags: _splitTags(tags),
+    );
+    return record == null
+        ? 'MEMORY_NOT_INITIALIZED'
+        : 'MEMORY_STORED: ${record.id}; verified=false; '
+            'confidence=${effectiveConfidence.toStringAsFixed(2)}; '
+            'tentative_until_real_verification';
+  }
+
+  Future<String> promoteGoldenPath({
+    required String problem,
+    required String solution,
+    required String verification,
+    required List<String> failedApproaches,
+    String tags = '',
+  }) async {
+    final memory = localMemory;
+    if (memory == null) return 'MEMORY_NOT_INITIALIZED';
+    final groundedVerification =
+        taskEvidenceLedger.groundedVerificationSummary.trim();
+    final groundedFailures = taskEvidenceLedger.failedApproaches();
+    if (groundedVerification.isEmpty) {
+      return 'GOLDEN_PATH_REJECTED: нет успешной команды проверки после '
+          'последней ошибки. Текст verification, предоставленный моделью, '
+          'не является доказательством.';
+    }
+    if (groundedFailures.isEmpty) {
+      return 'GOLDEN_PATH_REJECTED: в журнале текущего запуска нет реально '
+          'зафиксированного неудачного подхода.';
+    }
+    try {
+      final record = await memory.promoteGoldenPath(
+        problem: problem,
+        solution: solution,
+        verification: groundedVerification,
+        failedApproaches: groundedFailures,
+        projectPath: currentProject?.path ?? '',
+        tags: _splitTags(tags),
+      );
+      return 'GOLDEN_PATH_PROMOTED: ${record.id}; '
+          'verification=$groundedVerification';
+    } catch (error) {
+      return 'GOLDEN_PATH_REJECTED: $error';
+    }
   }
 
   String resolveToolsPath(String relativePath) {
@@ -8203,6 +10708,49 @@ $stack
       .replaceAll(RegExp(r'\s+'), ' ')
       .trim();
 
+  List<String> extractWebRelevantLines(String text, String query,
+      {int max = 40}) {
+    final queryWords = normalizeResearchText(query)
+        .split(' ')
+        .where((word) => word.length > 2)
+        .toSet();
+    final ranked = <MapEntry<double, String>>[];
+    final seen = <String>{};
+    var position = 0;
+    for (final rawLine in text.split('\n')) {
+      final line = rawLine.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (line.length < 12 || !seen.add(normalizeResearchText(line))) continue;
+      final normalized = normalizeResearchText(line);
+      final matches = queryWords.where(normalized.contains).length;
+      final heading = rawLine.trimLeft().startsWith('#');
+      final table = rawLine.trimLeft().startsWith('|');
+      if (queryWords.isNotEmpty && matches == 0 && !heading) {
+        position++;
+        continue;
+      }
+      final score = matches * 10.0 +
+          (heading ? 3.0 : 0.0) +
+          (table ? 1.5 : 0.0) +
+          (position < 25 ? 1.0 : 0.0);
+      ranked.add(MapEntry(score, line));
+      position++;
+    }
+    if (ranked.isEmpty) {
+      return text
+          .split('\n')
+          .map((line) => line.trim())
+          .where((line) => line.length >= 24)
+          .take(max.clamp(1, 100))
+          .map((line) => '- $line')
+          .toList(growable: false);
+    }
+    ranked.sort((a, b) => b.key.compareTo(a.key));
+    return ranked
+        .take(max.clamp(1, 100))
+        .map((entry) => '- ${entry.value}')
+        .toList(growable: false);
+  }
+
   bool textContainsAllNameTokens(String text, List<String> tokens) {
     if (tokens.length != 3) return true;
     final words = normalizeResearchText(text)
@@ -8324,32 +10872,13 @@ $stack
       if (response.statusCode < 200 || response.statusCode >= 300) {
         return 'DUCKDUCKGO_SEARCH_FAILED: HTTP ${response.statusCode}\n$query';
       }
+      final hits = webContentExtractor.extractSearchResults(html, uri,
+          maxResults: limit);
       final results = <String>[];
-      final resultPattern = RegExp(
-          r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>',
-          caseSensitive: false);
-      for (final match in resultPattern.allMatches(html)) {
-        if (results.length >= limit) break;
-        final url = normalizeDuckDuckGoUrl(match.group(1) ?? '');
-        final title =
-            stripHtmlToText(match.group(2) ?? '').replaceAll('\n', ' ').trim();
-        if (url.isEmpty || title.isEmpty) continue;
-        results.add('${results.length + 1}. $title\nURL: $url');
-      }
-      if (results.isEmpty) {
-        final links = RegExp(
-                r"""<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>""",
-                caseSensitive: false)
-            .allMatches(html);
-        for (final match in links) {
-          if (results.length >= limit) break;
-          final url = normalizeDuckDuckGoUrl(match.group(1) ?? '');
-          final title = stripHtmlToText(match.group(2) ?? '')
-              .replaceAll('\n', ' ')
-              .trim();
-          if (!url.startsWith('http') || title.length < 3) continue;
-          results.add('${results.length + 1}. $title\nURL: $url');
-        }
+      for (final hit in hits) {
+        final snippet = hit.snippet.isEmpty ? '' : '\nSNIPPET: ${hit.snippet}';
+        results.add(
+            '${results.length + 1}. ${hit.title}\nURL: ${hit.url}$snippet');
       }
       logAction('duckduckgo_search', {'query': q, 'results': results.length});
       if (results.isEmpty) return 'DUCKDUCKGO_SEARCH_NO_RESULTS: $q';
@@ -8383,84 +10912,89 @@ $stack
       final bytes =
           await response.expand((chunk) => chunk).take(limit * 4).toList();
       final html = utf8.decode(bytes, allowMalformed: true);
-      final titleMatch =
-          RegExp(r'<title[^>]*>([\s\S]*?)</title>', caseSensitive: false)
-              .firstMatch(html);
-      final title = titleMatch == null
-          ? ''
-          : stripHtmlToText(titleMatch.group(1) ?? '').replaceAll('\n', ' ');
-      final text = stripHtmlToText(html);
-      final linkLines = <String>[];
-      for (final match in RegExp(
-              r"""<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>""",
-              caseSensitive: false)
-          .allMatches(html)) {
-        if (linkLines.length >= 80) break;
-        final href = htmlEntityDecodeBasic(match.group(1) ?? '').trim();
-        final label =
-            stripHtmlToText(match.group(2) ?? '').replaceAll('\n', ' ').trim();
-        if (href.isEmpty || label.isEmpty) continue;
-        Uri? linkUri = Uri.tryParse(href);
-        if (linkUri != null && !linkUri.hasScheme)
-          linkUri = uri.resolveUri(linkUri);
-        if (linkUri == null ||
-            !(linkUri.scheme == 'http' || linkUri.scheme == 'https')) continue;
-        linkLines.add('- $label => ${linkUri.toString()}');
-      }
-      final imageLines = extractRelevantImageLines(
-          html, uri, researchQuery.trim().isEmpty ? raw : researchQuery,
-          max: 12);
+      final page = webContentExtractor.extract(html, uri);
+      final text = page.text;
+      final linkLines = page.links
+          .take(100)
+          .map((link) => '- ${link.label} => ${link.url}')
+          .toList(growable: false);
+      final queryWords = normalizeResearchText(researchQuery)
+          .split(' ')
+          .where((word) => word.length > 2)
+          .toSet();
+      final imageLines = page.images
+          .where((image) {
+            if (queryWords.isEmpty || image.description.isEmpty) return true;
+            final description = normalizeResearchText(image.description);
+            return queryWords.any(description.contains);
+          })
+          .take(16)
+          .map((image) =>
+              '- ${image.description.isEmpty ? 'изображение без описания' : image.description} => ${image.url}')
+          .toList(growable: false);
       final contacts = <String>[];
       for (final match in RegExp(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}',
               caseSensitive: false)
-          .allMatches('$text\n$html')) {
+          .allMatches('$text\n${page.metadata.values.join('\n')}')) {
         final value = match.group(0) ?? '';
         if (value.isNotEmpty &&
             !contacts.contains(value) &&
             contacts.length < 30) contacts.add(value);
       }
-      final usefulLines = <String>[];
-      final usefulMarkers = [
-        'работ',
-        'должн',
-        'компан',
-        'организац',
-        'университет',
-        'школ',
-        'профиль',
-        'биограф',
-        'родствен',
-        'комментар',
-        'контакт',
-        'сотруд',
-        'автор',
-        'руковод'
-      ];
-      for (final line in text.split('\n')) {
-        final cleanLine = line.trim();
-        if (cleanLine.length < 12) continue;
-        final lowerLine = cleanLine.toLowerCase();
-        if (usefulMarkers.any(lowerLine.contains) && usefulLines.length < 40)
-          usefulLines.add('- $cleanLine');
-      }
+      final relevantLines = extractWebRelevantLines(text, researchQuery);
+      final metadataLines = page.metadata.entries
+          .where((entry) => const {
+                'description',
+                'og:description',
+                'og:type',
+                'og:site_name',
+                'author',
+                'date',
+                'article:published_time',
+                'article:modified_time',
+                'canonical',
+                'language'
+              }.contains(entry.key))
+          .take(30)
+          .map((entry) => '- ${entry.key}: ${entry.value}')
+          .toList(growable: false);
+      final structuredData = page.structuredData.isEmpty
+          ? ''
+          : truncateMiddle(jsonEncode(page.structuredData), 12000);
       logAction('web_fetch', {
         'url': raw,
         'status': response.statusCode,
         'chars': text.length,
-        'links': linkLines.length
+        'links': linkLines.length,
+        'quality': page.qualityScore,
+        'warnings': page.warnings.length,
       });
       return '''WEB_FETCH_RESULT
 URL: $raw
 HTTP_STATUS: ${response.statusCode}
-TITLE: $title
+TITLE: ${page.title}
+WORDS: ${page.wordCount}
+EXTRACTION_QUALITY: ${page.qualityScore.toStringAsFixed(2)}
+
+[WARNINGS]
+${page.warnings.map((warning) => '- $warning').join('\n')}
+[/WARNINGS]
+
+[METADATA]
+${metadataLines.join('\n')}
+[/METADATA]
 
 [CONTACTS]
 ${contacts.map((e) => '- $e').join('\n')}
 [/CONTACTS]
 
-[USEFUL_LINES]
-${usefulLines.join('\n')}
-[/USEFUL_LINES]
+[QUERY_RELEVANT_EXCERPTS]
+${relevantLines.join('\n')}
+[/QUERY_RELEVANT_EXCERPTS]
+
+[STRUCTURED_DATA_JSON_LD]
+$structuredData
+[/STRUCTURED_DATA_JSON_LD]
 
 [IMAGES]
 ${imageLines.join('\n')}
@@ -8813,6 +11347,7 @@ ${linkLines.join('\n')}
       '.docx',
       '.xlsx',
       '.pptx',
+      '.vsdx',
       '.odt',
       '.ods',
       '.odp',
@@ -8866,23 +11401,14 @@ ${linkLines.join('\n')}
 
   Future<String> knowledgeStore(String topic, String content,
       {String source = '', String tags = ''}) async {
-    final cleanTopic = topic.trim();
-    final cleanContent = content.trim();
-    if (cleanTopic.isEmpty || cleanContent.isEmpty)
-      return 'topic and content are required';
-    await configRoot.create(recursive: true);
-    final record = {
-      'time': DateTime.now().toIso8601String(),
-      'topic': cleanTopic,
-      'content': cleanContent,
-      'source': source.trim(),
-      'tags': tags.trim(),
-    };
-    await knowledgeBaseFile().writeAsString('${jsonEncode(record)}\n',
-        mode: FileMode.append, encoding: utf8);
-    logAction('knowledge_store',
-        {'topic': cleanTopic, 'source': source, 'tags': tags});
-    return 'KNOWLEDGE_STORED: $cleanTopic';
+    return memoryRemember(
+      type: 'fact',
+      title: topic,
+      content: content,
+      source: source,
+      confidence: 0.7,
+      tags: tags,
+    );
   }
 
   Future<List<Map<String, dynamic>>> readKnowledgeRecords() async {
@@ -8900,29 +11426,99 @@ ${linkLines.join('\n')}
   }
 
   Future<String> knowledgeSearch(String query, {int maxResults = 8}) async {
-    final q = query.trim().toLowerCase();
-    if (q.isEmpty) return 'query is required';
-    final terms = q.split(RegExp(r'\s+')).where((e) => e.length > 1).toList();
-    final scored = <MapEntry<int, Map<String, dynamic>>>[];
-    for (final record in await readKnowledgeRecords()) {
-      final text =
-          '${record['topic']} ${record['content']} ${record['tags']} ${record['source']}'
-              .toLowerCase();
-      var score = text.contains(q) ? 10 : 0;
-      for (final term in terms) {
-        if (text.contains(term)) score++;
+    return memoryRecall(query, maxResults: maxResults);
+  }
+
+  Future<List<PluginUpdateInfo>> checkPluginUpdates(
+      {bool includeNotInstalled = false}) async {
+    final manager = pluginManager;
+    if (manager == null) return const [];
+    final updates =
+        await manager.checkForUpdates(includeNotInstalled: includeNotInstalled);
+    pendingPluginUpdates = updates;
+    notifyUi();
+    return updates;
+  }
+
+  Future<void> checkPluginUpdatesOnStartup() async {
+    if (!pluginAutoCheckEnabled || !allowInternetUse) return;
+    try {
+      final updates = await checkPluginUpdates();
+      if (updates.isEmpty) return;
+      if (pluginAutoUpdateEnabled) {
+        unawaited(updatePlugins(updates.map((item) => item.pluginId)));
+        return;
       }
-      if (score > 0) scored.add(MapEntry(score, record));
+      final selector = pluginUpdateSelector;
+      if (selector == null) return;
+      final selected = await selector(updates);
+      if (selected != null && selected.isNotEmpty) {
+        unawaited(updatePlugins(selected));
+      }
+    } catch (error) {
+      pluginOperationStatus = PluginOperationStatus(
+        active: false,
+        message: 'Ошибка проверки плагинов: $error',
+        error: true,
+      );
+      notifyUi();
     }
-    scored.sort((a, b) => b.key.compareTo(a.key));
-    if (scored.isEmpty) return 'KNOWLEDGE_NO_RESULTS: $query';
-    final lines = <String>[];
-    for (final item in scored.take(maxResults)) {
-      final r = item.value;
-      lines.add(
-          'TOPIC: ${r['topic']}\nSOURCE: ${r['source'] ?? ''}\nTAGS: ${r['tags'] ?? ''}\n${truncateMiddle((r['content'] ?? '').toString(), 2500)}');
+  }
+
+  Future<void> updatePlugins(Iterable<String> ids) async {
+    final manager = pluginManager;
+    if (manager == null) return;
+    try {
+      await manager.updateMany(ids);
+      pendingPluginUpdates = pendingPluginUpdates
+          .where((item) => !ids.contains(item.pluginId))
+          .toList(growable: false);
+    } catch (error) {
+      log('PLUGIN UPDATE ERROR: $error');
     }
-    return 'KNOWLEDGE_SEARCH_RESULTS for "$query"\n\n${lines.join('\n\n---\n\n')}';
+    notifyUi();
+  }
+
+  Future<void> installOrUpdatePlugin(String id) async {
+    await pluginManager?.installOrUpdate(id);
+    pendingPluginUpdates = pendingPluginUpdates
+        .where((item) => item.pluginId != id)
+        .toList(growable: false);
+    notifyUi();
+  }
+
+  Future<void> setPluginEnabled(String id, bool enabled) async {
+    await pluginManager?.setEnabled(id, enabled);
+    notifyUi();
+  }
+
+  String pluginListText() {
+    if (plugins.isEmpty) return 'PLUGINS_NONE';
+    final buffer = StringBuffer('PLUGINS: ${plugins.length}\n');
+    for (final plugin in plugins) {
+      buffer.writeln(
+          '- ${plugin.id}: ${plugin.name}; enabled=${plugin.enabled}; source=${plugin.sourceInstalled}; installed=${plugin.installedCommit}; latest=${plugin.latestCommit}; kind=${plugin.kind.name}; permissions=${plugin.permissions.map((p) => p.name).join(',')}${plugin.sensitive ? '; SENSITIVE' : ''}');
+    }
+    return buffer.toString().trimRight();
+  }
+
+  Future<String> runPluginTool(String toolName, String input) async {
+    final manager = pluginManager;
+    final plugin = manager?.byToolName(toolName);
+    if (manager == null || plugin == null) return 'PLUGIN_NOT_FOUND: $toolName';
+    if (!plugin.enabled) return 'PLUGIN_DISABLED: ${plugin.name}';
+    if (plugin.kind == AgentPluginKind.reference) {
+      return manager.searchDocumentation(plugin.id, input);
+    }
+    if (plugin.requiresNetwork && !allowInternetUse) {
+      return 'PLUGIN_NETWORK_DISABLED: ${plugin.name}';
+    }
+    var command = plugin.commandTemplate;
+    if (command.trim().isEmpty) return 'PLUGIN_HAS_NO_COMMAND: ${plugin.name}';
+    command = command.replaceAll('{{input}}', quoteShellArg(input)).replaceAll(
+        '{{plugin}}',
+        quoteShellArg(manager.pluginSourceDirectory(plugin.id).path));
+    return runCommand(command);
   }
 
   Future<String> exportKnowledgeBase() async {
@@ -9105,24 +11701,30 @@ ${linkLines.join('\n')}
 
   String? documentPlaceholderQualityIssue(String text) {
     final lower = text.toLowerCase();
-    final patterns = [
+    const patterns = [
       'здесь будут',
       'здесь будет',
       'остальные рецепты',
       'еще 17',
       'ещё 17',
-      'фото блюда',
-      'фото этапа',
       '[фото',
       'placeholder',
       'todo:',
       'omitted',
-      '...'
+      'и так далее вместо',
+      'будет добавлено позже',
+      'content goes here',
     ];
     for (final pattern in patterns) {
       if (lower.contains(pattern)) {
         return 'Document text contains placeholder marker "$pattern". Provide complete final content, real image paths/URLs if images are required, and concrete table rows before creating the document.';
       }
+    }
+    if (RegExp(
+            r'\.{3}\s*\)?\s*(?:здесь|далее|остальн|ещ[её]|remaining|omitted|continue)',
+            caseSensitive: false)
+        .hasMatch(lower)) {
+      return 'Document text contains an ellipsis placeholder instead of complete content. Expand every requested section before creating the document.';
     }
     return null;
   }
@@ -9142,6 +11744,30 @@ ${linkLines.join('\n')}
     }
     final result =
         await const office.OfficeDocumentBuilder().buildFromText(path, text);
+    final parsed = await const office.OfficeDocumentParser().parseFile(path);
+    final parseFailed = parsed.structure.startsWith('Parse error') ||
+        parsed.structure.contains('not found');
+    final expectsTable =
+        RegExp(r'^\s*\|?.+\|.+\r?\n\s*\|?\s*:?-{3,}', multiLine: true)
+            .hasMatch(text);
+    final expectedImages =
+        RegExp(r'!\[[^\]]*\]\([^)]+\)').allMatches(text).length;
+    final tableMissing = expectsTable &&
+        result.kind == office.OfficeDocumentKind.docx &&
+        !parsed.structure.contains(RegExp(r'tables=[1-9]'));
+    final imagesMissing = expectedImages > 0 &&
+        result.kind == office.OfficeDocumentKind.docx &&
+        !parsed.structure.contains(RegExp(r'media=[1-9]'));
+    if (parseFailed || tableMissing || imagesMissing) {
+      final reasons = [
+        if (parseFailed) 'generated package could not be parsed',
+        if (tableMissing) 'requested Markdown table is absent',
+        if (imagesMissing)
+          'referenced images were not embedded; verify that every image path exists',
+      ];
+      log('DOCUMENT CREATE VERIFICATION FAILED: ${reasons.join('; ')}');
+      return 'CREATE_DOCUMENT_FAILED_VERIFICATION\nPATH: $path\nFORMAT: ${result.kind.label}\nREASONS: ${reasons.join('; ')}\nSTRUCTURE:\n${parsed.structure}';
+    }
     taskFileMutations++;
     final project = currentProject;
     final displayPath = project == null || !isPathInsideAllowedSandbox(path)
@@ -9155,7 +11781,7 @@ ${linkLines.join('\n')}
             'Binary/document file created: ${result.kind.label}, ${result.bytes} bytes'));
     logAction('document_create',
         {'path': path, 'format': result.kind.label, 'bytes': result.bytes});
-    return 'CREATE_DOCUMENT_RESULT\nPATH: $path\nFORMAT: ${result.kind.label}\nBYTES: ${result.bytes}\nMESSAGE: ${result.message}';
+    return 'CREATE_DOCUMENT_RESULT\nPATH: $path\nFORMAT: ${result.kind.label}\nBYTES: ${result.bytes}\nVERIFIED: true\nPARSED_TEXT_CHARS: ${parsed.text.length}\nSTRUCTURE:\n${parsed.structure}\nMESSAGE: ${result.message}';
   }
 
   Future<String> editDocumentText(String rawPath,
@@ -9166,6 +11792,10 @@ ${linkLines.join('\n')}
         permissionMode != PermissionMode.fullAccess &&
         !isPathInsideAllowedSandbox(path))
       return 'DEVICE_FILE_ACCESS_DENIED: $rawPath';
+    final qualityIssue = documentPlaceholderQualityIssue(text);
+    if (qualityIssue != null) {
+      return 'EDIT_DOCUMENT_FAILED_QUALITY_CHECK: $qualityIssue';
+    }
     final editMode = switch (mode.trim().toLowerCase()) {
       'replace_all' ||
       'replaceall' ||
@@ -9180,6 +11810,14 @@ ${linkLines.join('\n')}
     };
     final result = await const office.OfficeDocumentEditor()
         .editText(path: path, mode: editMode, newText: text, oldText: oldText);
+    final parsed = result.changed
+        ? await const office.OfficeDocumentParser().parseFile(path)
+        : null;
+    if (parsed != null &&
+        (parsed.structure.startsWith('Parse error') ||
+            parsed.structure.contains('not found'))) {
+      return 'EDIT_DOCUMENT_FAILED_VERIFICATION\nPATH: $path\nFORMAT: ${result.kind.label}\nSTRUCTURE:\n${parsed.structure}';
+    }
     if (result.changed) {
       taskFileMutations++;
       final project = currentProject;
@@ -9201,7 +11839,7 @@ ${linkLines.join('\n')}
       'mode': editMode.name,
       'message': result.message
     });
-    return 'EDIT_DOCUMENT_RESULT\nPATH: $path\nFORMAT: ${result.kind.label}\nCHANGED: ${result.changed}\nMODE: ${editMode.name}\nMESSAGE: ${result.message}';
+    return 'EDIT_DOCUMENT_RESULT\nPATH: $path\nFORMAT: ${result.kind.label}\nCHANGED: ${result.changed}\nMODE: ${editMode.name}\nVERIFIED: ${parsed != null}\n${parsed == null ? '' : 'STRUCTURE:\n${parsed.structure}\n'}MESSAGE: ${result.message}';
   }
 
   Future<String> readDocxText(String rawPath) async {
@@ -9368,6 +12006,7 @@ ${linkLines.join('\n')}
       '.xlsx',
       '.pptx',
       '.ppts',
+      '.vsdx',
       '.odt',
       '.ods',
       '.odp',

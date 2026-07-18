@@ -1,4 +1,4 @@
-package local.ai.agent
+package com.example.ii_agent
 
 import io.flutter.embedding.android.FlutterActivity
 

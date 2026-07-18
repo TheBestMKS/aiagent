@@ -11,10 +11,13 @@ class OfficeDocumentBuilder {
 
   Future<DocumentBuildResult> buildFromText(String path, String text) async {
     final kind = detectOfficeDocumentKind(path);
+    final file = File(path);
     final bytes = switch (kind) {
-      OfficeDocumentKind.docx => buildDocxBytes(text),
+      OfficeDocumentKind.docx =>
+        buildDocxBytes(text, baseDirectory: file.parent.path),
       OfficeDocumentKind.xlsx => buildXlsxBytes(text),
       OfficeDocumentKind.pptx => buildPptxBytes(text),
+      OfficeDocumentKind.vsdx => buildVsdxBytes(text),
       OfficeDocumentKind.odt => buildOdtBytes(text),
       OfficeDocumentKind.ods => buildOdsBytes(text),
       OfficeDocumentKind.odp => buildOdpBytes(text),
@@ -24,7 +27,6 @@ class OfficeDocumentBuilder {
       OfficeDocumentKind.unknown =>
         utf8.encode(text),
     };
-    final file = File(path);
     await file.parent.create(recursive: true);
     await file.writeAsBytes(bytes, flush: true);
     return DocumentBuildResult(
@@ -47,8 +49,80 @@ class OfficeDocumentBuilder {
     return '{\\rtf1\\ansi\\deff0\n$body\n}'.codeUnits;
   }
 
-  List<int> buildDocxBytes(String text) {
-    final docx = _docxPartsFromText(text);
+  List<int> buildVsdxBytes(String text) {
+    final paragraphs = splitParagraphs(text);
+    final shapes = StringBuffer();
+    for (var index = 0; index < paragraphs.length; index++) {
+      final id = index + 1;
+      final pinY = (10.4 - index * 1.15).clamp(0.8, 10.4).toStringAsFixed(2);
+      shapes.writeln('''
+      <Shape ID="$id" NameU="Text box $id" Name="Text box $id" Type="Shape">
+        <Cell N="PinX" V="4.25"/><Cell N="PinY" V="$pinY"/>
+        <Cell N="Width" V="7.2"/><Cell N="Height" V="0.8"/>
+        <Cell N="LocPinX" F="Width*0.5" V="3.6"/>
+        <Cell N="LocPinY" F="Height*0.5" V="0.4"/>
+        <Cell N="Angle" V="0"/><Cell N="LinePattern" V="0"/>
+        <Cell N="FillPattern" V="0"/>
+        <Section N="Geometry" IX="0">
+          <Row T="MoveTo" IX="1"><Cell N="X" V="0"/><Cell N="Y" V="0"/></Row>
+          <Row T="LineTo" IX="2"><Cell N="X" F="Width" V="7.2"/><Cell N="Y" V="0"/></Row>
+          <Row T="LineTo" IX="3"><Cell N="X" F="Width" V="7.2"/><Cell N="Y" F="Height" V="0.8"/></Row>
+          <Row T="LineTo" IX="4"><Cell N="X" V="0"/><Cell N="Y" F="Height" V="0.8"/></Row>
+          <Row T="LineTo" IX="5"><Cell N="X" V="0"/><Cell N="Y" V="0"/></Row>
+        </Section>
+        <Text>${xmlEscape(paragraphs[index])}</Text>
+      </Shape>''');
+    }
+    final archive = Archive();
+    archiveAddUtf8(archive, '[Content_Types].xml',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/visio/document.xml" ContentType="application/vnd.ms-visio.drawing.main+xml"/>
+  <Override PartName="/visio/pages/pages.xml" ContentType="application/vnd.ms-visio.pages+xml"/>
+  <Override PartName="/visio/pages/page1.xml" ContentType="application/vnd.ms-visio.page+xml"/>
+</Types>''');
+    archiveAddUtf8(archive, '_rels/.rels',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.microsoft.com/visio/2010/relationships/document" Target="visio/document.xml"/>
+</Relationships>''');
+    archiveAddUtf8(archive, 'visio/document.xml',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<VisioDocument xmlns="http://schemas.microsoft.com/office/visio/2012/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <DocumentSettings TopPage="0" DefaultTextStyle="0" DefaultLineStyle="0" DefaultFillStyle="0" DefaultGuideStyle="0"/>
+</VisioDocument>''');
+    archiveAddUtf8(archive, 'visio/_rels/document.xml.rels',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.microsoft.com/visio/2010/relationships/pages" Target="pages/pages.xml"/>
+</Relationships>''');
+    archiveAddUtf8(archive, 'visio/pages/pages.xml',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Pages xmlns="http://schemas.microsoft.com/office/visio/2012/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <Page ID="0" NameU="Page-1" Name="Page-1" Background="0" ViewScale="1" ViewCenterX="4.25" ViewCenterY="5.5" r:id="rId1"/>
+</Pages>''');
+    archiveAddUtf8(archive, 'visio/pages/_rels/pages.xml.rels',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.microsoft.com/visio/2010/relationships/page" Target="page1.xml"/>
+</Relationships>''');
+    archiveAddUtf8(archive, 'visio/pages/page1.xml',
+        '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<PageContents xmlns="http://schemas.microsoft.com/office/visio/2012/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <PageSheet>
+    <Cell N="PageWidth" V="8.5"/><Cell N="PageHeight" V="11"/>
+    <Cell N="ShdwOffsetX" V="0.11811"/><Cell N="ShdwOffsetY" V="-0.11811"/>
+  </PageSheet>
+  <Shapes>$shapes
+  </Shapes>
+</PageContents>''');
+    return encodeZipArchive(archive);
+  }
+
+  List<int> buildDocxBytes(String text, {String baseDirectory = ''}) {
+    final docx = _docxPartsFromText(text, baseDirectory: baseDirectory);
     final archive = Archive();
     archiveAddUtf8(archive, '[Content_Types].xml', _docxContentTypes());
     archiveAddUtf8(
@@ -231,7 +305,7 @@ class OfficeDocumentBuilder {
   <Relationship Id="rId1" Type="$type" Target="$target"/>
 </Relationships>''';
 
-  _DocxBuildParts _docxPartsFromText(String text) {
+  _DocxBuildParts _docxPartsFromText(String text, {String baseDirectory = ''}) {
     final lines =
         text.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n');
     final buffer = StringBuffer();
@@ -247,7 +321,12 @@ class OfficeDocumentBuilder {
           RegExp(r'!\[([^\]]*)\]\(([^)]+)\)').firstMatch(line.trim());
       if (imageMatch != null) {
         final imagePath = imageMatch.group(2)?.trim() ?? '';
-        final file = File(imagePath);
+        var file = File(imagePath);
+        if (!file.isAbsolute &&
+            baseDirectory.isNotEmpty &&
+            !file.existsSync()) {
+          file = File('$baseDirectory${Platform.pathSeparator}$imagePath');
+        }
         if (file.existsSync()) {
           final dot = file.path.lastIndexOf('.');
           final ext =

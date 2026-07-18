@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../core/app_constants.dart';
 import '../controllers/agent_controller.dart';
+import '../plugins/plugin_models.dart';
 import '../core/models.dart';
 import '../core/runtime_types.dart';
 import '../utils/html_utils.dart';
@@ -14,6 +15,8 @@ import '../tabs/chat_tab.dart';
 import '../tabs/files_tab.dart';
 import '../tabs/console_tab.dart';
 import '../tabs/web_tab.dart';
+
+Widget buildAiAgentApp() => const AiAgentApp();
 
 class AiAgentApp extends StatefulWidget {
   const AiAgentApp({super.key, this.disableStartupTasks = false});
@@ -123,6 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     widget.controller.permissionApprover = _confirmAgentPermission;
+    widget.controller.pluginUpdateSelector = _selectPluginUpdates;
     widget.controller.openUrlInWebTab = (url) {
       if (!mounted) return;
       setState(() => selectedTab = 3);
@@ -135,6 +139,16 @@ class _HomeScreenState extends State<HomeScreen> {
       WidgetsBinding.instance
           .addPostFrameCallback((_) => _askLocalLlamaIfNeeded());
     }
+  }
+
+  Future<List<String>?> _selectPluginUpdates(
+      List<PluginUpdateInfo> updates) async {
+    if (!mounted) return null;
+    return showDialog<List<String>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => PluginUpdateSelectionDialog(updates: updates),
+    );
   }
 
   Future<bool> _confirmAgentPermission(AgentPermissionRequest request) async {
@@ -171,6 +185,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (widget.controller.permissionApprover == _confirmAgentPermission) {
       widget.controller.permissionApprover = null;
     }
+    widget.controller.pluginUpdateSelector = null;
     if (widget.controller.openUrlInWebTab != null)
       widget.controller.openUrlInWebTab = null;
     unawaited(widget.controller.shutdown());
@@ -417,6 +432,51 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
         if (controller.projectLoading) const LinearProgressIndicator(),
+        if (controller.pluginOperationStatus.active ||
+            controller.pendingPluginUpdates.isNotEmpty ||
+            controller.pluginOperationStatus.error)
+          Material(
+            color: controller.pluginOperationStatus.error
+                ? Theme.of(context).colorScheme.errorContainer
+                : Theme.of(context).colorScheme.surfaceContainerHighest,
+            child: InkWell(
+              onTap: () async {
+                await showDialog<void>(
+                  context: context,
+                  builder: (_) => PluginManagerDialog(controller: controller),
+                );
+                if (mounted) setState(() {});
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                child: Row(
+                  children: [
+                    if (controller.pluginOperationStatus.active) ...[
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      const SizedBox(width: 8),
+                    ] else
+                      const Icon(Icons.extension, size: 17),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        controller.pendingPluginUpdates.isNotEmpty
+                            ? '${controller.pluginOperationStatus.message} • ожидают: ${controller.pendingPluginUpdates.length}'
+                            : controller.pluginOperationStatus.message,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    const Icon(Icons.chevron_right, size: 18),
+                  ],
+                ),
+              ),
+            ),
+          ),
         Expanded(
           child: switch (selectedTab) {
             0 => ChatTab(
