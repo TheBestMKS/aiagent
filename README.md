@@ -1,12 +1,12 @@
 # AI Agent
 
-> Version 1.59.0 adds multi-domain task routing, adaptive execution, durable attempt memory, shared PTY terminals, semantic web extraction, and layout-aware DOCX/XLSX/PPTX/VSDX tools.
+> Version 1.59.1 separates explicit Stop requests from internal loop protection and always reports a structured task result when execution ends.
 
 AI Agent is a cross-platform Flutter application for local and OpenAI-compatible models, projects, files, console sessions, office documents, and local tools.
 
 ## Version
 
-Current version: `1.59.0+65`.
+Current version: `1.59.1+66`.
 
 `pubspec.yaml` is the single version source. The release builder uses the semantic version before `+` in artifact names and the numeric suffix as the Android build number.
 
@@ -39,10 +39,10 @@ BAT launchers:
 The complete release is written to:
 
 ```text
-N:\Codex\AIAgent\dist\AIAgent_v.1.59.0\
-  AIAgent_v.1.59.0_win.zip
-  AIAgent_v.1.59.0_web.zip
-  AIAgent_v.1.59.0_android.apk
+N:\Codex\AIAgent\dist\AIAgent_v.1.59.1\
+  AIAgent_v.1.59.1_win.zip
+  AIAgent_v.1.59.1_web.zip
+  AIAgent_v.1.59.1_android.apk
 ```
 
 The Web target uses a separate browser-safe entry point. Desktop modules that depend on `dart:io`, process execution, and Windows WebView are not compiled into the Web application.

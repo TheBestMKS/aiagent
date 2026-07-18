@@ -110,8 +110,7 @@ class _TaskRunHistoryDialogState extends State<TaskRunHistoryDialog> {
                     '${run.status.label} · ${_formatTime(run.updatedAt)} · '
                     'итерация ${run.iteration}/${run.maxIterations}',
                   ),
-                  childrenPadding:
-                      const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                  childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
                   children: [
                     Align(
                       alignment: Alignment.centerLeft,
@@ -198,6 +197,7 @@ class _TaskRunHistoryDialogState extends State<TaskRunHistoryDialog> {
   IconData _iconFor(AgentRunStatus status) => switch (status) {
         AgentRunStatus.completed => Icons.check_circle_outline,
         AgentRunStatus.cancelled => Icons.stop_circle_outlined,
+        AgentRunStatus.stalled => Icons.repeat_on_outlined,
         AgentRunStatus.failed => Icons.error_outline,
         AgentRunStatus.interrupted => Icons.restore,
         _ => Icons.pending_outlined,
