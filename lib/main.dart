@@ -1,10 +1,8 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 
-import 'app/ai_agent_app.dart';
-
-export 'app/ai_agent_app.dart';
-export 'utils/path_utils.dart' show sanitizeFileName, truncateMiddle;
+import 'app/app_entry.dart';
 
 void main() {
-  runApp(const AiAgentApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(buildAiAgentApp());
 }

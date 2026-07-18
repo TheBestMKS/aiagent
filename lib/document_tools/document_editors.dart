@@ -89,6 +89,7 @@ class OfficeDocumentEditor {
         OfficeDocumentKind.docx,
         OfficeDocumentKind.xlsx,
         OfficeDocumentKind.pptx,
+        OfficeDocumentKind.vsdx,
         OfficeDocumentKind.odt,
         OfficeDocumentKind.ods,
         OfficeDocumentKind.odp,
@@ -148,6 +149,9 @@ class OfficeDocumentEditor {
       OfficeDocumentKind.pptx => names
           .where((n) => n.startsWith('ppt/slides/') && n.endsWith('.xml'))
           .toList(),
+      OfficeDocumentKind.vsdx => names
+          .where((n) => n.startsWith('visio/pages/page') && n.endsWith('.xml'))
+          .toList(),
       OfficeDocumentKind.odt ||
       OfficeDocumentKind.ods ||
       OfficeDocumentKind.odp ||
@@ -163,6 +167,7 @@ class OfficeDocumentEditor {
       OfficeDocumentKind.docx => {'t'},
       OfficeDocumentKind.xlsx => {'t', 'v'},
       OfficeDocumentKind.pptx => {'t'},
+      OfficeDocumentKind.vsdx => {'Text'},
       OfficeDocumentKind.odt ||
       OfficeDocumentKind.ods ||
       OfficeDocumentKind.odp ||

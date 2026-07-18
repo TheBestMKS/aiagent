@@ -2,11 +2,6 @@ analyzer:
   exclude:
     - build/**
     - .dart_tool/**
-    - tooling/**
-    - flutter/**
-    - "**/tooling/**"
-    - "**/flutter/packages/**"
-    - "**/flutter/bin/cache/**"
 
 linter:
   rules:

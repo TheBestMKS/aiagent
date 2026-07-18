@@ -12,6 +12,7 @@ OfficeDocumentKind detectOfficeDocumentKind(String path) {
   if (lower.endsWith('.xlsx')) return OfficeDocumentKind.xlsx;
   if (lower.endsWith('.pptx') || lower.endsWith('.ppts'))
     return OfficeDocumentKind.pptx;
+  if (lower.endsWith('.vsdx')) return OfficeDocumentKind.vsdx;
   if (lower.endsWith('.odt')) return OfficeDocumentKind.odt;
   if (lower.endsWith('.ods')) return OfficeDocumentKind.ods;
   if (lower.endsWith('.odp')) return OfficeDocumentKind.odp;

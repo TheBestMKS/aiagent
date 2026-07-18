@@ -10,6 +10,8 @@ import '../rendering/message_rendering.dart';
 import '../utils/format_utils.dart';
 import '../utils/path_utils.dart';
 import '../dialogs/settings_dialogs.dart';
+import '../widgets/interrupted_task_banner.dart';
+import '../widgets/task_reliability_status_bar.dart';
 
 class ChatTab extends StatefulWidget {
   const ChatTab({
@@ -237,6 +239,11 @@ class _ChatTabState extends State<ChatTab> {
               ),
             ),
           ),
+        TaskReliabilityStatusBar(controller: controller),
+        InterruptedTaskBanner(
+          controller: controller,
+          onChanged: onChanged,
+        ),
         Expanded(
           child: Scrollbar(
             controller: _scrollController,
