@@ -21,6 +21,7 @@ import '../agent_core/retrieval/web_content_extractor.dart';
 import '../agent_core/runs/adaptive_agent_budget.dart';
 import '../agent_core/runs/agent_run_checkpoint.dart';
 import '../agent_core/runs/agent_run_checkpoint_store.dart';
+import '../agent_core/runs/agent_termination.dart';
 import '../agent_core/safety/tool_call_contract.dart';
 import '../agent_core/safety/tool_call_json_repair.dart';
 import '../agent_core/safety/tool_execution_guard.dart';
@@ -49,6 +50,7 @@ class AgentController {
   AgentRunCheckpoint? interruptedRunCheckpoint;
   final ToolExecutionGuard toolExecutionGuard = ToolExecutionGuard();
   final TaskEvidenceLedger taskEvidenceLedger = TaskEvidenceLedger();
+  final AgentTerminationState terminationState = AgentTerminationState();
   final TaskIntentAnalyzer taskIntentAnalyzer = const TaskIntentAnalyzer();
   final WebContentExtractor webContentExtractor = const WebContentExtractor();
   TaskIntentProfile? activeTaskIntent;
@@ -101,7 +103,7 @@ class AgentController {
   List<AvailableModel> availableModels = [];
   String status = 'Готово';
   bool busy = false;
-  bool cancelRequested = false;
+  bool get cancelRequested => terminationState.userRequested;
   int visibleExchangeCount = 10;
   int maxContextTokens = 8192;
   int maxOutputTokens = 4096;
@@ -264,10 +266,26 @@ class AgentController {
   }
 
   void requestStop() {
-    cancelRequested = true;
+    terminationState.requestUserStop();
     status = 'Остановка агента...';
     log('AGENT STOP REQUESTED BY USER');
     logAction('agent_stop_requested', {'state': taskStateJson()});
+    notifyUi();
+  }
+
+  void requestSafetyStop(String reason) {
+    if (terminationState.userRequested || terminationState.safetyStopped) {
+      return;
+    }
+    terminationState.requestSafetyStop(reason);
+    lastFinalAnswerQualityIssue =
+        'AGENT_STALLED_STOP: ${terminationState.reason}';
+    status = 'Остановка: защита от циклов...';
+    log(lastFinalAnswerQualityIssue);
+    logAction('agent_safety_stop_requested', {
+      'reason': terminationState.reason,
+      'state': taskStateJson(),
+    });
     notifyUi();
   }
 
@@ -3983,7 +4001,7 @@ class AgentController {
       }
     }
     busy = true;
-    cancelRequested = false;
+    terminationState.reset();
     status = 'Агент выполняет задачу...';
     expandedDiffKey = null;
     expandedActionKey = null;
@@ -4113,7 +4131,10 @@ ${localToolsCompactSummary(maxItems: 80)}
 **Python:** пакеты не ставятся в общий Python. При `pip install`, `python -m pip install`, `pytest` или ошибке `ModuleNotFoundError` агент создаёт окружение проекта `.cppagent/python_venv`, устанавливает пакеты туда и запускает Python через это окружение.
 
 **C++/CMake:** `run_tests` теперь сам ищет `*.cpp` в проекте и подпапках, создаёт/исправляет минимальный `CMakeLists.txt` только для сборки найденного исходника и использует CMake/Visual Studio, если нет `g++`.''';
-      await finishLiveProgress(text, actionSummaries: currentActionSummaries());
+      await finishLiveProgress(
+        buildTaskResultText(AgentLoopResult.completed, details: text),
+        actionSummaries: currentActionSummaries(),
+      );
       status = 'Готово';
       await completeTaskCheckpoint(AgentRunStatus.completed);
       busy = false;
@@ -4133,27 +4154,43 @@ ${localToolsCompactSummary(maxItems: 80)}
       final startIteration = isRecovery
           ? (currentAgentIteration + 1).clamp(1, maxAgentIterations).toInt()
           : 1;
-      await runAgentLoop(startIteration: startIteration);
-      status = 'Готово';
+      final loopResult = await runAgentLoop(startIteration: startIteration);
+      runStatus = loopResult.status;
+      runError = loopResult.reason;
+      status = switch (loopResult.status) {
+        AgentRunStatus.completed => 'Готово',
+        AgentRunStatus.cancelled => 'Остановлено пользователем',
+        AgentRunStatus.stalled => 'Остановлено защитой от циклов',
+        _ => 'Задача не выполнена',
+      };
     } catch (error, stack) {
       runStatus = AgentRunStatus.failed;
       runError = error.toString();
-      await removeLiveProgress();
-      final message =
-          ChatMessage(role: 'assistant', content: 'Ошибка агента: $error');
-      messages.add(message);
-      await appendSession(message);
+      await finishLiveProgress(
+        buildTaskResultText(
+          AgentLoopResult.failed(error.toString()),
+          details: 'Ошибка агента: $error',
+        ),
+        fileChanges: takeTaskFileChanges(),
+        actionSummaries: currentActionSummaries(),
+      );
       log('AGENT ERROR: $error\n$stack');
       status = 'Ошибка';
     } finally {
-      final wasCancelled = cancelRequested;
-      if (runStatus != AgentRunStatus.failed &&
+      final wasCancelled = terminationState.userRequested;
+      final safetyStopReason =
+          terminationState.safetyStopped ? terminationState.reason : '';
+      if (runStatus == AgentRunStatus.completed &&
           qualityCheckEnabled &&
           taskIncompleteReason().isNotEmpty) {
         runStatus = AgentRunStatus.failed;
         runError = taskIncompleteReason();
       }
       if (wasCancelled) runStatus = AgentRunStatus.cancelled;
+      if (!wasCancelled && safetyStopReason.isNotEmpty) {
+        runStatus = AgentRunStatus.stalled;
+        runError = safetyStopReason;
+      }
       if (runStatus == AgentRunStatus.completed) {
         try {
           await autoLearnVerifiedRun();
@@ -4168,7 +4205,7 @@ ${localToolsCompactSummary(maxItems: 80)}
       }
       await completeTaskCheckpoint(runStatus, error: runError);
       busy = false;
-      cancelRequested = false;
+      terminationState.reset();
       final pendingProject = pendingProjectOpenAfterTask;
       pendingProjectOpenAfterTask = null;
       if (pendingProject != null) {
@@ -4395,7 +4432,7 @@ ${localToolsCompactSummary(maxItems: 80)}
     return false;
   }
 
-  Future<void> runAgentLoop({int startIteration = 1}) async {
+  Future<AgentLoopResult> runAgentLoop({int startIteration = 1}) async {
     var continued = startIteration > 1;
     var emptyModelResponses = 0;
     var noActionRetries = 0;
@@ -4412,45 +4449,37 @@ ${localToolsCompactSummary(maxItems: 80)}
         final reason = budget.runtimeExpired
             ? 'Достигнут предельный срок одного запуска агента.'
             : 'Адаптивный бюджет исчерпан без нового измеримого прогресса.';
-        await finishLiveProgress(
-          '$reason Задача сохранена в контрольной точке и может быть продолжена.',
-          fileChanges: takeTaskFileChanges(),
-          actionSummaries: currentActionSummaries(),
-        );
         log('AGENT LOOP STOP: $reason ${budget.statusSummary(iteration: iteration, progressRevision: taskProgressRevision)}');
-        logAction('task_stopped_adaptive_budget', {
-          'reason': reason,
-          'budget': budget.statusSummary(
-              iteration: iteration, progressRevision: taskProgressRevision),
-        });
-        break;
+        return finishAgentLoopResult(
+          AgentLoopResult.paused(
+            '$reason Задача сохранена в контрольной точке и может быть продолжена.',
+          ),
+          action: 'task_stopped_adaptive_budget',
+        );
       }
       currentAgentIteration = iteration;
       budget.observe(
           iteration: iteration, progressRevision: taskProgressRevision);
       await updateTaskCheckpoint(AgentRunStatus.waitingForModel);
-      if (cancelRequested) {
-        await finishLiveProgress('⛔ Выполнение остановлено пользователем.',
-            fileChanges: takeTaskFileChanges());
-        log('AGENT LOOP STOP: cancelled by user before iteration $iteration.');
-        logAction('task_cancelled_by_user', taskStateJson());
-        break;
-      }
+      final stopBeforeIteration = await finishPendingAgentTermination(
+        phase: 'before iteration $iteration',
+      );
+      if (stopBeforeIteration != null) return stopBeforeIteration;
       log('AGENT ITERATION $iteration/${budget.currentLimit} state=actions:$taskToolActions files:$taskFileMutations commands:$taskCommandRuns failedCommands:$taskFailedCommands lastExit:$lastCommandExitCode');
       await ensureLiveProgress(iteration == firstIteration
           ? '🤖 Запрашиваю модель...'
           : '🤖 Продолжаю выполнение задачи, итерация $iteration...');
       final assistantText = await callModel();
       await updateTaskCheckpoint(AgentRunStatus.running);
-      if (cancelRequested) {
-        await finishLiveProgress(
-            '⛔ Выполнение остановлено пользователем после ответа модели.',
-            fileChanges: takeTaskFileChanges());
-        log('AGENT LOOP STOP: cancelled by user after model response.');
-        logAction('task_cancelled_by_user_after_model', taskStateJson());
-        break;
-      }
+      final stopAfterModel = await finishPendingAgentTermination(
+        phase: 'after model response',
+      );
+      if (stopAfterModel != null) return stopAfterModel;
       final actions = await processAssistantText(assistantText);
+      final stopAfterActions = await finishPendingAgentTermination(
+        phase: 'after assistant actions',
+      );
+      if (stopAfterActions != null) return stopAfterActions;
       if (!actions.didAction) {
         final fingerprint =
             normalizeRepeatedText(stripToolCalls(assistantText));
@@ -4461,21 +4490,26 @@ ${localToolsCompactSummary(maxItems: 80)}
           repeatedNoActionResponses = fingerprint.isEmpty ? 0 : 1;
         }
         if (repeatedNoActionResponses >= 3) {
-          cancelRequested = true;
-          lastFinalAnswerQualityIssue =
-              'AGENT_STALLED_STOP: модель трижды повторила один и тот же '
-              'текст без выполненного инструмента.';
-          log(lastFinalAnswerQualityIssue);
+          requestSafetyStop(
+            'Модель трижды повторила один и тот же текст без выполненного '
+            'инструмента.',
+          );
+          final stalled = await finishPendingAgentTermination(
+            phase: 'repeated model response',
+          );
+          if (stalled != null) return stalled;
         }
         if (lastContextMismatch ||
             lastModelFinishReason == 'context_mismatch') {
-          await finishLiveProgress(
-              assistantText.trim().isEmpty
-                  ? lastContextMismatchDetails
-                  : assistantText.trim(),
-              fileChanges: takeTaskFileChanges());
           log('AGENT LOOP STOP: server context mismatch detected.');
-          break;
+          final details = assistantText.trim().isEmpty
+              ? lastContextMismatchDetails
+              : assistantText.trim();
+          return finishAgentLoopResult(
+            AgentLoopResult.failed('Сервер модели отклонил размер контекста.'),
+            details: details,
+            action: 'task_failed_context_mismatch',
+          );
         }
         if (taskFileMutations == 0 &&
             await tryLocalFallbackIfUseful(
@@ -4483,7 +4517,7 @@ ${localToolsCompactSummary(maxItems: 80)}
                     ? 'модель оборвала ответ по finish_reason=length'
                     : 'модель не вернула пригодный tool-call')) {
           log('AGENT LOOP: local fallback completed the task.');
-          break;
+          return finishAgentLoopResult(AgentLoopResult.completed);
         }
         if (assistantText.contains('<tool_call>') &&
             actions.toolCallCount == 0 &&
@@ -4537,47 +4571,45 @@ ${localToolsCompactSummary(maxItems: 80)}
         }
 
         if (assistantText.trim().isEmpty) {
-          await removeLiveProgress();
-          final message = ChatMessage(
-            role: 'assistant',
-            content:
-                'Модель несколько раз вернула пустой ответ без команд. Задача не выполнена. Проверьте не context window, а лимит генерации ответа: увеличьте Max output tokens в профиле/сервере или выберите модель, которая не обрывает tool-call.',
-            actionSummaries: currentActionSummaries(),
+          return finishAgentLoopResult(
+            AgentLoopResult.failed(
+              'Модель несколько раз вернула пустой ответ без команд.',
+            ),
+            details:
+                'Проверьте лимит генерации ответа: увеличьте Max output tokens '
+                'в профиле или выберите модель, которая не обрывает tool-call.',
+            action: 'task_failed_empty_model_response',
           );
-          messages.add(message);
-          await appendSession(message);
-          logAction('task_failed_empty_model_response',
-              {'empty_responses': emptyModelResponses});
         } else if (incompleteReason.isNotEmpty) {
           if (await tryAutomaticRecovery(incompleteReason)) {
+            final stopAfterRecovery = await finishPendingAgentTermination(
+              phase: 'after automatic recovery',
+            );
+            if (stopAfterRecovery != null) return stopAfterRecovery;
             recalculateContext();
             notifyUi();
             if (lastCommandExitCode == 0 && taskCommandRuns > 0) {
-              await finishLiveProgress(buildFinalSummaryText(),
-                  fileChanges: takeTaskFileChanges());
-              logAction('task_finished_after_auto_recovery', taskStateJson());
-              break;
+              return finishAgentLoopResult(
+                AgentLoopResult.completed,
+                action: 'task_finished_after_auto_recovery',
+              );
             }
             continue;
           }
-          await removeLiveProgress();
-          final message = ChatMessage(
-            role: 'assistant',
-            content:
-                'Агент остановлен после нескольких попыток продолжения. Последняя причина незавершённости: $incompleteReason',
-            actionSummaries: currentActionSummaries(),
+          return finishAgentLoopResult(
+            AgentLoopResult.failed(
+              'После нескольких попыток задача осталась незавершённой: '
+              '$incompleteReason',
+            ),
+            details: assistantText,
+            action: 'task_stopped_incomplete',
           );
-          messages.add(message);
-          await appendSession(message);
-          logAction('task_stopped_incomplete',
-              {'reason': incompleteReason, 'state': taskStateJson()});
         } else {
-          await finishLiveProgress(buildFinalSummaryText(),
-              fileChanges: const []);
-          logAction('task_finished', taskStateJson());
+          return finishAgentLoopResult(
+            AgentLoopResult.completed,
+            details: assistantText,
+          );
         }
-        log('AGENT LOOP STOP: модель не запросила действий. emptyResponses=$emptyModelResponses noActionRetries=$noActionRetries');
-        break;
       }
 
       noActionRetries = 0;
@@ -4585,12 +4617,11 @@ ${localToolsCompactSummary(maxItems: 80)}
       repeatedNoActionResponses = 0;
       lastNoActionFingerprint = '';
       if (lastToolResultCompletesReadOnlyTask()) {
-        await finishLiveProgress(buildReadOnlyToolFinalText(),
-            fileChanges: takeTaskFileChanges(),
-            actionSummaries: currentActionSummaries());
-        logAction(
-            'task_finished_after_successful_tool', {'tool': lastToolName});
-        break;
+        return finishAgentLoopResult(
+          AgentLoopResult.completed,
+          details: buildReadOnlyToolFinalText(),
+          action: 'task_finished_after_successful_tool',
+        );
       }
       if (iteration >= budget.currentLimit) {
         final extended = budget.extendIfProgressing(
@@ -4599,16 +4630,14 @@ ${localToolsCompactSummary(maxItems: 80)}
           taskComplete: false,
         );
         if (!extended) {
-          final message = ChatMessage(
-            role: 'assistant',
-            content:
-                'Агент остановил текущий запуск: в последнем окне действий не было нового измеримого прогресса. Выполненные шаги и результаты сохранены; продолжение не начнёт задачу заново.',
+          return finishAgentLoopResult(
+            AgentLoopResult.paused(
+              'В последнем окне действий не было нового измеримого прогресса. '
+              'Выполненные шаги и результаты сохранены; продолжение не '
+              'начнёт задачу заново.',
+            ),
+            action: 'task_stopped_no_recent_progress',
           );
-          messages.add(message);
-          await appendSession(message);
-          log('AGENT LOOP STOP: adaptive window exhausted without progress.');
-          logAction('task_stopped_no_recent_progress', taskStateJson());
-          break;
         }
         log('AGENT LOOP EXTENDED: ${budget.statusSummary(iteration: iteration, progressRevision: taskProgressRevision)}');
         logAction('agent_loop_extended', {
@@ -4712,24 +4741,69 @@ ${localToolsCompactSummary(maxItems: 80)}
     return buffer.toString().trimRight();
   }
 
-  String buildFinalSummaryText() {
-    final buffer = StringBuffer('Готово.');
-    if (taskFileMutations > 0)
-      buffer.write(' Изменений файлов: $taskFileMutations.');
-    if (taskCommandRuns > 0)
-      buffer.write(
-          ' Команд выполнено: $taskCommandRuns, последний exit code: ${lastCommandExitCode ?? 'unknown'}.');
-    if (taskFailedCommands > 0) {
-      buffer.write(' Команд с ошибками: $taskFailedCommands.');
-    }
+  String buildTaskResultText(AgentLoopResult result, {String details = ''}) {
     final completion = currentTaskCompletionAssessment();
-    if (completion.ready) {
-      buffer.write(' Результат подтверждён журналом выполнения; уверенность '
-          '${(completion.confidence * 100).round()}%.');
-    } else if (completion.missingEvidence.isNotEmpty) {
-      buffer.write(' ${completion.userMessage}');
+    final verification = completion.ready
+        ? 'результат подтверждён журналом выполнения; уверенность '
+            '${(completion.confidence * 100).round()}%.'
+        : completion.userMessage;
+    return AgentResultSummary.build(
+      result: result,
+      fileMutations: taskFileMutations,
+      commandRuns: taskCommandRuns,
+      failedCommands: taskFailedCommands,
+      lastExitCode: lastCommandExitCode,
+      lastCommand: SecretRedactor.redact(lastCommandText),
+      lastCommandResult: SecretRedactor.redact(lastCommandResultText),
+      lastTool: lastToolName,
+      lastToolResult: SecretRedactor.redact(lastToolResultText),
+      verification: verification,
+      details: truncateMiddle(details.trim(), 12000),
+    );
+  }
+
+  String buildFinalSummaryText() =>
+      buildTaskResultText(AgentLoopResult.completed);
+
+  Future<AgentLoopResult> finishAgentLoopResult(
+    AgentLoopResult result, {
+    String details = '',
+    String action = 'task_finished',
+  }) async {
+    await finishLiveProgress(
+      buildTaskResultText(result, details: details),
+      fileChanges: takeTaskFileChanges(),
+      actionSummaries: currentActionSummaries(),
+    );
+    log('AGENT LOOP RESULT: status=${result.status.name}; '
+        'reason=${truncateMiddle(result.reason, 3000)}');
+    logAction(action, {
+      'status': result.status.name,
+      'reason': result.reason,
+      'state': taskStateJson(),
+    });
+    return result;
+  }
+
+  Future<AgentLoopResult?> finishPendingAgentTermination({
+    required String phase,
+  }) async {
+    if (terminationState.userRequested) {
+      log('AGENT LOOP STOP: user cancellation at $phase.');
+      return finishAgentLoopResult(
+        AgentLoopResult.userCancelled(terminationState.reason),
+        action: 'task_cancelled_by_user',
+      );
     }
-    return buffer.toString();
+    if (terminationState.safetyStopped) {
+      log('AGENT LOOP STOP: safety guard at $phase; '
+          '${terminationState.reason}');
+      return finishAgentLoopResult(
+        AgentLoopResult.safetyStopped(terminationState.reason),
+        action: 'task_stopped_by_safety_guard',
+      );
+    }
+    return null;
   }
 
   bool taskLooksLikeCppTask() {
@@ -4790,6 +4864,8 @@ ${localToolsCompactSummary(maxItems: 80)}
         'problem_solving_attempts': problemSolvingAttempts,
         'internet_tool_actions': taskInternetActions,
         'last_quality_issue': lastFinalAnswerQualityIssue,
+        'termination_cause': terminationState.cause.name,
+        'termination_reason': terminationState.reason,
         'checkpoint_run_id': activeRunCheckpoint?.runId,
         'checkpoint_iteration': currentAgentIteration,
         'task_intent': activeTaskIntent?.toJson(),
@@ -6515,10 +6591,11 @@ $stateBlock
     var result = message;
     if (consecutiveInvalidToolCalls >= 3 ||
         consecutiveCircuitBreakerBlocks >= 3) {
-      cancelRequested = true;
-      result += '\nAGENT_STALLED_STOP: три некорректных или запрещённых '
-          'вызова инструмента подряд. Запуск остановлен вместо бесконечного '
-          'повтора; продолжение возможно с исправленным планом.';
+      const reason = 'Три некорректных или запрещённых вызова инструмента '
+          'подряд. Запуск остановлен вместо бесконечного повтора; продолжение '
+          'возможно с исправленным планом.';
+      requestSafetyStop(reason);
+      result += '\nAGENT_STALLED_STOP: $reason';
     }
     lastToolName = call.name;
     lastToolResultText = result;
@@ -6613,8 +6690,9 @@ $stateBlock
     var didAction = false;
     final toolResultBuffer = StringBuffer();
     for (final file in extractedFiles) {
-      if (cancelRequested) {
-        log('PROCESS ASSISTANT TEXT: cancelled before markdown file write ${file.path}');
+      if (terminationState.shouldStop) {
+        log('PROCESS ASSISTANT TEXT: stopped before markdown file write '
+            '${file.path}; cause=${terminationState.cause.name}');
         break;
       }
       await updateLiveProgress('📝 Записываю файл ${file.path}...');
@@ -6637,8 +6715,9 @@ $stateBlock
       log('MARKDOWN FILE ${file.path}: $result');
     }
     for (final rawCall in toolCalls) {
-      if (cancelRequested) {
-        log('PROCESS ASSISTANT TEXT: cancelled before tool ${rawCall.name}');
+      if (terminationState.shouldStop) {
+        log('PROCESS ASSISTANT TEXT: stopped before tool ${rawCall.name}; '
+            'cause=${terminationState.cause.name}');
         break;
       }
       final contract = ToolCallContract.resolve(
@@ -7377,7 +7456,7 @@ $stateBlock
     if (buildMutationAwaitingRetry &&
         buildRetryRequired &&
         !isRequiredBuildRetryToolCall(call)) {
-      final blocked =
+      var blocked =
           'BUILD_RETRY_REQUIRED_NEXT: после подтверждённой правки следующим '
           'действием должна быть исходная команда сборки:\n'
           '$requiredBuildRetryCommand\n'
@@ -7387,7 +7466,11 @@ $stateBlock
       lastToolResultText = blocked;
       consecutiveCircuitBreakerBlocks++;
       if (consecutiveCircuitBreakerBlocks >= 3) {
-        cancelRequested = true;
+        const reason = 'Три действия подряд нарушили обязательный повтор '
+            'исходной команды сборки после изменения файлов.';
+        requestSafetyStop(reason);
+        blocked += '\nAGENT_STALLED_STOP: $reason';
+        lastToolResultText = blocked;
       }
       taskEvidenceLedger.recordTool(
         toolName: call.name,
@@ -7424,10 +7507,11 @@ $stateBlock
         consecutiveCircuitBreakerBlocks++;
         var effectiveBlocked = blocked;
         if (consecutiveCircuitBreakerBlocks >= 3) {
-          cancelRequested = true;
-          effectiveBlocked += '\nAGENT_STALLED_STOP: три действия подряд были '
-              'заблокированы без прогресса. Запуск остановлен, чтобы не '
-              'расходовать итерации на цикл.';
+          const reason = 'Три действия подряд были заблокированы без '
+              'прогресса. Запуск остановлен, чтобы не расходовать итерации '
+              'на цикл.';
+          requestSafetyStop(reason);
+          effectiveBlocked += '\nAGENT_STALLED_STOP: $reason';
         }
         lastToolName = call.name;
         lastToolResultText = effectiveBlocked;
@@ -7462,10 +7546,11 @@ $stateBlock
           progressRevision: taskProgressRevision,
         );
         if (consecutiveCircuitBreakerBlocks >= 3) {
-          cancelRequested = true;
-          blocked += '\nAGENT_STALLED_STOP: три вызова инструментов были '
-              'заблокированы без измеримого прогресса. Текущий запуск '
-              'остановлен; продолжение возможно после изменения стратегии.';
+          const reason = 'Три вызова инструментов были заблокированы без '
+              'измеримого прогресса. Текущий запуск остановлен; продолжение '
+              'возможно после изменения стратегии.';
+          requestSafetyStop(reason);
+          blocked += '\nAGENT_STALLED_STOP: $reason';
         }
         lastToolName = call.name;
         lastToolResultText = blocked;

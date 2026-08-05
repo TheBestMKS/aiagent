@@ -7,6 +7,7 @@ enum AgentRunStatus {
   verifying,
   completed,
   cancelled,
+  stalled,
   failed,
   interrupted,
 }
@@ -15,6 +16,7 @@ extension AgentRunStatusX on AgentRunStatus {
   bool get isTerminal => switch (this) {
         AgentRunStatus.completed ||
         AgentRunStatus.cancelled ||
+        AgentRunStatus.stalled ||
         AgentRunStatus.failed =>
           true,
         _ => false,
@@ -27,6 +29,7 @@ extension AgentRunStatusX on AgentRunStatus {
         AgentRunStatus.verifying => 'Проверка результата',
         AgentRunStatus.completed => 'Завершено',
         AgentRunStatus.cancelled => 'Остановлено',
+        AgentRunStatus.stalled => 'Остановлено защитой от циклов',
         AgentRunStatus.failed => 'Ошибка',
         AgentRunStatus.interrupted => 'Прервано',
       };
@@ -193,12 +196,12 @@ class AgentRunCheckpoint {
       messageCount: messageCount ?? this.messageCount,
       buildFailureKind: buildFailureKind ?? this.buildFailureKind,
       buildFailureSummary: buildFailureSummary ?? this.buildFailureSummary,
-      buildFailureRecommendedAction: buildFailureRecommendedAction ??
-          this.buildFailureRecommendedAction,
-      buildFailureImplicatedFiles: buildFailureImplicatedFiles ??
-          this.buildFailureImplicatedFiles,
-      buildFailureImplicatedLines: buildFailureImplicatedLines ??
-          this.buildFailureImplicatedLines,
+      buildFailureRecommendedAction:
+          buildFailureRecommendedAction ?? this.buildFailureRecommendedAction,
+      buildFailureImplicatedFiles:
+          buildFailureImplicatedFiles ?? this.buildFailureImplicatedFiles,
+      buildFailureImplicatedLines:
+          buildFailureImplicatedLines ?? this.buildFailureImplicatedLines,
       buildSuggestedDiagnostic:
           buildSuggestedDiagnostic ?? this.buildSuggestedDiagnostic,
       buildSuggestedRecovery:
@@ -214,11 +217,10 @@ class AgentRunCheckpoint {
           this.requiredBuildRetryWorkingDirectory,
       buildMutationAwaitingRetry:
           buildMutationAwaitingRetry ?? this.buildMutationAwaitingRetry,
-      buildFailureRevision:
-          buildFailureRevision ?? this.buildFailureRevision,
+      buildFailureRevision: buildFailureRevision ?? this.buildFailureRevision,
       buildDiagnosticsRun: buildDiagnosticsRun ?? this.buildDiagnosticsRun,
-      fileReadAtBuildFailureRevision: fileReadAtBuildFailureRevision ??
-          this.fileReadAtBuildFailureRevision,
+      fileReadAtBuildFailureRevision:
+          fileReadAtBuildFailureRevision ?? this.fileReadAtBuildFailureRevision,
       fileReadRangesAtBuildFailureRevision:
           fileReadRangesAtBuildFailureRevision ??
               this.fileReadRangesAtBuildFailureRevision,
@@ -289,7 +291,8 @@ class AgentRunCheckpoint {
         ? rawGuard.map((key, value) => MapEntry(key.toString(), value))
         : <String, dynamic>{};
     final implicatedFiles = _asStringList(json['buildFailureImplicatedFiles']);
-    final implicatedLines = _asStringIntMap(json['buildFailureImplicatedLines']);
+    final implicatedLines =
+        _asStringIntMap(json['buildFailureImplicatedLines']);
     final diagnostics = _asStringList(json['buildDiagnosticsRun']);
     final rawReadRevisions = json['fileReadAtBuildFailureRevision'];
     final readRevisions = <String, int>{};
@@ -343,10 +346,8 @@ class AgentRunCheckpoint {
       buildFailureImplicatedLines: implicatedLines,
       buildSuggestedDiagnostic:
           json['buildSuggestedDiagnostic']?.toString() ?? '',
-      buildSuggestedRecovery:
-          json['buildSuggestedRecovery']?.toString() ?? '',
-      buildMissingDependency:
-          json['buildMissingDependency']?.toString() ?? '',
+      buildSuggestedRecovery: json['buildSuggestedRecovery']?.toString() ?? '',
+      buildMissingDependency: json['buildMissingDependency']?.toString() ?? '',
       buildLocatedDependencyPath:
           json['buildLocatedDependencyPath']?.toString() ?? '',
       buildRetryRequired: _asBool(json['buildRetryRequired']),
@@ -354,8 +355,7 @@ class AgentRunCheckpoint {
           json['requiredBuildRetryCommand']?.toString() ?? '',
       requiredBuildRetryWorkingDirectory:
           json['requiredBuildRetryWorkingDirectory']?.toString() ?? '',
-      buildMutationAwaitingRetry:
-          _asBool(json['buildMutationAwaitingRetry']),
+      buildMutationAwaitingRetry: _asBool(json['buildMutationAwaitingRetry']),
       buildFailureRevision: _asInt(json['buildFailureRevision']),
       buildDiagnosticsRun: diagnostics,
       fileReadAtBuildFailureRevision: readRevisions,

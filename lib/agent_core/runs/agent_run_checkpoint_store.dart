@@ -153,6 +153,7 @@ class AgentRunCheckpointStore {
     final cutoff = DateTime.now().subtract(maxAge);
     for (final checkpoint in recent) {
       final resumableStatus = checkpoint.status == AgentRunStatus.cancelled ||
+          checkpoint.status == AgentRunStatus.stalled ||
           checkpoint.status == AgentRunStatus.failed ||
           checkpoint.status == AgentRunStatus.interrupted;
       final hasProgress = checkpoint.toolActions > 0 ||

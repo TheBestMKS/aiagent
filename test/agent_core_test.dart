@@ -12,6 +12,7 @@ import 'package:ii_agent/agent_core/retrieval/hybrid_retrieval.dart';
 import 'package:ii_agent/agent_core/runs/adaptive_agent_budget.dart';
 import 'package:ii_agent/agent_core/runs/agent_run_checkpoint.dart';
 import 'package:ii_agent/agent_core/runs/agent_run_checkpoint_store.dart';
+import 'package:ii_agent/agent_core/runs/agent_termination.dart';
 import 'package:ii_agent/agent_core/safety/tool_call_contract.dart';
 import 'package:ii_agent/agent_core/safety/tool_call_json_repair.dart';
 import 'package:ii_agent/agent_core/safety/tool_execution_guard.dart';
@@ -1075,6 +1076,76 @@ add_executable(user_target src/main.cpp src/ImageClassifier.cpp)
     expect(restored!.prompt, 'Собери проект');
     expect(restored.iteration, 7);
     expect(restored.status, AgentRunStatus.cancelled);
+  });
+
+  test('safety guard stop is never classified as a user cancellation', () {
+    final termination = AgentTerminationState();
+    termination.requestSafetyStop(
+      'AGENT_STALLED_STOP: модель трижды повторила один ответ',
+    );
+
+    expect(termination.shouldStop, isTrue);
+    expect(termination.safetyStopped, isTrue);
+    expect(termination.userRequested, isFalse);
+    expect(termination.reason, 'модель трижды повторила один ответ');
+
+    final result = AgentLoopResult.safetyStopped(termination.reason);
+    final summary = AgentResultSummary.build(
+      result: result,
+      fileMutations: 1,
+      commandRuns: 2,
+      failedCommands: 2,
+      lastExitCode: 1,
+      lastCommand: 'run_tests',
+      lastCommandResult: 'PROCESS_EXIT_CODE: 1',
+      verification: 'сборка не подтверждена',
+    );
+    expect(summary, startsWith('**Результат выполнения задачи**'));
+    expect(summary, contains('внутренней защитой'));
+    expect(summary, contains('Изменений файлов: 1'));
+    expect(summary, contains('PROCESS_EXIT_CODE: 1'));
+    expect(summary, isNot(contains('Остановлено пользователем')));
+  });
+
+  test('only an explicit stop request is classified as user cancellation', () {
+    final termination = AgentTerminationState()
+      ..requestSafetyStop('внутренняя защита')
+      ..requestUserStop();
+
+    expect(termination.userRequested, isTrue);
+    expect(termination.safetyStopped, isFalse);
+    expect(termination.reason, contains('Stop'));
+  });
+
+  test('stalled checkpoint with progress remains resumable', () async {
+    final dir = await Directory.systemTemp.createTemp('aia_stalled_history_');
+    addTearDown(() => dir.delete(recursive: true));
+    final store = AgentRunCheckpointStore(projectRoot: dir);
+    final checkpoint = await store.begin(
+      prompt: 'Собери проект',
+      maxIterations: 120,
+    );
+    await store.archiveAndClear(
+      checkpoint.copyWith(
+        status: AgentRunStatus.stalled,
+        iteration: 8,
+        toolActions: 5,
+        lastError: 'модель трижды повторила один ответ',
+      ),
+    );
+
+    final restored = await store.loadLatestResumableHistory();
+    expect(restored, isNotNull);
+    expect(restored!.status, AgentRunStatus.stalled);
+    expect(restored.lastError, contains('трижды повторила'));
+  });
+
+  test('controller never assigns an internal stall to cancelRequested', () {
+    final source =
+        File('lib/controllers/agent_controller.dart').readAsStringSync();
+    expect(RegExp(r'cancelRequested\s*=\s*true').hasMatch(source), isFalse);
+    expect(source, contains('requestSafetyStop('));
+    expect(source, contains('finishPendingAgentTermination('));
   });
 
   test('missing CMake working directory is normalized to project root',

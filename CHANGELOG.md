@@ -1,3 +1,12 @@
+## 1.59.1+66 - 2026-07-19
+
+- Fixed an internal repetition/circuit-breaker stop being reported as "stopped by user" even when the Stop button was never pressed.
+- Added distinct typed termination causes for explicit user cancellation and internal safety guards.
+- Added the terminal and resumable `stalled` checkpoint status for runs stopped by loop protection.
+- Changed the agent loop to return an explicit result status and reason instead of inferring the outcome from a shared cancellation flag.
+- Added a mandatory final "Результат выполнения задачи" message for completed, failed, paused, safety-stopped, and user-cancelled runs, including file/command counters and the last captured result.
+- Added regression coverage for the repeated-model-response sequence from the application log, safety-stop classification, result formatting, and stalled-run recovery.
+
 ## 1.59.0+65 - 2026-07-18
 
 - Replaced single-label task classification with multi-domain intent analysis and a hidden execution frame that never rewrites the user's prompt.
