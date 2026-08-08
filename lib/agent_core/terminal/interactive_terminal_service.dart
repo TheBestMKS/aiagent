@@ -34,6 +34,8 @@ class TerminalSessionSnapshot {
     required this.exitCode,
     required this.transcript,
     required this.lastActivity,
+    this.backend = 'native',
+    this.distribution = '',
   });
 
   final String id;
@@ -45,6 +47,22 @@ class TerminalSessionSnapshot {
   final int? exitCode;
   final String transcript;
   final DateTime lastActivity;
+  final String backend;
+  final String distribution;
+}
+
+class WslDistributionInfo {
+  const WslDistributionInfo({
+    required this.name,
+    required this.state,
+    required this.version,
+    required this.isDefault,
+  });
+
+  final String name;
+  final String state;
+  final int version;
+  final bool isDefault;
 }
 
 class InteractiveTerminalService {
@@ -82,6 +100,9 @@ class InteractiveTerminalService {
     Map<String, String>? environment,
     int rows = 30,
     int columns = 120,
+    String backend = 'native',
+    String wslDistribution = '',
+    String wslCwd = '',
   }) async {
     _ensureAlive();
     final id = _safeSessionId(sessionId.isEmpty
@@ -90,23 +111,44 @@ class InteractiveTerminalService {
     final existing = _sessions[id];
     if (existing != null && existing.running) return existing.snapshot;
 
+    final normalizedBackend = backend.trim().toLowerCase();
+    final useWsl = normalizedBackend == 'wsl';
+    if (useWsl && !Platform.isWindows) {
+      throw StateError('WSL backend is available only on Windows');
+    }
     final effectiveCwd = _resolveCwd(cwd);
-    final effectiveShell = shell.trim().isEmpty ? defaultShell : shell.trim();
+    final effectiveShell = useWsl
+        ? 'wsl.exe'
+        : (shell.trim().isEmpty ? defaultShell : shell.trim());
+    final effectiveArguments = useWsl
+        ? _wslArguments(
+            distribution: wslDistribution,
+            cwd: wslCwd.trim().isEmpty
+                ? windowsPathToWsl(effectiveCwd)
+                : wslCwd.trim(),
+            shell: shell,
+            extra: arguments,
+          )
+        : arguments;
     final session = existing ??
         _InteractiveTerminalSession(
           id: id,
           name: name.trim().isEmpty ? id : name.trim(),
           cwd: effectiveCwd,
           shell: effectiveShell,
+          backend: useWsl ? 'wsl' : 'native',
+          distribution: wslDistribution.trim(),
           emit: _emit,
         );
     session
       ..name = name.trim().isEmpty ? session.name : name.trim()
       ..cwd = effectiveCwd
-      ..shell = effectiveShell;
+      ..shell = effectiveShell
+      ..backend = useWsl ? 'wsl' : 'native'
+      ..distribution = wslDistribution.trim();
     _sessions[id] = session;
     await session.start(
-      arguments: arguments,
+      arguments: effectiveArguments,
       environment: environment,
       rows: rows,
       columns: columns,
@@ -177,7 +219,8 @@ ${session.tail(maxChars.clamp(1000, 120000).toInt())}''';
       buffer.writeln();
       buffer.write(
         '- id=${snapshot.id}; name=${snapshot.name}; running=${snapshot.running}; '
-        'pid=${snapshot.pid ?? 'n/a'}; cwd=${snapshot.cwd}; shell=${snapshot.shell}',
+        'pid=${snapshot.pid ?? 'n/a'}; cwd=${snapshot.cwd}; shell=${snapshot.shell}; '
+        'backend=${snapshot.backend}${snapshot.distribution.isEmpty ? '' : '; distro=${snapshot.distribution}'}',
       );
     }
     return buffer.toString();
@@ -243,6 +286,93 @@ ${session.tail(maxChars.clamp(1000, 120000).toInt())}''';
   }
 
   String lineEndingFor(String shell) => Platform.isWindows ? '\r\n' : '\n';
+
+  Future<List<WslDistributionInfo>> listWslDistributions() async {
+    if (!Platform.isWindows) return const [];
+    final result = await Process.run(
+      'wsl.exe',
+      const ['--list', '--verbose'],
+      runInShell: false,
+    );
+    if (result.exitCode != 0) {
+      throw ProcessException(
+        'wsl.exe',
+        const ['--list', '--verbose'],
+        _cleanWslOutput('${result.stderr}'),
+        result.exitCode,
+      );
+    }
+    return parseWslDistributionList('${result.stdout}');
+  }
+
+  static List<WslDistributionInfo> parseWslDistributionList(String output) {
+    final rows = <WslDistributionInfo>[];
+    final lines = _cleanWslOutput(output).split(RegExp(r'[\r\n]+'));
+    for (final raw in lines) {
+      var line = raw.trimRight();
+      final trimmedLine = line.trim();
+      if (trimmedLine.isEmpty ||
+          trimmedLine.toLowerCase().contains('distribution') ||
+          trimmedLine.toLowerCase().startsWith('name ')) {
+        continue;
+      }
+      final isDefault = line.trimLeft().startsWith('*');
+      line = line.trimLeft().replaceFirst(RegExp(r'^\*\s*'), '');
+      final columns = line
+          .trim()
+          .split(RegExp(r'\s{2,}'))
+          .where((item) => item.trim().isNotEmpty)
+          .toList(growable: false);
+      if (columns.isEmpty) continue;
+      final parsedVersion = int.tryParse(columns.last.trim());
+      if (parsedVersion == null) continue;
+      final version = parsedVersion;
+      final state =
+          columns.length >= 3 ? columns[columns.length - 2].trim() : '';
+      final name = columns.length >= 3
+          ? columns.take(columns.length - 2).join(' ').trim()
+          : columns.first.trim();
+      if (name.isEmpty) continue;
+      rows.add(WslDistributionInfo(
+        name: name,
+        state: state,
+        version: version,
+        isDefault: isDefault,
+      ));
+    }
+    return rows;
+  }
+
+  static String windowsPathToWsl(String value) {
+    final path = value.trim();
+    if (path.startsWith('/')) return path.replaceAll('\\', '/');
+    final match = RegExp(r'^([A-Za-z]):[\\/]*(.*)$').firstMatch(path);
+    if (match == null) return path.replaceAll('\\', '/');
+    final drive = match.group(1)!.toLowerCase();
+    final rest = match.group(2)!.replaceAll('\\', '/');
+    return rest.isEmpty ? '/mnt/$drive' : '/mnt/$drive/$rest';
+  }
+
+  List<String> _wslArguments({
+    required String distribution,
+    required String cwd,
+    required String shell,
+    required List<String> extra,
+  }) {
+    final result = <String>[];
+    if (distribution.trim().isNotEmpty) {
+      result.addAll(['--distribution', distribution.trim()]);
+    }
+    if (cwd.trim().isNotEmpty) result.addAll(['--cd', cwd.trim()]);
+    if (shell.trim().isNotEmpty) {
+      result.addAll(['--exec', shell.trim()]);
+    }
+    result.addAll(extra);
+    return result;
+  }
+
+  static String _cleanWslOutput(String value) =>
+      value.replaceAll('\u0000', '').replaceAll('\ufeff', '').trim();
 
   Future<void> dispose() async {
     if (_disposed) return;
@@ -326,6 +456,8 @@ ${session.tail(maxChars.clamp(1000, 120000).toInt())}''';
                   'name': item.name,
                   'cwd': item.cwd,
                   'shell': item.shell,
+                  'backend': item.backend,
+                  'distribution': item.distribution,
                   'running': item.running,
                   'exit_code': item.exitCode,
                 })
@@ -387,6 +519,8 @@ class _InteractiveTerminalSession {
     required this.name,
     required this.cwd,
     required this.shell,
+    this.backend = 'native',
+    this.distribution = '',
     required this.emit,
   });
 
@@ -394,6 +528,8 @@ class _InteractiveTerminalSession {
   String name;
   String cwd;
   String shell;
+  String backend;
+  String distribution;
   final void Function(TerminalSessionEvent event) emit;
   Pty? _pty;
   StreamSubscription<String>? _outputSubscription;
@@ -423,6 +559,8 @@ class _InteractiveTerminalSession {
         exitCode: exitCode,
         transcript: _transcript,
         lastActivity: lastActivity,
+        backend: backend,
+        distribution: distribution,
       );
 
   Future<void> start({

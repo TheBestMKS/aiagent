@@ -92,10 +92,12 @@ class AgentRunCheckpointStore {
         await archiveAndClear(checkpoint);
         return null;
       }
-      final interrupted = checkpoint.copyWith(
-        status: AgentRunStatus.interrupted,
-        updatedAt: DateTime.now(),
-      );
+      final interrupted = checkpoint.status == AgentRunStatus.awaitingUser
+          ? checkpoint
+          : checkpoint.copyWith(
+              status: AgentRunStatus.interrupted,
+              updatedAt: DateTime.now(),
+            );
       await save(interrupted);
       return interrupted;
     } catch (_) {
@@ -155,7 +157,8 @@ class AgentRunCheckpointStore {
       final resumableStatus = checkpoint.status == AgentRunStatus.cancelled ||
           checkpoint.status == AgentRunStatus.stalled ||
           checkpoint.status == AgentRunStatus.failed ||
-          checkpoint.status == AgentRunStatus.interrupted;
+          checkpoint.status == AgentRunStatus.interrupted ||
+          checkpoint.status == AgentRunStatus.awaitingUser;
       final hasProgress = checkpoint.toolActions > 0 ||
           checkpoint.fileMutations > 0 ||
           checkpoint.commandRuns > 0 ||

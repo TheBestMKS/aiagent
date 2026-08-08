@@ -232,7 +232,12 @@ class TaskEvidenceLedger {
     Map<String, dynamic> args,
     String result,
   ) {
-    if (toolName == 'set_task_plan') return TaskEvidenceType.plan;
+    if (toolName == 'set_task_plan' ||
+        toolName == 'define_task_goal' ||
+        toolName == 'add_task_subtask' ||
+        toolName == 'update_task_subtask') {
+      return TaskEvidenceType.plan;
+    }
     if (const {
       'write_file',
       'create_file',
@@ -244,6 +249,7 @@ class TaskEvidenceLedger {
       'move_path',
       'create_document_from_text',
       'edit_document_text',
+      'package_project_release',
     }.contains(toolName)) {
       return TaskEvidenceType.fileMutation;
     }

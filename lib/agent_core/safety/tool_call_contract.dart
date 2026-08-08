@@ -19,6 +19,21 @@ class ToolCallContract {
   const ToolCallContract._();
 
   static const Map<String, List<String>> _requiredArguments = {
+    'define_task_goal': ['expected_result', 'subtasks'],
+    'add_task_subtask': ['parent_id', 'title', 'expected_result'],
+    'update_task_subtask': ['id', 'status'],
+    'record_task_context': ['kind', 'key', 'value'],
+    'package_project_release': [
+      'program',
+      'version',
+      'platform',
+      'architecture',
+      'artifact_paths',
+      'change_en',
+      'change_ru',
+      'readme_en',
+      'readme_ru',
+    ],
     'set_task_plan': ['plan'],
     'read_file': ['path'],
     'write_file': ['path', 'content'],
@@ -39,6 +54,9 @@ class ToolCallContract {
     'download_to_tools': ['url'],
     'extract_zip_to_tools': ['path', 'dest'],
     'memory_recall': ['query'],
+    'context_search': ['query'],
+    'context_read': ['source_id'],
+    'literature_search': ['query'],
     'memory_remember': ['type', 'title', 'content'],
     'promote_golden_path': [
       'problem',
@@ -88,8 +106,7 @@ class ToolCallContract {
       return ToolCallContractResolution(
         call: call,
         valid: false,
-        message:
-            'TOOL_ARGUMENT_VALIDATION_FAILED: `${call.name}` получил путь '
+        message: 'TOOL_ARGUMENT_VALIDATION_FAILED: `${call.name}` получил путь '
             '`$path`, похожий на каталог. Для каталога используй `make_dir`; '
             'для файла передай имя файла внутри каталога.',
       );
@@ -129,8 +146,8 @@ class ToolCallContract {
       return implicated.first;
     }
 
-    final content = '${args['old_text'] ?? ''}\n${args['new_text'] ?? ''}'
-        .toLowerCase();
+    final content =
+        '${args['old_text'] ?? ''}\n${args['new_text'] ?? ''}'.toLowerCase();
     if (content.contains('cmake_minimum_required') ||
         content.contains('find_package(') ||
         content.contains('target_link_libraries(') ||
@@ -169,9 +186,26 @@ class ToolCallContract {
         'solution',
         'verification',
         'failed_approaches',
+        'expected_result',
+        'parent_id',
+        'id',
+        'status',
+        'kind',
+        'key',
+        'value',
+        'source_id',
+        'program',
+        'version',
+        'platform',
+        'architecture',
+        'change_en',
+        'change_ru',
+        'readme_en',
+        'readme_ru',
       }.contains(key);
 
-  static bool _blank(Object? value) => value == null || value.toString().trim().isEmpty;
+  static bool _blank(Object? value) =>
+      value == null || value.toString().trim().isEmpty;
 
   static bool _looksLikeDirectoryPath(String path) {
     if (path.isEmpty) return false;

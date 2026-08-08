@@ -47,6 +47,11 @@ String resolveDefaultAppRootPath() {
     return pathJoin(Directory.systemTemp.path, 'ii_agent_data');
   }
   try {
+    final executable = File(Platform.resolvedExecutable);
+    final executableName = pathBasename(executable.path).toLowerCase();
+    if (executableName == 'aiagent.exe' || executableName == 'aiagent') {
+      return executable.parent.path;
+    }
     return Directory.current.path;
   } catch (_) {
     return pathJoin(Directory.systemTemp.path, 'ii_agent_data');

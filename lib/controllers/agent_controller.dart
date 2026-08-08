@@ -15,8 +15,16 @@ import '../agent_core/build/build_failure_analyzer.dart';
 import '../agent_core/build/build_working_directory_resolver.dart';
 import '../agent_core/build/cmake_command_resolver.dart';
 import '../agent_core/build/cpp_build_command_builder.dart';
+import '../agent_core/build/project_build_recipe.dart';
+import '../agent_core/memory/context_archive_service.dart';
 import '../agent_core/memory/local_memory_service.dart';
+import '../agent_core/planning/guided_execution_coach.dart';
+import '../agent_core/planning/project_agent_configuration.dart';
+import '../agent_core/planning/project_task_mode.dart';
+import '../agent_core/planning/task_execution_state.dart';
 import '../agent_core/planning/task_intent_analyzer.dart';
+import '../agent_core/prompts/agent_prompt_templates.dart';
+import '../agent_core/release/project_release_packager.dart';
 import '../agent_core/retrieval/web_content_extractor.dart';
 import '../agent_core/runs/adaptive_agent_budget.dart';
 import '../agent_core/runs/agent_run_checkpoint.dart';
@@ -43,18 +51,37 @@ class AgentController {
   Directory distribRoot = Directory('distrib');
   Directory toolsRoot = Directory('tools');
   Directory pluginsRoot = Directory('plugins');
+  Directory documentsRoot = Directory('documents');
   LocalMemoryService? localMemory;
+  ContextArchiveService? contextArchive;
   PluginManager? pluginManager;
   AgentRunCheckpointStore? taskCheckpointStore;
+  TaskExecutionStateStore? taskExecutionStateStore;
   AgentRunCheckpoint? activeRunCheckpoint;
   AgentRunCheckpoint? interruptedRunCheckpoint;
+  TaskExecutionState? activeTaskGoal;
+  String activeTaskInvariant = '';
   final ToolExecutionGuard toolExecutionGuard = ToolExecutionGuard();
   final TaskEvidenceLedger taskEvidenceLedger = TaskEvidenceLedger();
   final AgentTerminationState terminationState = AgentTerminationState();
   final TaskIntentAnalyzer taskIntentAnalyzer = const TaskIntentAnalyzer();
+  final TaskGoalPlanner taskGoalPlanner = const TaskGoalPlanner();
+  final GuidedExecutionCoach guidedExecutionCoach =
+      const GuidedExecutionCoach();
+  final ProjectBuildRecipeDetector projectBuildRecipeDetector =
+      const ProjectBuildRecipeDetector();
+  final ProjectAgentConfigurationStore projectConfigurationStore =
+      const ProjectAgentConfigurationStore();
+  final ProjectReleasePackager projectReleasePackager =
+      const ProjectReleasePackager();
+  ProjectAgentConfiguration currentProjectConfiguration =
+      const ProjectAgentConfiguration();
+  AgentPromptLibrary promptLibrary = AgentPromptLibrary();
   final WebContentExtractor webContentExtractor = const WebContentExtractor();
   TaskIntentProfile? activeTaskIntent;
   String activeRelevantMemoryContext = '';
+  String activeArchiveContext = '';
+  ProjectBuildRecipe? activeBuildRecipe;
   final InteractiveTerminalService terminalService =
       InteractiveTerminalService();
   final BuildFailureAnalyzer buildFailureAnalyzer =
@@ -70,6 +97,7 @@ class AgentController {
   int consecutiveInvalidToolCalls = 0;
   CppDependencyAvailability? currentCppDependencyAvailability;
   final Set<String> autoLearnedVerificationCommands = <String>{};
+  final Set<String> globallyRememberedCommands = <String>{};
   bool buildRetryRequired = false;
   String requiredBuildRetryCommand = '';
   String requiredBuildRetryWorkingDirectory = '';
@@ -80,6 +108,9 @@ class AgentController {
   bool taskCheckpointingEnabled = true;
   bool toolCircuitBreakerEnabled = true;
   bool autoLearnVerifiedRunsEnabled = true;
+  bool guidedExecutionEnabled = true;
+  bool crossProjectMemoryEnabled = true;
+  bool literatureAutoIndexEnabled = true;
   PluginOperationStatus pluginOperationStatus =
       const PluginOperationStatus.idle();
   List<PluginUpdateInfo> pendingPluginUpdates = const [];
@@ -284,6 +315,28 @@ class AgentController {
     log(lastFinalAnswerQualityIssue);
     logAction('agent_safety_stop_requested', {
       'reason': terminationState.reason,
+      'state': taskStateJson(),
+    });
+    notifyUi();
+  }
+
+  void requestUserGuidance(String blocker) {
+    if (terminationState.userRequested || terminationState.awaitingUser) return;
+    final safeBlocker = SecretRedactor.redact(blocker.trim());
+    final question = 'Не удалось продолжить после нескольких разных попыток: '
+        '${truncateMiddle(safeBlocker, 800)} Какой способ продолжения выбрать '
+        'или какой недостающий параметр вы можете предоставить?';
+    terminationState.requestUserGuidance(question);
+    activeTaskGoal = activeTaskGoal?.awaitUser(
+      blocker: safeBlocker,
+      question: question,
+    );
+    unawaited(persistTaskExecutionState());
+    status = 'Ожидается ответ пользователя';
+    log('AGENT USER GUIDANCE REQUIRED: $safeBlocker');
+    logAction('agent_user_guidance_required', {
+      'blocker': safeBlocker,
+      'question': question,
       'state': taskStateJson(),
     });
     notifyUi();
@@ -1047,6 +1100,12 @@ class AgentController {
     } catch (e) {
       lines.add('tools: ошибка проверки $e');
     }
+    try {
+      lines.add(
+          "documents: ${documentsRoot.existsSync() ? 'доступна' : 'не создана'} — ${documentsRoot.path}");
+    } catch (e) {
+      lines.add('documents: ошибка проверки $e');
+    }
     if (Platform.isAndroid) {
       lines.add(
           'Android: для внешних папок нужны системные разрешения приложения. Встроенная рабочая папка доступна всегда. Повторный запрос прав выполняется системой Android при обращении к файловому диалогу/внешнему URI.');
@@ -1073,6 +1132,7 @@ class AgentController {
       distribRoot = Directory(pathJoin(appRootPath, 'distrib'));
       toolsRoot = Directory(pathJoin(appRootPath, 'tools'));
       pluginsRoot = Directory(pathJoin(appRootPath, 'plugins'));
+      documentsRoot = Directory(pathJoin(appRootPath, 'documents'));
       await loadAppSettings(defaultProjectsRoot: projectsRoot.path);
       unawaited(configureWindowsTrayBridge());
       try {
@@ -1093,12 +1153,22 @@ class AgentController {
               toolsRoot.path, Platform.operatingSystem, hostArchSegment))
           .create(recursive: true);
       await pluginsRoot.create(recursive: true);
+      await documentsRoot.create(recursive: true);
       localMemory = LocalMemoryService(configRoot: configRoot);
       await localMemory!.initialize();
       await localMemory!.migrateLegacy(
         knowledgeBase: knowledgeBaseFile(),
         solutionMemory: solutionMemoryFile,
       );
+      contextArchive = ContextArchiveService(
+        configRoot: configRoot,
+        projectsRoot: projectsRoot,
+        documentsRoot: documentsRoot,
+        textExtractor: (path, maxChars) =>
+            readDeviceDocumentText(path, maxChars: maxChars),
+        projectPathsProvider: () => projects.map((project) => project.path),
+      );
+      await contextArchive!.initialize();
       pluginManager = PluginManager(
         pluginsRoot: pluginsRoot,
         networkAllowed: () => allowInternetUse,
@@ -1109,7 +1179,7 @@ class AgentController {
         onChanged: notifyUi,
       );
       await pluginManager!.initialize();
-      log('CHECK folders: Projects=${projectsRoot.path}; config=${configRoot.path}; distrib=${distribRoot.path}; tools=${toolsRoot.path}; plugins=${pluginsRoot.path}');
+      log('CHECK folders: Projects=${projectsRoot.path}; config=${configRoot.path}; distrib=${distribRoot.path}; tools=${toolsRoot.path}; plugins=${pluginsRoot.path}; documents=${documentsRoot.path}');
       if (!Platform.isAndroid) {
         await logStartupLlamaScan().timeout(const Duration(seconds: 3),
             onTimeout: () {
@@ -1273,6 +1343,16 @@ class AgentController {
           data['autoLearnVerifiedRunsEnabled'] is bool
               ? data['autoLearnVerifiedRunsEnabled'] as bool
               : autoLearnVerifiedRunsEnabled;
+      guidedExecutionEnabled = data['guidedExecutionEnabled'] is bool
+          ? data['guidedExecutionEnabled'] as bool
+          : guidedExecutionEnabled;
+      crossProjectMemoryEnabled = data['crossProjectMemoryEnabled'] is bool
+          ? data['crossProjectMemoryEnabled'] as bool
+          : crossProjectMemoryEnabled;
+      literatureAutoIndexEnabled = data['literatureAutoIndexEnabled'] is bool
+          ? data['literatureAutoIndexEnabled'] as bool
+          : literatureAutoIndexEnabled;
+      promptLibrary = AgentPromptLibrary.fromJson(data['agentPromptOverrides']);
       emailAccounts = (data['emailAccounts'] as List<dynamic>? ?? [])
           .whereType<Map>()
           .map((m) => EmailAccountConfig.fromJson(
@@ -1367,6 +1447,10 @@ class AgentController {
         'taskCheckpointingEnabled': taskCheckpointingEnabled,
         'toolCircuitBreakerEnabled': toolCircuitBreakerEnabled,
         'autoLearnVerifiedRunsEnabled': autoLearnVerifiedRunsEnabled,
+        'guidedExecutionEnabled': guidedExecutionEnabled,
+        'crossProjectMemoryEnabled': crossProjectMemoryEnabled,
+        'literatureAutoIndexEnabled': literatureAutoIndexEnabled,
+        'agentPromptOverrides': promptLibrary.toJson(),
         'emailAccounts': emailAccounts.map((a) => a.toJson()).toList(),
         'apiOutputTemplates':
             apiOutputTemplates.map((a) => a.toJson()).toList(),
@@ -1379,6 +1463,54 @@ class AgentController {
         'projectsRoot': projectsRoot.path,
       }),
       encoding: utf8,
+    );
+  }
+
+  Future<void> updateAgentPrompt(String key, String value) async {
+    promptLibrary.update(key, value);
+    await saveAppSettings();
+    notifyUi();
+  }
+
+  Future<void> resetAgentPrompt(String key) async {
+    promptLibrary.reset(key);
+    await saveAppSettings();
+    notifyUi();
+  }
+
+  Future<void> resetAllAgentPrompts() async {
+    promptLibrary.resetAll();
+    await saveAppSettings();
+    notifyUi();
+  }
+
+  String previewAgentPrompts({
+    ProjectTaskMode? mode,
+    String task = '',
+  }) {
+    final selectedMode = mode ?? currentProjectConfiguration.taskMode;
+    final sample = task.trim().isEmpty
+        ? 'Создать, проверить и передать пользователю требуемый результат.'
+        : task.trim();
+    final intent = taskIntentAnalyzer.analyze(
+      sample,
+      projectMode: selectedMode,
+    );
+    final expected = const TaskGoalPlanner()
+        .create(
+          taskId: 'preview',
+          projectPath: currentProject?.path ?? projectsRoot.path,
+          projectMode: selectedMode,
+          intent: intent,
+          prompt: sample,
+        )
+        .expectedResult;
+    return promptLibrary.render(
+      mode: selectedMode,
+      taskType: intent.primaryDomain.name,
+      expectedResult: expected,
+      program: currentProject?.name ?? 'program',
+      version: appVersion,
     );
   }
 
@@ -1908,6 +2040,7 @@ class AgentController {
     if (path.trim().isEmpty) return;
     projectsRoot = Directory(path.trim());
     await projectsRoot.create(recursive: true);
+    contextArchive?.updateProjectsRoot(projectsRoot);
     await saveAppSettings();
     await refreshProjects();
     if (projects.isNotEmpty) {
@@ -1925,7 +2058,40 @@ class AgentController {
     await createProjectAt(name, dir.path);
   }
 
-  Future<void> createProjectAt(String rawName, String rawPath) async {
+  Future<ProjectAgentConfiguration> loadProjectAgentConfiguration(
+    ProjectInfo project,
+  ) =>
+      projectConfigurationStore.load(Directory(project.path));
+
+  Future<void> saveProjectAgentConfiguration(
+    ProjectInfo project, {
+    required ProjectTaskMode taskMode,
+    required bool indexContents,
+  }) async {
+    final configuration = ProjectAgentConfiguration(
+      taskMode: taskMode,
+      indexContents: indexContents,
+    );
+    await projectConfigurationStore.save(
+      Directory(project.path),
+      configuration,
+    );
+    if (currentProject?.path == project.path) {
+      currentProjectConfiguration = configuration;
+    }
+    log(
+      'PROJECT AGENT CONFIG SAVED: ${project.path}; '
+      'taskMode=${taskMode.name}; indexContents=$indexContents',
+    );
+    notifyUi();
+  }
+
+  Future<void> createProjectAt(
+    String rawName,
+    String rawPath, {
+    ProjectTaskMode taskMode = ProjectTaskMode.automatic,
+    bool indexContents = false,
+  }) async {
     final name = sanitizeFileName(
         rawName.trim().isEmpty ? 'NewProject' : rawName.trim());
     final dir = Directory(rawPath.trim().isEmpty
@@ -1939,6 +2105,13 @@ class AgentController {
       await readme.writeAsString('# $name\n\nПроект создан AI Agent.\n',
           encoding: utf8);
     }
+    await projectConfigurationStore.save(
+      dir,
+      ProjectAgentConfiguration(
+        taskMode: taskMode,
+        indexContents: indexContents,
+      ),
+    );
     await refreshProjects();
     await openProject(ProjectInfo(name: name, path: dir.path));
   }
@@ -2114,19 +2287,25 @@ class AgentController {
     projectLoading = true;
     currentProject = project;
     taskCheckpointStore = null;
+    taskExecutionStateStore = null;
     activeRunCheckpoint = null;
     interruptedRunCheckpoint = null;
+    activeTaskGoal = null;
+    activeTaskInvariant = '';
     messages = [];
     status = 'Загрузка проекта: ${project.name}...';
     notifyUi();
     setupProjectLogging(project);
     await terminalService.configureProject(project.path);
     await loadProjectPermissions(project);
+    currentProjectConfiguration =
+        await projectConfigurationStore.load(Directory(project.path));
     log('Открыт проект: ${project.path}');
     await Directory(pathJoin(project.path, '.cppagent', 'sessions'))
         .create(recursive: true);
     await loadLatestSessionForCurrentProject();
     await initializeTaskCheckpointStore(project);
+    await initializeTaskExecutionStateStore(project);
     recalculateContext();
     projectLoading = false;
     if (interruptedRunCheckpoint == null) {
@@ -3309,7 +3488,11 @@ class AgentController {
     lastCommandResultText = '';
     activeTaskText = '';
     activeTaskIntent = null;
+    activeTaskGoal = null;
+    activeTaskInvariant = '';
     activeRelevantMemoryContext = '';
+    activeArchiveContext = '';
+    activeBuildRecipe = null;
     pendingFileChanges.clear();
     taskFileChanges.clear();
     taskActionSummaries.clear();
@@ -3338,6 +3521,106 @@ class AgentController {
     taskEvidenceLedger.reset();
   }
 
+  Future<void> initializeTaskExecutionStateStore(ProjectInfo project) async {
+    try {
+      taskExecutionStateStore = TaskExecutionStateStore(
+        projectRoot: Directory(project.path),
+      );
+      await taskExecutionStateStore!.initialize();
+      final checkpoint = interruptedRunCheckpoint;
+      if (checkpoint != null) {
+        activeTaskGoal = await taskExecutionStateStore!.load(checkpoint.runId);
+        if (activeTaskGoal != null) {
+          activeTaskInvariant =
+              await taskExecutionStateStore!.readInvariant(activeTaskGoal!);
+          log(
+            'CANONICAL TASK STATE RECOVERED: task=${checkpoint.runId}; '
+            'completion=${activeTaskGoal!.completionPercent}',
+          );
+        }
+      }
+    } catch (error) {
+      taskExecutionStateStore = null;
+      activeTaskGoal = null;
+      activeTaskInvariant = '';
+      log('CANONICAL TASK STATE INITIALIZATION ERROR: $error');
+    }
+  }
+
+  Future<void> beginTaskExecutionState(
+    String prompt, {
+    AgentRunCheckpoint? resumeFrom,
+    List<String> attachments = const [],
+    List<String> locations = const [],
+  }) async {
+    final project = currentProject;
+    final intent = activeTaskIntent;
+    if (project == null || intent == null) return;
+    try {
+      taskExecutionStateStore ??= TaskExecutionStateStore(
+        projectRoot: Directory(project.path),
+      );
+      await taskExecutionStateStore!.initialize();
+      final taskId = resumeFrom?.runId ??
+          activeRunCheckpoint?.runId ??
+          'task_${DateTime.now().microsecondsSinceEpoch}';
+      if (resumeFrom != null) {
+        activeTaskGoal = await taskExecutionStateStore!.load(taskId);
+        if (activeTaskGoal?.status == TaskGoalStatus.awaitingUser) {
+          activeTaskGoal = activeTaskGoal!.copyWith(
+            status: TaskGoalStatus.active,
+            blocker: '',
+            questionForUser: '',
+          );
+        }
+      }
+      activeTaskGoal ??= taskGoalPlanner.create(
+        taskId: taskId,
+        projectPath: project.path,
+        projectMode: currentProjectConfiguration.taskMode,
+        intent: intent,
+        prompt: prompt,
+        initialContext: [
+          for (final path in attachments)
+            TaskContextFact(
+              kind: 'attachment',
+              key: path,
+              value: path,
+              source: 'user',
+              verified: true,
+              updatedAt: DateTime.now(),
+            ),
+          for (final path in locations)
+            TaskContextFact(
+              kind: 'selected_location',
+              key: path,
+              value: path,
+              source: 'user',
+              verified: true,
+              updatedAt: DateTime.now(),
+            ),
+        ],
+      );
+      await taskExecutionStateStore!.begin(activeTaskGoal!);
+      activeTaskInvariant =
+          await taskExecutionStateStore!.readInvariant(activeTaskGoal!);
+      logAction('canonical_task_state_started', activeTaskGoal!.toJson());
+    } catch (error) {
+      log('CANONICAL TASK STATE START ERROR: $error');
+    }
+  }
+
+  Future<void> persistTaskExecutionState() async {
+    final state = activeTaskGoal;
+    if (state == null || taskExecutionStateStore == null) return;
+    try {
+      await taskExecutionStateStore!.save(state);
+      activeTaskInvariant = await taskExecutionStateStore!.readInvariant(state);
+    } catch (error) {
+      log('CANONICAL TASK STATE SAVE ERROR: $error');
+    }
+  }
+
   Future<void> initializeTaskCheckpointStore(ProjectInfo project) async {
     try {
       taskCheckpointStore = AgentRunCheckpointStore(
@@ -3351,8 +3634,10 @@ class AgentController {
       interruptedRunCheckpoint = await taskCheckpointStore!.loadInterrupted();
       if (interruptedRunCheckpoint != null) {
         final checkpoint = interruptedRunCheckpoint!;
-        status =
-            'Обнаружена незавершённая задача: итерация ${checkpoint.iteration}/${checkpoint.maxIterations}';
+        status = checkpoint.status == AgentRunStatus.awaitingUser
+            ? 'Ожидается ответ пользователя'
+            : 'Обнаружена незавершённая задача: итерация '
+                '${checkpoint.iteration}/${checkpoint.maxIterations}';
         log(
           'TASK CHECKPOINT RECOVERED: run=${checkpoint.runId}; '
           'iteration=${checkpoint.iteration}; status=${checkpoint.status.name}',
@@ -3541,6 +3826,13 @@ class AgentController {
     String error = '',
   }) async {
     if (activeRunCheckpoint == null) return;
+    if (status == AgentRunStatus.awaitingUser) {
+      await updateTaskCheckpoint(status, lastError: error);
+      interruptedRunCheckpoint = activeRunCheckpoint;
+      activeRunCheckpoint = null;
+      notifyUi();
+      return;
+    }
     final terminalStatus = status.isTerminal ? status : AgentRunStatus.failed;
     if (taskCheckpointingEnabled) {
       await updateTaskCheckpoint(terminalStatus, lastError: error);
@@ -3733,6 +4025,11 @@ class AgentController {
           ..writeln(checkpoint.plan.trim());
       }
     }
+    if (activeTaskInvariant.trim().isNotEmpty) {
+      buffer
+        ..writeln()
+        ..writeln(activeTaskInvariant.trim());
+    }
     return buffer.toString().trimRight();
   }
 
@@ -3881,7 +4178,11 @@ class AgentController {
     try {
       return truncateMiddle(
         await memory.formatSearchResults(prompt,
-            maxResults: 8, projectPath: project.path),
+            maxResults: crossProjectMemoryEnabled ? 12 : 8,
+            projectPath: project.path,
+            scope: crossProjectMemoryEnabled
+                ? AgentMemorySearchScope.allProjects
+                : AgentMemorySearchScope.currentAndGlobal),
         18000,
       );
     } catch (error) {
@@ -3890,24 +4191,100 @@ class AgentController {
     }
   }
 
-  String classifyTaskKind(String prompt) {
-    return taskIntentAnalyzer.analyze(prompt).primaryDomain.name;
+  Future<String> relevantArchiveForPrompt(String prompt) async {
+    final archive = contextArchive;
+    final project = currentProject;
+    if (archive == null || project == null) {
+      return '(архив контекстов не инициализирован)';
+    }
+    try {
+      final scope = literatureAutoIndexEnabled
+          ? ContextArchiveScope.all
+          : ContextArchiveScope.allProjects;
+      return truncateMiddle(
+        await archive.formatSearchResults(
+          prompt,
+          scope: scope,
+          currentProjectPath: project.path,
+          maxResults: 6,
+          includeOtherProjects: crossProjectMemoryEnabled,
+          maxCharsPerResult: 1800,
+        ),
+        14000,
+      );
+    } catch (error) {
+      log('CONTEXT ARCHIVE LOAD ERROR: $error');
+      return '(не удалось найти прошлый контекст: $error)';
+    }
   }
 
+  Future<String> searchContextArchive(
+    String query, {
+    String scope = 'all',
+    int maxResults = 8,
+  }) async {
+    final archive = contextArchive;
+    if (archive == null) return 'CONTEXT_ARCHIVE_NOT_INITIALIZED';
+    return archive.formatSearchResults(
+      query,
+      scope: ContextArchiveScopeParsing.parse(scope),
+      currentProjectPath: currentProject?.path ?? '',
+      maxResults: maxResults,
+      includeOtherProjects: crossProjectMemoryEnabled,
+    );
+  }
+
+  Future<String> readContextArchiveSource(
+    String sourceId, {
+    int offset = 0,
+    int maxChars = 24000,
+  }) async {
+    final archive = contextArchive;
+    if (archive == null) return 'CONTEXT_ARCHIVE_NOT_INITIALIZED';
+    return archive.readSource(sourceId, offset: offset, maxChars: maxChars);
+  }
+
+  Future<String> rebuildContextArchive({bool force = false}) async {
+    final archive = contextArchive;
+    if (archive == null) return 'CONTEXT_ARCHIVE_NOT_INITIALIZED';
+    final report = await archive.rebuild(
+      currentProjectPath: currentProject?.path ?? '',
+      force: force,
+    );
+    log('CONTEXT ARCHIVE REBUILT: ${report.summary}');
+    return 'CONTEXT_ARCHIVE_REBUILT: ${report.summary}; documents=${documentsRoot.path}';
+  }
+
+  Future<String> literatureList({int maxItems = 200}) async {
+    final archive = contextArchive;
+    if (archive == null) return 'CONTEXT_ARCHIVE_NOT_INITIALIZED';
+    return archive.listLiterature(maxItems: maxItems);
+  }
+
+  String classifyTaskKind(String prompt) {
+    return analyzeTaskIntent(prompt).primaryDomain.name;
+  }
+
+  TaskIntentProfile analyzeTaskIntent(String prompt) =>
+      taskIntentAnalyzer.analyze(
+        prompt,
+        projectMode: currentProjectConfiguration.taskMode,
+      );
+
   bool taskLooksLikeSoftwareCreation(String prompt) {
-    final intent = activeTaskIntent ?? taskIntentAnalyzer.analyze(prompt);
+    final intent = activeTaskIntent ?? analyzeTaskIntent(prompt);
     return intent.hasDomain(TaskDomain.software) && intent.expectsMutation;
   }
 
   bool taskNeedsProjectPreflight(String prompt) {
-    final intent = activeTaskIntent ?? taskIntentAnalyzer.analyze(prompt);
+    final intent = activeTaskIntent ?? analyzeTaskIntent(prompt);
     return intent.requiresProjectAudit;
   }
 
   Future<String> projectPreflightAudit(String prompt) async {
     final project = currentProject;
     if (project == null) return '';
-    final intent = activeTaskIntent ?? taskIntentAnalyzer.analyze(prompt);
+    final intent = activeTaskIntent ?? analyzeTaskIntent(prompt);
     final entries = <String>[];
     if (intent.requiresProjectAudit) {
       try {
@@ -3981,6 +4358,23 @@ class AgentController {
     var effectiveDisplayPrompt = displayPrompt;
     var effectiveRecoveryNote = recoveryNote;
     var effectiveResumeCheckpoint = resumeCheckpoint;
+    final waitingCheckpoint = interruptedRunCheckpoint;
+    if (effectiveResumeCheckpoint == null &&
+        waitingCheckpoint?.status == AgentRunStatus.awaitingUser &&
+        !isContinuationIntent(prompt)) {
+      final userGuidance = prompt;
+      effectiveResumeCheckpoint = waitingCheckpoint;
+      prompt = waitingCheckpoint!.prompt;
+      effectiveDisplayPrompt = userGuidance;
+      effectiveRecoveryNote =
+          '${buildCheckpointRecoveryNote(waitingCheckpoint)}\n'
+          '[USER_GUIDANCE]\n$userGuidance\n[/USER_GUIDANCE]\n'
+          'Продолжай исходную задачу с учётом этого ответа; не создавай новую задачу.';
+      log(
+        'USER GUIDANCE RESUMES TASK: run=${waitingCheckpoint.runId}; '
+        'guidance=${truncateMiddle(userGuidance, 2000)}',
+      );
+    }
     if (effectiveResumeCheckpoint == null && isContinuationIntent(prompt)) {
       taskCheckpointStore ??= AgentRunCheckpointStore(
         projectRoot: Directory(project.path),
@@ -4011,8 +4405,15 @@ class AgentController {
     if (effectiveResumeCheckpoint != null) {
       restoreTaskStateFromCheckpoint(effectiveResumeCheckpoint);
     }
-    activeTaskIntent = taskIntentAnalyzer.analyze(prompt);
+    activeTaskIntent = taskIntentAnalyzer.analyze(
+      prompt,
+      projectMode: currentProjectConfiguration.taskMode,
+    );
     activeRelevantMemoryContext = await relevantMemoryForPrompt(prompt);
+    activeArchiveContext = await relevantArchiveForPrompt(prompt);
+    activeBuildRecipe = activeTaskIntent!.hasDomain(TaskDomain.software)
+        ? detectProjectBuildRecipe()
+        : null;
     if (CppDependencyPreflight.taskLooksLikeImageMl(prompt)) {
       currentCppDependencyAvailability =
           CppDependencyPreflight.probe(toolsRoot);
@@ -4105,6 +4506,12 @@ class AgentController {
         ? prompt
         : '$prompt\n\n[HIDDEN_TASK_CONTEXT]\n$hiddenTaskContext\n[/HIDDEN_TASK_CONTEXT]';
     await beginTaskCheckpoint(prompt, resumeFrom: effectiveResumeCheckpoint);
+    await beginTaskExecutionState(
+      prompt,
+      resumeFrom: effectiveResumeCheckpoint,
+      attachments: attachments,
+      locations: selectedLocationSnapshot,
+    );
     final profileForLimits = currentProfile;
     if (profileForLimits != null) {
       runtimeLimitsCache.remove(runtimeCacheKey(profileForLimits));
@@ -4136,6 +4543,7 @@ ${localToolsCompactSummary(maxItems: 80)}
         actionSummaries: currentActionSummaries(),
       );
       status = 'Готово';
+      await finalizeTaskExecutionState(AgentRunStatus.completed, '');
       await completeTaskCheckpoint(AgentRunStatus.completed);
       busy = false;
       recalculateContext();
@@ -4160,6 +4568,7 @@ ${localToolsCompactSummary(maxItems: 80)}
       status = switch (loopResult.status) {
         AgentRunStatus.completed => 'Готово',
         AgentRunStatus.cancelled => 'Остановлено пользователем',
+        AgentRunStatus.awaitingUser => 'Ожидается ответ пользователя',
         AgentRunStatus.stalled => 'Остановлено защитой от циклов',
         _ => 'Задача не выполнена',
       };
@@ -4203,6 +4612,7 @@ ${localToolsCompactSummary(maxItems: 80)}
       } catch (error) {
         log('ATTEMPT MEMORY ERROR: $error');
       }
+      await finalizeTaskExecutionState(runStatus, runError);
       await completeTaskCheckpoint(runStatus, error: runError);
       busy = false;
       terminationState.reset();
@@ -4213,6 +4623,54 @@ ${localToolsCompactSummary(maxItems: 80)}
       }
       recalculateContext();
       notifyUi();
+    }
+  }
+
+  Future<void> finalizeTaskExecutionState(
+    AgentRunStatus runStatus,
+    String error,
+  ) async {
+    var state = activeTaskGoal;
+    if (state == null) return;
+    final finalStatus = switch (runStatus) {
+      AgentRunStatus.completed => TaskGoalStatus.completed,
+      AgentRunStatus.cancelled => TaskGoalStatus.cancelled,
+      AgentRunStatus.stalled => TaskGoalStatus.blocked,
+      AgentRunStatus.awaitingUser => TaskGoalStatus.awaitingUser,
+      _ => TaskGoalStatus.failed,
+    };
+    if (finalStatus == TaskGoalStatus.awaitingUser &&
+        state.status != TaskGoalStatus.awaitingUser) {
+      final question = error.trim().isEmpty
+          ? 'Как продолжить выполнение сохранённой задачи?'
+          : error.trim();
+      state = state.awaitUser(blocker: question, question: question);
+    }
+    final assistantResult = messages.reversed
+        .where((message) =>
+            message.role == 'assistant' &&
+            !message.internal &&
+            message.content.trim().isNotEmpty)
+        .map((message) => message.content.trim())
+        .firstOrNull;
+    activeTaskGoal = state.finish(
+      finalStatus: finalStatus,
+      result: error.trim().isNotEmpty
+          ? error.trim()
+          : (assistantResult ??
+              (runStatus == AgentRunStatus.completed
+                  ? 'Задача выполнена и проверена.'
+                  : runStatus.label)),
+      artifacts: state.contextFacts
+          .where((fact) => const {'release', 'artifact'}.contains(fact.kind))
+          .map((fact) => fact.key)
+          .toList(growable: false),
+    );
+    await persistTaskExecutionState();
+    if (finalStatus == TaskGoalStatus.completed ||
+        finalStatus == TaskGoalStatus.cancelled ||
+        finalStatus == TaskGoalStatus.failed) {
+      await taskExecutionStateStore?.clearActivePointer(state.taskId);
     }
   }
 
@@ -4490,7 +4948,7 @@ ${localToolsCompactSummary(maxItems: 80)}
           repeatedNoActionResponses = fingerprint.isEmpty ? 0 : 1;
         }
         if (repeatedNoActionResponses >= 3) {
-          requestSafetyStop(
+          requestUserGuidance(
             'Модель трижды повторила один и тот же текст без выполненного '
             'инструмента.',
           );
@@ -4597,9 +5055,10 @@ ${localToolsCompactSummary(maxItems: 80)}
             continue;
           }
           return finishAgentLoopResult(
-            AgentLoopResult.failed(
-              'После нескольких попыток задача осталась незавершённой: '
-              '$incompleteReason',
+            AgentLoopResult.awaitingUser(
+              'После нескольких разных попыток остаётся препятствие: '
+              '$incompleteReason Укажите недостающий параметр или способ '
+              'продолжения.',
             ),
             details: assistantText,
             action: 'task_stopped_incomplete',
@@ -4697,6 +5156,11 @@ ${localToolsCompactSummary(maxItems: 80)}
 
   String buildContinuationPrompt({required bool repeated}) {
     final buffer = StringBuffer();
+    if (guidedExecutionEnabled) {
+      buffer
+        ..writeln(guidedExecutionPromptBlock())
+        ..writeln();
+    }
     buffer.writeln(
         'Результаты инструментов выше. Продолжай выполнение исходной задачи до полного завершения.');
     buffer.writeln(
@@ -4795,6 +5259,15 @@ ${localToolsCompactSummary(maxItems: 80)}
         action: 'task_cancelled_by_user',
       );
     }
+    if (terminationState.awaitingUser) {
+      log('AGENT LOOP PAUSE: waiting for user guidance at $phase; '
+          '${terminationState.reason}');
+      return finishAgentLoopResult(
+        AgentLoopResult.awaitingUser(terminationState.reason),
+        details: terminationState.reason,
+        action: 'task_waiting_for_user_guidance',
+      );
+    }
     if (terminationState.safetyStopped) {
       log('AGENT LOOP STOP: safety guard at $phase; '
           '${terminationState.reason}');
@@ -4868,6 +5341,10 @@ ${localToolsCompactSummary(maxItems: 80)}
         'termination_reason': terminationState.reason,
         'checkpoint_run_id': activeRunCheckpoint?.runId,
         'checkpoint_iteration': currentAgentIteration,
+        'project_task_mode': currentProjectConfiguration.taskMode.name,
+        'canonical_task_id': activeTaskGoal?.taskId,
+        'canonical_task_status': activeTaskGoal?.status.name,
+        'canonical_completion_percent': activeTaskGoal?.completionPercent,
         'task_intent': activeTaskIntent?.toJson(),
         'tool_guard': toolExecutionGuard.statusSummary(),
         'evidence':
@@ -5120,6 +5597,25 @@ ${localToolsCompactSummary(maxItems: 80)}
     if (!qualityCheckEnabled) return '';
     if (lastFinalAnswerQualityIssue.isNotEmpty)
       return lastFinalAnswerQualityIssue;
+    final canonical = activeTaskGoal;
+    if (canonical != null && canonical.goalDefined) {
+      final unfinished = <TaskNode>[];
+      void collect(Iterable<TaskNode> nodes) {
+        for (final node in nodes) {
+          if (!node.isDone && node.kind != TaskNodeKind.delivery) {
+            unfinished.add(node);
+          }
+          collect(node.children);
+        }
+      }
+
+      collect(canonical.subtasks);
+      if (unfinished.isNotEmpty) {
+        return 'иерархическая цель ещё содержит незавершённые подзадачи: '
+            '${unfinished.take(8).map((node) => '${node.id} (${node.title})').join(', ')}. '
+            'Нужно выполнить и проверить их, затем вызвать update_task_subtask';
+      }
+    }
     if (taskLooksLikeWebResearchTask() &&
         allowInternetUse &&
         taskInternetActions == 0) {
@@ -5135,6 +5631,18 @@ ${localToolsCompactSummary(maxItems: 80)}
     }
     if (generatedSourcesContainPlaceholder()) {
       return 'в созданных C++ исходниках обнаружены заглушки/концептуальные фразы/TODO вместо полноценной реализации. Нужно заменить их рабочим кодом, затем снова выполнить сборку и запуск';
+    }
+    final intent = activeTaskIntent;
+    if (intent != null &&
+        intent.hasDomain(TaskDomain.software) &&
+        intent.expectsMutation &&
+        taskFileMutations > 0 &&
+        !(canonical?.contextFacts
+                .any((fact) => fact.kind == 'release' && fact.verified) ??
+            false)) {
+      return 'программная задача реализована, но стандартный проверенный '
+          'релиз ещё не собран. После успешных тестов вызови '
+          'package_project_release и передай реальные артефакты сборки';
     }
     if ((taskLooksLikeRequiresCommand() || taskFileMutations > 0) &&
         taskCommandRuns == 0) {
@@ -5182,11 +5690,134 @@ ${localToolsCompactSummary(maxItems: 80)}
     return '';
   }
 
+  bool currentModelNeedsStrictGuidance() {
+    final profile = currentProfile;
+    if (profile == null) return true;
+    final contextTokens = profile.maxContextTokens > 0
+        ? profile.maxContextTokens
+        : maxContextTokens;
+    final outputTokens =
+        profile.maxOutputTokens > 0 ? profile.maxOutputTokens : maxOutputTokens;
+    return guidedExecutionCoach.modelNeedsStrictGuidance(
+      modelName: profile.model,
+      contextTokens: contextTokens,
+      outputTokens: outputTokens,
+      localModel: profile.kind == ProfileKind.localLlama,
+    );
+  }
+
+  GuidedExecutionInput currentGuidedExecutionInput() {
+    final intent = activeTaskIntent ??
+        analyzeTaskIntent(
+          activeTaskText.trim().isEmpty ? 'general task' : activeTaskText,
+        );
+    if (intent.hasDomain(TaskDomain.software) && activeBuildRecipe == null) {
+      activeBuildRecipe = detectProjectBuildRecipe();
+    }
+    final failure = lastBuildFailureAnalysis;
+    final implicatedFile = failure?.implicatedFiles.isNotEmpty == true
+        ? failure!.implicatedFiles.first
+        : '';
+    var implicatedPolicyPath = implicatedFile;
+    final project = currentProject;
+    if (project != null && isAbsolutePath(implicatedFile)) {
+      final normalizedProject = normalizePathForCompare(project.path);
+      final normalizedFile = normalizePathForCompare(implicatedFile);
+      if (normalizedFile == normalizedProject ||
+          normalizedFile.startsWith('$normalizedProject/')) {
+        implicatedPolicyPath = pathRelative(project.path, implicatedFile);
+      }
+    }
+    final normalizedImplicated =
+        normalizeRelativePathForPolicy(implicatedPolicyPath);
+    final completion = currentTaskCompletionAssessment();
+    return GuidedExecutionInput(
+      intent: intent,
+      taskToolActions: taskToolActions,
+      fileMutations: taskFileMutations,
+      commandRuns: taskCommandRuns,
+      failedCommands: taskFailedCommands,
+      lastExitCode: lastCommandExitCode,
+      lastToolName: lastToolName,
+      buildFailureKind: failure?.kind.name ?? BuildFailureKind.none.name,
+      buildFailureSummary: failure?.summary ?? '',
+      implicatedFile: implicatedFile,
+      implicatedFileRead: implicatedFile.isNotEmpty &&
+          fileReadAtBuildFailureRevision[normalizedImplicated] ==
+              buildFailureRevision,
+      suggestedDiagnosticCommand:
+          failure?.suggestedDiagnosticCommand?.trim() ?? '',
+      buildRetryRequired: buildRetryRequired,
+      hasPassingVerification: taskEvidenceLedger.hasPassingVerification,
+      completionReady: completion.ready,
+      completionBlocker: activeTaskIntent == null ? '' : taskIncompleteReason(),
+      buildRecipe: activeBuildRecipe,
+    );
+  }
+
+  GuidedStepDirective currentGuidedStep() =>
+      guidedExecutionCoach.nextStep(currentGuidedExecutionInput());
+
+  String guidedExecutionPromptBlock() {
+    if (!guidedExecutionEnabled) return '(пошаговое ведение отключено)';
+    return currentGuidedStep().toPromptBlock(
+      weakModel: currentModelNeedsStrictGuidance(),
+    );
+  }
+
+  Set<String> routedToolNames() {
+    final names =
+        guidedExecutionCoach.routedTools(currentGuidedExecutionInput()).toSet();
+    final enabledPlugins = plugins.where((plugin) => plugin.enabled);
+    if (!currentModelNeedsStrictGuidance()) {
+      names.addAll(enabledPlugins.map((plugin) => plugin.toolName));
+    } else {
+      final task = activeTaskText.toLowerCase();
+      for (final plugin in enabledPlugins) {
+        final tokens = '${plugin.id} ${plugin.name} ${plugin.toolName}'
+            .toLowerCase()
+            .split(RegExp(r'[^a-zа-яё0-9]+'))
+            .where((token) => token.length >= 4);
+        if (tokens.any(task.contains)) names.add(plugin.toolName);
+      }
+      if (task.contains('плагин') || task.contains('plugin')) {
+        names.add('plugin_list');
+      }
+    }
+    return names;
+  }
+
+  List<Map<String, Object?>> buildRoutedOpenAiToolDefinitions() {
+    final definitions = buildOpenAiToolDefinitions();
+    if (!guidedExecutionEnabled || !currentModelNeedsStrictGuidance()) {
+      return definitions;
+    }
+    final allowed = routedToolNames();
+    return definitions.where((definition) {
+      final function = definition['function'];
+      if (function is! Map) return false;
+      return allowed.contains(function['name']?.toString() ?? '');
+    }).toList(growable: false);
+  }
+
+  String routedToolNamesPrompt() => buildRoutedOpenAiToolDefinitions()
+      .map((definition) {
+        final function = definition['function'];
+        return function is Map ? function['name']?.toString() ?? '' : '';
+      })
+      .where((name) => name.isNotEmpty)
+      .join(', ');
+
   List<Map<String, Object?>> buildOpenAiToolDefinitions() {
     Map<String, Object?> strProp(String description) =>
         {'type': 'string', 'description': description};
     Map<String, Object?> boolProp(String description) =>
         {'type': 'boolean', 'description': description};
+    Map<String, Object?> arrayProp(
+      String description,
+      Map<String, Object?> items,
+    ) =>
+        {'type': 'array', 'description': description, 'items': items};
     Map<String, Object?> fn(String name, String description,
             Map<String, Object?> properties, List<String> required) =>
         {
@@ -5280,6 +5911,88 @@ ${localToolsCompactSummary(maxItems: 80)}
             'name'
           ]),
       fn(
+          'define_task_goal',
+          'Уточнить наблюдаемый конечный результат и заменить начальный план иерархией проверяемых подзадач. Исходная задача пользователя остаётся неизменной.',
+          {
+            'expected_result': strProp(
+                'Фактические артефакты, состояние и критерии готовности'),
+            'subtasks': arrayProp('Подзадачи верхнего уровня', {
+              'type': 'object',
+              'properties': {
+                'id': strProp('Стабильный короткий идентификатор'),
+                'title': strProp('Что выполнить'),
+                'expected_result':
+                    strProp('Как наблюдаемо понять, что шаг завершён'),
+                'kind': strProp(
+                    'discovery | execution | verification | delivery | custom'),
+              },
+              'required': ['title', 'expected_result'],
+            }),
+          },
+          [
+            'expected_result',
+            'subtasks'
+          ]),
+      fn(
+          'add_task_subtask',
+          'Рекурсивно добавить подзадачу к корню или существующей сложной подзадаче.',
+          {
+            'parent_id': strProp('root или id родительской подзадачи'),
+            'id': strProp('Необязательный стабильный короткий id'),
+            'title': strProp('Что выполнить'),
+            'expected_result': strProp('Проверяемый ожидаемый результат'),
+            'kind': strProp(
+                'discovery | execution | verification | delivery | custom'),
+          },
+          [
+            'parent_id',
+            'title',
+            'expected_result'
+          ]),
+      fn(
+          'update_task_subtask',
+          'Обновить состояние подзадачи после фактического действия или проверки.',
+          {
+            'id': strProp('Идентификатор подзадачи'),
+            'status': strProp(
+                'pending | inProgress | blocked | completed | failed | skipped'),
+            'result': strProp('Фактически полученный результат'),
+            'evidence': arrayProp(
+                'Выводы команд, проверки и другие доказательства',
+                {'type': 'string'}),
+            'artifacts': arrayProp(
+                'Пути результирующих файлов или идентификаторы сессий',
+                {'type': 'string'}),
+            'next_action': strProp('Следующее действие при незавершённом шаге'),
+          },
+          [
+            'id',
+            'status'
+          ]),
+      fn(
+          'record_task_context',
+          'Сохранить важный путь, команду, найденный факт, сессию или решение в неизменяемом handoff текущей задачи.',
+          {
+            'kind': strProp(
+                'compiler | command | file | document | remote_session | decision | context'),
+            'key': strProp('Короткий уникальный ключ'),
+            'value': strProp('Полезное значение и результат'),
+            'source': strProp('Инструмент, команда, файл или пользователь'),
+            'verified': boolProp('Подтверждено ли значение инструментом'),
+            'reusable_globally': boolProp(
+                'Сохранить проверенный факт также для других проектов'),
+          },
+          [
+            'kind',
+            'key',
+            'value'
+          ]),
+      fn(
+          'get_task_goal',
+          'Получить дословное сохранённое состояние основной цели, рекурсивных подзадач, результатов и важных фактов.',
+          {},
+          []),
+      fn(
           'set_task_plan',
           'Зафиксировать план сложной задачи в виде подзадач. Используй перед длинной реализацией или исправлением сложной ошибки.',
           {
@@ -5288,6 +6001,35 @@ ${localToolsCompactSummary(maxItems: 80)}
           },
           [
             'plan'
+          ]),
+      fn(
+          'package_project_release',
+          'После успешной сборки и проверки создать стандартный release/<program>_<version> с двуязычными описаниями, исходниками, артефактами и SHA-256.',
+          {
+            'program': strProp('Название программы'),
+            'version': strProp('Версия программы'),
+            'platform': strProp('win | linux | android | macos и т.п.'),
+            'architecture': strProp('x64 | arm64 | universal и т.п.'),
+            'artifact_paths': arrayProp(
+                'Файлы или папки успешной сборки относительно проекта',
+                {'type': 'string'}),
+            'change_en': strProp('Полное описание изменений на английском'),
+            'change_ru': strProp('Полное описание изменений на русском'),
+            'readme_en': strProp(
+                'Описание, функционал, установка и запуск на английском'),
+            'readme_ru':
+                strProp('Описание, функционал, установка и запуск на русском'),
+          },
+          [
+            'program',
+            'version',
+            'platform',
+            'architecture',
+            'artifact_paths',
+            'change_en',
+            'change_ru',
+            'readme_en',
+            'readme_ru',
           ]),
       fn(
           'get_task_status',
@@ -5555,8 +6297,13 @@ ${localToolsCompactSummary(maxItems: 80)}
         'to'
       ]),
       fn(
+          'wsl_list',
+          'Показать установленные в Windows дистрибутивы WSL, их состояние и версию перед открытием Linux-сессии.',
+          {},
+          []),
+      fn(
           'terminal_open',
-          'Открыть общую интерактивную PTY-сессию, видимую пользователю во вкладке «Консоль». Используй для SSH, telnet, msfconsole, REPL и долгоживущих оболочек.',
+          'Открыть общую интерактивную PTY-сессию, видимую пользователю во вкладке «Консоль». Поддерживает native и WSL backend; используй для SSH, telnet, msfconsole, REPL и долгоживущих оболочек.',
           {
             'session_id': strProp(
                 'Стабильный идентификатор, например ssh-prod или msf-lab; если пусто, будет создан автоматически'),
@@ -5564,7 +6311,12 @@ ${localToolsCompactSummary(maxItems: 80)}
             'cwd': strProp(
                 'Рабочая папка внутри проекта или разрешённый абсолютный путь'),
             'shell': strProp(
-                'Необязательный исполняемый файл оболочки; по умолчанию cmd.exe или /bin/bash'),
+                'Для native — исполняемый файл оболочки; для WSL — необязательная Linux-оболочка, например /bin/bash'),
+            'backend': strProp('native | wsl'),
+            'wsl_distribution':
+                strProp('Имя установленного дистрибутива из wsl_list'),
+            'wsl_cwd': strProp(
+                'Необязательный Linux-путь; Windows-путь cwd иначе преобразуется в /mnt/<drive>/...'),
             'initial_command': strProp(
                 'Необязательная первая команда, например ssh -tt user@host или msfconsole')
           },
@@ -5614,8 +6366,16 @@ ${localToolsCompactSummary(maxItems: 80)}
             'command'
           ]),
       fn(
+          'inspect_project_build',
+          'Определить экосистему проекта, штатные команды проверки, сборки и запуска, а также недостающие исполняемые файлы. Используй до первой сборки и после существенного изменения структуры.',
+          {
+            'cwd': strProp(
+                'Необязательная рабочая папка внутри проекта, например . или app')
+          },
+          []),
+      fn(
           'run_tests',
-          'Автоматически проверить, собрать или запустить проект. Для C++ сам найдёт исходники и при необходимости создаст/исправит CMakeLists.txt.',
+          'Автоматически определить штатную проверку, тест или сборку проекта и выполнить её. Поддерживает Flutter/Dart, Node.js, Python, Rust, Go, .NET, Java, CMake, C и C++.',
           {
             'command': strProp(
                 'Необязательная команда. Если пусто, агент выберет сам'),
@@ -5650,7 +6410,55 @@ ${localToolsCompactSummary(maxItems: 80)}
           'Найти релевантные факты, решения, процедуры и события во встроенной локальной памяти.',
           {
             'query': strProp('Что нужно вспомнить'),
-            'max_results': strProp('Максимальное количество результатов')
+            'max_results': strProp('Максимальное количество результатов'),
+            'scope': strProp(
+                'current_and_global | current_project | other_projects | all_projects | global_only')
+          },
+          [
+            'query'
+          ]),
+      fn(
+          'context_search',
+          'Найти фрагменты полного журнала текущего проекта, прошлых задач других проектов, общей памяти и пользовательской литературы. Результат содержит SOURCE_ID для последующего точного чтения.',
+          {
+            'query': strProp('Ошибка, задача, команда или тема для поиска'),
+            'scope': strProp(
+                'current_project | other_projects | all_projects | global_memory | literature | all'),
+            'max_results': strProp('Максимальное количество фрагментов')
+          },
+          [
+            'query'
+          ]),
+      fn(
+          'context_read',
+          'Прочитать полный источник, найденный через context_search, по стабильному SOURCE_ID. Поддерживает последовательное чтение частями.',
+          {
+            'source_id': strProp('SOURCE_ID из результата context_search'),
+            'offset': strProp('Смещение в символах, по умолчанию 0'),
+            'max_chars': strProp('Максимум символов, по умолчанию 24000')
+          },
+          [
+            'source_id'
+          ]),
+      fn(
+          'context_reindex',
+          'Принудительно обновить индекс журналов всех проектов, общей памяти и папки documents.',
+          {
+            'force':
+                boolProp('Полностью перечитать даже неизменённые источники')
+          },
+          []),
+      fn(
+          'literature_list',
+          'Показать материалы, которые пользователь положил в общую папку documents рядом с программой.',
+          {'max_items': strProp('Максимальное количество файлов')},
+          []),
+      fn(
+          'literature_search',
+          'Искать только в общей пользовательской библиотеке documents: документации, книгах, стандартах, примерах кода и офисных документах.',
+          {
+            'query': strProp('Тема, API, ошибка или фрагмент текста'),
+            'max_results': strProp('Максимальное количество фрагментов')
           },
           [
             'query'
@@ -5718,7 +6526,9 @@ ${localToolsCompactSummary(maxItems: 80)}
     final reason = emptyResponse
         ? 'Твой предыдущий ответ был пустым: в content нет видимого текста и нет tool-call.'
         : 'Ты дал видимый ответ, но задача ещё не подтверждена программой как выполненная. Причина: $incompleteReason.';
+    final guided = guidedExecutionEnabled ? guidedExecutionPromptBlock() : '';
     return '''$reason
+$guided
 Не выводи только план и не используй reasoning_content вместо content.
 Текущая исходная задача пользователя:
 ${truncateMiddle(activeTaskText, 12000)}
@@ -5816,17 +6626,22 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
       request.headers
           .set(HttpHeaders.authorizationHeader, 'Bearer ${profile.apiKey}');
     final modelMessages = buildMessagesForModel();
-    final maxOutputTokensToSend = calculateMaxOutputTokens(modelMessages);
+    final toolDefinitions = buildRoutedOpenAiToolDefinitions();
+    final toolSchemaTokens = estimateTextTokens(jsonEncode(toolDefinitions));
+    final maxOutputTokensToSend = calculateMaxOutputTokens(
+      modelMessages,
+      extraPromptTokens: toolSchemaTokens,
+    );
     final body = {
       'model': profile.model,
       'temperature': 0.1,
       'stream': profile.streamResponses,
       'max_tokens': maxOutputTokensToSend,
       'messages': modelMessages,
-      'tools': buildOpenAiToolDefinitions(),
+      'tools': toolDefinitions,
       'tool_choice': 'auto',
     };
-    log('CONTEXT BUDGET: profileContext=$maxContextTokens runtimeContext=${runtimeCtx ?? 'unknown'} promptTokens≈${estimateMessagesTokens(modelMessages)} requestedMaxOutput=${profile.maxOutputTokens} sentMaxTokens=$maxOutputTokensToSend messages=${modelMessages.length}');
+    log('CONTEXT BUDGET: profileContext=$maxContextTokens runtimeContext=${runtimeCtx ?? 'unknown'} promptTokens≈${estimateMessagesTokens(modelMessages)} toolSchemaTokens≈$toolSchemaTokens requestedMaxOutput=${profile.maxOutputTokens} sentMaxTokens=$maxOutputTokensToSend messages=${modelMessages.length} tools=${toolDefinitions.length} strictGuidance=${currentModelNeedsStrictGuidance()}');
     final encodedBody = jsonEncode(body);
     log('HTTP REQUEST ${uri.toString()}: ${truncateMiddle(encodedBody, 18000)}');
     request.write(encodedBody);
@@ -6225,8 +7040,12 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
     return total;
   }
 
-  int calculateMaxOutputTokens(List<Map<String, String>> modelMessages) {
-    final promptTokens = estimateMessagesTokens(modelMessages);
+  int calculateMaxOutputTokens(
+    List<Map<String, String>> modelMessages, {
+    int extraPromptTokens = 0,
+  }) {
+    final promptTokens =
+        estimateMessagesTokens(modelMessages) + extraPromptTokens;
     final remainingByContext = maxContextTokens - promptTokens - 512;
     final requestedOutput = maxOutputTokens < 512 ? 512 : maxOutputTokens;
     if (remainingByContext <= 512) return 512;
@@ -6269,9 +7088,11 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
 
   String activeDomainGuidance() {
     final intent = activeTaskIntent ??
-        taskIntentAnalyzer.analyze(
+        analyzeTaskIntent(
             activeTaskText.trim().isEmpty ? 'general task' : activeTaskText);
     final buffer = StringBuffer()
+      ..writeln('Режим задач проекта: '
+          '${currentProjectConfiguration.taskMode.label}.')
       ..writeln('Активные домены: '
           '${intent.domains.map((domain) => domain.name).join(', ')}.')
       ..writeln('Критерии завершения:')
@@ -6342,32 +7163,104 @@ ${const JsonEncoder.withIndent('  ').convert(taskStateJson())}
 - На каждом шаге выбирай действие по текущему препятствию. Если результат опроверг план, сформулируй новую гипотезу; не повторяй тот же вызов без изменения аргументов, состояния или доказательств.
 - Уточняй одним коротким нейтральным вопросом только факт, без которого невозможно безопасно продолжить. Всё остальное выясняй инструментами.
 - Успешные подзадачи переиспользуй, а не выполняй заново.''');
+    buffer
+      ..writeln()
+      ..writeln(promptLibrary.render(
+        mode: currentProjectConfiguration.taskMode,
+        taskType: intent.primaryDomain.name,
+        expectedResult: activeTaskGoal?.expectedResult ??
+            intent.completionCriteria.join(' '),
+        program: currentProject?.name ?? 'program',
+        version: appVersion,
+      ));
     return buffer.toString().trimRight();
   }
 
   List<Map<String, String>> buildMessagesForModel() {
     final project = currentProject;
+    final strictGuidance = currentModelNeedsStrictGuidance();
     final activeTaskBlock = activeTaskText.trim().isEmpty
         ? 'Активная задача ещё не задана.'
         : 'Активная исходная задача пользователя, которую нельзя терять при сжатии контекста:\n${truncateMiddle(activeTaskText, 16000)}';
     final stateBlock =
         const JsonEncoder.withIndent('  ').convert(taskStateJson());
     final environmentBlock = hostEnvironmentSummary();
-    final localToolsBlock = localToolsCompactSummary(maxItems: 12);
+    final localToolsBlock =
+        localToolsCompactSummary(maxItems: strictGuidance ? 8 : 12);
     final cppDependencyBlock =
         currentCppDependencyAvailability?.toPromptBlock() ?? '';
-    final projectStructureBlock = projectStructureCompactSummary(maxItems: 140);
+    final projectStructureBlock =
+        projectStructureCompactSummary(maxItems: strictGuidance ? 40 : 140);
     final automationBlock = automationSummaryForPrompt();
     final intentBlock = const JsonEncoder.withIndent('  ')
         .convert(activeTaskIntent?.toJson() ?? const <String, Object?>{});
-    final attemptMemoryBlock = taskEvidenceLedger.decisionContext(maxItems: 24);
+    final attemptMemoryBlock =
+        taskEvidenceLedger.decisionContext(maxItems: strictGuidance ? 10 : 24);
     final domainGuidanceBlock = activeDomainGuidance();
-    final pluginToolNames = plugins
-        .where((plugin) => plugin.enabled)
-        .map((plugin) => plugin.toolName)
-        .join(', ');
-    final system =
-        '''Ты универсальный локальный агент выполнения задач внутри Flutter-оболочки. Работай на уровне сильного инженерного агента: сохраняй точную цель пользователя, выбирай инструменты по фактической задаче, выполняй работу до проверяемого результата и меняй стратегию по новым данным.
+    final guidedStepBlock = guidedExecutionPromptBlock();
+    final buildRecipeBlock = activeBuildRecipe?.toPromptBlock() ??
+        '[PROJECT_BUILD_RECIPE]\n(not detected)\n[/PROJECT_BUILD_RECIPE]';
+    final relevantMemoryBlock = truncateMiddle(
+      activeRelevantMemoryContext,
+      strictGuidance ? 1800 : 18000,
+    );
+    final archiveContextBlock = truncateMiddle(
+      activeArchiveContext,
+      strictGuidance ? 2200 : 14000,
+    );
+    final availableToolNames = routedToolNamesPrompt();
+    final canonicalTaskBlock = activeTaskInvariant.trim().isEmpty
+        ? '[CANONICAL_TASK_STATE]\nnot_initialized\n[/CANONICAL_TASK_STATE]'
+        : activeTaskInvariant;
+    final compactSystem =
+        '''Ты исполнитель задач внутри AI Agent. Программа хранит цель, доказательства и историю; выполни только указанный ближайший шаг, изучи tool-result и продолжай до проверенного результата.
+Текущий проект: ${project?.path ?? ''}
+
+Неизменяемая цель и состояние подзадач:
+$canonicalTaskBlock
+
+Текущий запрос пользователя:
+${truncateMiddle(activeTaskBlock, 1600)}
+
+Маршрут задачи:
+${truncateMiddle(intentBlock, 1200)}
+
+$guidedStepBlock
+
+Штатный способ сборки:
+${truncateMiddle(buildRecipeBlock, 1400)}
+
+Карта проекта:
+${truncateMiddle(projectStructureBlock, 1400)}
+
+Найденная проверенная память:
+$relevantMemoryBlock
+
+Фрагменты полных контекстов и библиотеки `${documentsRoot.path}`:
+$archiveContextBlock
+
+Последние попытки:
+${truncateMiddle(attemptMemoryBlock, 1200)}
+
+Счётчики состояния:
+${truncateMiddle(stateBlock, 900)}
+
+Права: ${permissionMode.label}; интернет=${allowInternetUse ? 'да' : 'нет'}; поиск устройства=${allowComputerSearch ? 'да' : 'нет'}; файлы устройства=${allowDeviceFileAccess ? 'да' : 'нет'}.
+Доступные tools текущего шага: $availableToolNames.
+
+Правила:
+1. Исходный запрос и каноническая цель обязательны; внутренний маршрут их не заменяет.
+2. Выполни одно ближайшее проверяемое действие. Не отвечай только планом.
+3. Не повторяй команду с теми же аргументами. После ошибки читай фактический stdout/stderr и меняй гипотезу.
+4. Для недостающей подсказки используй context_search; полный найденный источник читай через context_read по SOURCE_ID.
+5. Для кода сначала учитывай существующие файлы, затем записывай полный рабочий материал без TODO, заглушек и пропусков.
+6. Ошибка окружения не разрешает переписывать исходники. Ошибка компилятора разрешает минимальную правку только после read_file указанного файла.
+7. Успех требует tool-result проверки. Диагностическая команда не заменяет сборку или тест.
+8. Финальный ответ перечисляет выполненное, артефакты и проверку. Если безопасное продолжение невозможно после разных попыток, задай один короткий вопрос.
+''';
+    final system = strictGuidance
+        ? compactSystem
+        : '''Ты универсальный локальный агент выполнения задач внутри Flutter-оболочки. Работай на уровне сильного инженерного агента: сохраняй точную цель пользователя, выбирай инструменты по фактической задаче, выполняй работу до проверяемого результата и меняй стратегию по новым данным.
 Текущий проект: ${project?.path ?? ''}
 Среда выполнения агента:
 $environmentBlock
@@ -6384,10 +7277,22 @@ $projectStructureBlock
 ${solutionMemoryCompactSummary(maxItems: 30)}
 
 Релевантные записи прошлых задач, включая успешные и неудачные попытки:
-$activeRelevantMemoryContext
+$relevantMemoryBlock
 - Для точного поиска по локальной типизированной памяти используй memory_recall.
 - Не сохраняй догадку как проверенную процедуру. promote_golden_path допустим только после реального успешного теста и с перечислением хотя бы одного исключённого нерабочего подхода.
 - memory_remember сохраняет происхождение и уверенность, а секреты перед записью маскируются.
+
+Полнотекстовый архив прошлых диалогов, результатов команд и пользовательской литературы:
+$archiveContextBlock
+- Для дополнительного поиска используй context_search. Ищи в scope=other_projects, когда текущие попытки не помогают, и scope=literature для документации пользователя.
+- Результат поиска возвращает SOURCE_ID. Полный исходный журнал или документ читай через context_read, а не угадывай пропущенный фрагмент.
+- Общая библиотека пользователя находится в `${documentsRoot.path}`. Её список доступен через literature_list, поиск — через literature_search.
+
+Определённый программой способ проверки и сборки проекта:
+$buildRecipeBlock
+
+Один ближайший проверяемый шаг для текущего состояния:
+$guidedStepBlock
 
 Многопрофильный разбор текущей задачи (это подсказка маршрутизации, а не замена исходного запроса):
 $intentBlock
@@ -6440,6 +7345,10 @@ $domainGuidanceBlock
 
 $activeTaskBlock
 
+Неизменяемое состояние цели и подзадач. Этот блок загружен с диска и должен
+использоваться дословно после сжатия контекста:
+$canonicalTaskBlock
+
 Последнее выбранное или прочитанное расположение устройства: ${lastDeviceDirectoryPath.trim().isEmpty ? '(не задано)' : lastDeviceDirectoryPath}.
 Если пользователь в следующем сообщении пишет «эту папку», «каждую игру», «упакуй всё», «прочитай выбранное расположение» без нового пути — используй это расположение или выбранные SELECTED_LOCATION из текущей задачи.
 
@@ -6454,7 +7363,7 @@ $stateBlock
 Режим создания проекта: ${creationMode.label}.
 Проверка качества результата: ${qualityCheckEnabled ? 'включена' : 'отключена'}.
 Лимиты профиля: context window=$maxContextTokens токенов; max output=$maxOutputTokens токенов. Это разные настройки.
-Доступные tools: project_map, list_files, list_local_tools, rebuild_device_index, search_device_index, recognize_image_text, run_custom_tool, duckduckgo_search, web_fetch, web_deep_fetch, web_research, filesystem_search, list_device_directory, read_device_text_file, read_device_folder_texts, search_device_documents, read_document_structure, create_document_from_text, edit_document_text, archive_device_children, knowledge_search, knowledge_store, memory_recall, memory_remember, memory_conflicts, promote_golden_path, plugin_list, email_list_accounts, email_draft_smtp, download_to_project, set_task_plan, get_task_status, download_to_tools, extract_zip_to_tools, remember_solution, read_file, write_file, create_file, append_file, replace_text, make_dir, delete_path, copy_path, move_path, terminal_open, terminal_write, terminal_read, terminal_list, terminal_close, run_command, run_tests, inspect_zip, extract_zip, read_docx_text, read_xlsx_text${pluginToolNames.isEmpty ? '' : ', $pluginToolNames'}.
+Доступные tools для текущего шага: $availableToolNames.
 
 Правила полноценного агента:
 1. Сохраняй исходную цель и все последующие поправки пользователя; внутренний классификатор не может их заменить.
@@ -6472,11 +7381,16 @@ $stateBlock
       {'role': 'system', 'content': system}
     ];
     final reserveOutputTokens = maxOutputTokens.clamp(1024, 32768).toInt();
+    final toolSchemaReserveTokens =
+        estimateTextTokens(jsonEncode(buildRoutedOpenAiToolDefinitions()));
     final minPromptBudgetTokens =
-        maxContextTokens < 2048 ? maxContextTokens : 2048;
-    final promptBudgetTokens = (maxContextTokens - reserveOutputTokens)
-        .clamp(minPromptBudgetTokens, maxContextTokens)
-        .toInt();
+        maxContextTokens < (strictGuidance ? 1024 : 2048)
+            ? maxContextTokens
+            : (strictGuidance ? 1024 : 2048);
+    final promptBudgetTokens =
+        (maxContextTokens - reserveOutputTokens - toolSchemaReserveTokens)
+            .clamp(minPromptBudgetTokens, maxContextTokens)
+            .toInt();
     final budgetChars = (promptBudgetTokens * 3.2).floor();
     var used = system.length;
     final selected = <ChatMessage>[];
@@ -6496,7 +7410,8 @@ $stateBlock
           message.content.startsWith('Ошибка контекста сервера')) continue;
       final content = compressHistoryContent(message.content);
       final cost = content.length + message.role.length + 24;
-      if (used + cost > budgetChars && selected.length >= 4) {
+      if (used + cost > budgetChars &&
+          (strictGuidance || selected.length >= 4)) {
         compressedHistory = true;
         break;
       }
@@ -6594,8 +7509,8 @@ $stateBlock
       const reason = 'Три некорректных или запрещённых вызова инструмента '
           'подряд. Запуск остановлен вместо бесконечного повтора; продолжение '
           'возможно с исправленным планом.';
-      requestSafetyStop(reason);
-      result += '\nAGENT_STALLED_STOP: $reason';
+      requestUserGuidance(reason);
+      result += '\nUSER_GUIDANCE_REQUIRED: $reason';
     }
     lastToolName = call.name;
     lastToolResultText = result;
@@ -6699,6 +7614,7 @@ $stateBlock
       final markdownCall = ToolCall(
           name: 'write_file',
           args: {'path': file.path, 'content': file.content});
+      final beforeMarkdownMutations = taskFileMutations;
       final allowed =
           await checkToolPermission(markdownCall, markdownFile: true);
       final result = allowed
@@ -6709,6 +7625,12 @@ $stateBlock
       final markdownTool = ToolCall(
           name: 'write_file',
           args: {'path': file.path, 'content': '[markdown block]'});
+      await observeTaskToolResult(
+        markdownTool,
+        result,
+        successful: allowed && toolResultLooksSuccessful('write_file', result),
+        fileMutations: taskFileMutations - beforeMarkdownMutations,
+      );
       recordActionAttempt(markdownTool, result);
       toolResultBuffer.writeln(
           'Tool result for markdown_file ${file.path}\nok: ${allowed ? 'true' : 'false'}\n$result\n');
@@ -6749,7 +7671,9 @@ $stateBlock
       didAction = true;
       recordActionAttempt(call, result);
       final contextResult = toolOutputCompactionEnabled
-          ? const ToolOutputCompactor().compact(call.name, result)
+          ? ToolOutputCompactor(
+                  maxChars: currentModelNeedsStrictGuidance() ? 8000 : 24000)
+              .compact(call.name, result)
           : result;
       toolResultBuffer
           .writeln('Tool result for ${call.name}\n$contextResult\n');
@@ -7218,7 +8142,13 @@ $stateBlock
       'list_files',
       'read_file',
       'list_local_tools',
+      'inspect_project_build',
       'get_task_status',
+      'get_task_goal',
+      'define_task_goal',
+      'add_task_subtask',
+      'update_task_subtask',
+      'record_task_context',
       'duckduckgo_search',
       'web_fetch',
       'web_deep_fetch',
@@ -7238,9 +8168,15 @@ $stateBlock
       'recognize_image_text',
       'memory_recall',
       'memory_conflicts',
+      'context_search',
+      'context_read',
+      'context_reindex',
+      'literature_list',
+      'literature_search',
       'plugin_list',
       'terminal_read',
       'terminal_list',
+      'wsl_list',
     }.contains(name);
   }
 
@@ -7274,6 +8210,7 @@ $stateBlock
       'terminal_open',
       'terminal_write',
       'terminal_close',
+      'package_project_release',
     }.contains(name);
   }
 
@@ -7468,8 +8405,8 @@ $stateBlock
       if (consecutiveCircuitBreakerBlocks >= 3) {
         const reason = 'Три действия подряд нарушили обязательный повтор '
             'исходной команды сборки после изменения файлов.';
-        requestSafetyStop(reason);
-        blocked += '\nAGENT_STALLED_STOP: $reason';
+        requestUserGuidance(reason);
+        blocked += '\nUSER_GUIDANCE_REQUIRED: $reason';
         lastToolResultText = blocked;
       }
       taskEvidenceLedger.recordTool(
@@ -7510,8 +8447,8 @@ $stateBlock
           const reason = 'Три действия подряд были заблокированы без '
               'прогресса. Запуск остановлен, чтобы не расходовать итерации '
               'на цикл.';
-          requestSafetyStop(reason);
-          effectiveBlocked += '\nAGENT_STALLED_STOP: $reason';
+          requestUserGuidance(reason);
+          effectiveBlocked += '\nUSER_GUIDANCE_REQUIRED: $reason';
         }
         lastToolName = call.name;
         lastToolResultText = effectiveBlocked;
@@ -7549,8 +8486,8 @@ $stateBlock
           const reason = 'Три вызова инструментов были заблокированы без '
               'измеримого прогресса. Текущий запуск остановлен; продолжение '
               'возможно после изменения стратегии.';
-          requestSafetyStop(reason);
-          blocked += '\nAGENT_STALLED_STOP: $reason';
+          requestUserGuidance(reason);
+          blocked += '\nUSER_GUIDANCE_REQUIRED: $reason';
         }
         lastToolName = call.name;
         lastToolResultText = blocked;
@@ -7663,6 +8600,12 @@ $stateBlock
       }
       lastToolName = call.name;
       lastToolResultText = result;
+      await observeTaskToolResult(
+        call,
+        result,
+        successful: successful,
+        fileMutations: taskFileMutations - beforeFileMutations,
+      );
       logAction('tool_finish', {
         'tool': call.name,
         'successful': successful,
@@ -7692,11 +8635,82 @@ $stateBlock
       }
       lastToolName = call.name;
       lastToolResultText = failed;
+      await observeTaskToolResult(
+        call,
+        failed,
+        successful: false,
+        fileMutations: taskFileMutations - beforeFileMutations,
+      );
       await updateTaskCheckpoint(
         AgentRunStatus.waitingForModel,
         lastError: error.toString(),
       );
       return failed;
+    }
+  }
+
+  Future<void> observeTaskToolResult(
+    ToolCall call,
+    String result, {
+    required bool successful,
+    required int fileMutations,
+  }) async {
+    if (fileMutations > 0 &&
+        (activeTaskIntent?.hasDomain(TaskDomain.software) ?? false)) {
+      activeBuildRecipe = null;
+    }
+    final state = activeTaskGoal;
+    if (state == null) return;
+    activeTaskGoal = state.observeTool(
+      toolName: call.name,
+      args: call.args,
+      result: result,
+      successful: successful,
+      fileMutations: fileMutations,
+      lastExitCode: const {'run_command', 'run_tests'}.contains(call.name)
+          ? lastCommandExitCode
+          : null,
+    );
+    await persistTaskExecutionState();
+
+    if (!successful ||
+        lastCommandExitCode != 0 ||
+        !const {'run_command', 'run_tests'}.contains(call.name)) {
+      return;
+    }
+    var command = call.args['command']?.toString().trim() ?? '';
+    if (command.isEmpty) command = lastCommandText.trim();
+    if (command.isEmpty ||
+        (!isCompilerOrBuildCommand(command) &&
+            !VerificationCommandClassifier.isVerificationCommand(command))) {
+      return;
+    }
+    final key = '${Platform.operatingSystem}:$hostArchSegment:'
+        '${normalizeBuildCommandForComparison(command)}';
+    if (!globallyRememberedCommands.add(key)) return;
+    try {
+      await localMemory?.remember(
+        type: AgentMemoryType.procedure,
+        key: key,
+        title: 'Проверенная команда сборки или тестирования',
+        content: 'Команда: $command\n'
+            'Рабочая папка: ${call.args['cwd'] ?? '.'}\n'
+            'Результат: ${truncateMiddle(result, 5000)}',
+        scope: 'global',
+        source: 'task:${state.taskId}',
+        provenance: 'agent-tool-grounded',
+        confidence: 0.95,
+        verified: true,
+        verification: truncateMiddle(result, 3000),
+        tags: [
+          'command',
+          'verified',
+          Platform.operatingSystem,
+          hostArchSegment,
+        ],
+      );
+    } catch (error) {
+      log('GLOBAL COMMAND MEMORY ERROR: $error');
     }
   }
 
@@ -7873,6 +8887,22 @@ $fallback
       case 'list_local_tools':
         return localToolsCompactSummary(
             purpose: call.args['purpose']?.toString() ?? 'all', maxItems: 80);
+      case 'inspect_project_build':
+        return inspectProjectBuild(
+          relativeWorkingDirectory: call.args['cwd']?.toString() ?? '',
+        );
+      case 'define_task_goal':
+        return defineTaskGoal(call.args);
+      case 'add_task_subtask':
+        return addTaskSubtask(call.args);
+      case 'update_task_subtask':
+        return updateTaskSubtask(call.args);
+      case 'record_task_context':
+        return recordTaskContext(call.args);
+      case 'get_task_goal':
+        return activeTaskInvariant.trim().isEmpty
+            ? 'TASK_GOAL_NOT_INITIALIZED'
+            : activeTaskInvariant;
       case 'set_task_plan':
         {
           final plan = call.args['plan']?.toString() ?? '';
@@ -7888,6 +8918,8 @@ $fallback
         }
       case 'get_task_status':
         return currentTaskStatusReport();
+      case 'package_project_release':
+        return packageProjectRelease(call.args);
       case 'rebuild_device_index':
         return await rebuildDeviceIndex();
       case 'search_device_index':
@@ -8014,6 +9046,37 @@ $fallback
           call.args['query']?.toString() ?? '',
           maxResults:
               int.tryParse(call.args['max_results']?.toString() ?? '') ?? 8,
+          scope: call.args['scope']?.toString() ?? 'current_and_global',
+        );
+      case 'context_search':
+        return searchContextArchive(
+          call.args['query']?.toString() ?? '',
+          scope: call.args['scope']?.toString() ?? 'all',
+          maxResults:
+              int.tryParse(call.args['max_results']?.toString() ?? '') ?? 8,
+        );
+      case 'context_read':
+        return readContextArchiveSource(
+          call.args['source_id']?.toString() ?? '',
+          offset: int.tryParse(call.args['offset']?.toString() ?? '') ?? 0,
+          maxChars:
+              int.tryParse(call.args['max_chars']?.toString() ?? '') ?? 24000,
+        );
+      case 'context_reindex':
+        return rebuildContextArchive(
+          force: parseBoolString(call.args['force']?.toString() ?? ''),
+        );
+      case 'literature_list':
+        return literatureList(
+          maxItems:
+              int.tryParse(call.args['max_items']?.toString() ?? '') ?? 200,
+        );
+      case 'literature_search':
+        return searchContextArchive(
+          call.args['query']?.toString() ?? '',
+          scope: ContextArchiveScope.literature.wireName,
+          maxResults:
+              int.tryParse(call.args['max_results']?.toString() ?? '') ?? 8,
         );
       case 'memory_remember':
         return memoryRemember(
@@ -8091,6 +9154,16 @@ $fallback
         return copyRelativePath(call.args['from']?.toString() ?? '',
             call.args['to']?.toString() ?? '',
             move: true);
+      case 'wsl_list':
+        {
+          if (!Platform.isWindows) {
+            return 'WSL_NOT_AVAILABLE: host=${Platform.operatingSystem}';
+          }
+          final distributions = await terminalService.listWslDistributions();
+          if (distributions.isEmpty) return 'WSL_DISTRIBUTIONS: none';
+          return 'WSL_DISTRIBUTIONS: ${distributions.length}\n'
+              '${distributions.map((item) => '- ${item.name}; state=${item.state.isEmpty ? 'unknown' : item.state}; version=${item.version == 0 ? 'unknown' : item.version}; default=${item.isDefault}').join('\n')}';
+        }
       case 'terminal_open':
         {
           final snapshot = await terminalService.open(
@@ -8099,6 +9172,9 @@ $fallback
             cwd: call.args['cwd']?.toString() ?? '.',
             shell: call.args['shell']?.toString() ?? '',
             environment: buildToolAwareEnvironment(),
+            backend: call.args['backend']?.toString() ?? 'native',
+            wslDistribution: call.args['wsl_distribution']?.toString() ?? '',
+            wslCwd: call.args['wsl_cwd']?.toString() ?? '',
           );
           final initial = call.args['initial_command']?.toString().trim() ?? '';
           var initialResult = '';
@@ -8114,6 +9190,8 @@ SESSION_ID: ${snapshot.id}
 NAME: ${snapshot.name}
 CWD: ${snapshot.cwd}
 SHELL: ${snapshot.shell}
+BACKEND: ${snapshot.backend}
+WSL_DISTRIBUTION: ${snapshot.distribution.isEmpty ? 'n/a' : snapshot.distribution}
 RUNNING: ${snapshot.running}
 PID: ${snapshot.pid ?? 'n/a'}
 ${initialResult.isEmpty ? '' : '\n$initialResult'}''';
@@ -9795,29 +10873,72 @@ add_executable(agent_app \${AGENT_SOURCES})$includeBlock
     return false;
   }
 
+  ProjectBuildRecipe? detectProjectBuildRecipe(
+      {String relativeWorkingDirectory = ''}) {
+    final project = currentProject;
+    if (project == null) return null;
+    final relative = normalizeRelativeDirectory(relativeWorkingDirectory);
+    final root = relative.isEmpty
+        ? Directory(project.path)
+        : Directory(resolveProjectPath(project.path, relative));
+    if (!root.existsSync()) return null;
+    return projectBuildRecipeDetector.detect(
+      root,
+      executables: {
+        'flutter': toolCommand(['flutter.bat', 'flutter.exe', 'flutter']),
+        'dart': toolCommand(['dart.bat', 'dart.exe', 'dart']),
+        'npm': toolCommand(['npm.cmd', 'npm.exe', 'npm']),
+        'node': toolCommand(['node.exe', 'node']),
+        'python': Platform.isWindows
+            ? toolCommand(['python.exe', 'python'])
+            : toolCommand(['python3', 'python']),
+        'cmake': toolCommand(['cmake.exe', 'cmake']),
+        'cargo': toolCommand(['cargo.exe', 'cargo']),
+        'go': toolCommand(['go.exe', 'go']),
+        'dotnet': toolCommand(['dotnet.exe', 'dotnet']),
+        'mvn': toolCommand(['mvn.cmd', 'mvn.exe', 'mvn']),
+        'gradle': toolCommand(['gradle.bat', 'gradle.exe', 'gradle']),
+        'meson': toolCommand(['meson.exe', 'meson']),
+        'ninja': toolCommand(['ninja.exe', 'ninja']),
+        'make': toolCommand(['make.exe', 'mingw32-make.exe', 'make']),
+        'zig': toolCommand(['zig.exe', 'zig']),
+        'swift': toolCommand(['swift.exe', 'swift']),
+        'bundle': toolCommand(['bundle.bat', 'bundle']),
+        'composer': toolCommand(['composer.bat', 'composer']),
+        'g++': toolCommand(['g++.exe', 'g++', 'clang++.exe', 'clang++']),
+        'gcc': toolCommand(['gcc.exe', 'gcc', 'clang.exe', 'clang']),
+        'javac': toolCommand(['javac.exe', 'javac']),
+      },
+      isExecutableAvailable: commandLikelyAvailable,
+    );
+  }
+
+  String inspectProjectBuild({String relativeWorkingDirectory = ''}) {
+    final recipe = detectProjectBuildRecipe(
+        relativeWorkingDirectory: relativeWorkingDirectory);
+    if (recipe == null) return 'PROJECT_BUILD_RECIPE_NOT_AVAILABLE';
+    activeBuildRecipe = recipe;
+    return recipe.toPromptBlock();
+  }
+
   String defaultTestCommand({String relativeWorkingDirectory = ''}) {
     final root = currentProject;
     if (root == null) return '';
     final workRel = normalizeRelativeDirectory(relativeWorkingDirectory);
-    final workDir =
-        workRel.isEmpty ? root.path : resolveProjectPath(root.path, workRel);
+    final recipe = detectProjectBuildRecipe(relativeWorkingDirectory: workRel);
+    if (recipe != null &&
+        recipe.ecosystem != ProjectEcosystem.cpp &&
+        recipe.verificationCommands.isNotEmpty) {
+      activeBuildRecipe = recipe;
+      final commands = <String>[
+        ...recipe.verificationCommands,
+        if (recipe.buildCommands.isNotEmpty &&
+            recipe.ecosystem != ProjectEcosystem.cmake)
+          recipe.buildCommands.first,
+      ];
+      return commands.toSet().join(' && ');
+    }
     final python = Platform.isWindows ? 'python' : 'python3';
-    final flutter = toolCommand(['flutter.bat', 'flutter.exe', 'flutter']);
-    final npm = toolCommand(['npm.cmd', 'npm.exe', 'npm']);
-    final cargo = toolCommand(['cargo.exe', 'cargo']);
-    final cmake = toolCommand(['cmake.exe', 'cmake']);
-    if (File(pathJoin(workDir, 'pubspec.yaml')).existsSync())
-      return '$flutter test';
-    if (File(pathJoin(workDir, 'CMakeLists.txt')).existsSync())
-      return '$cmake -S . -B build && $cmake --build build';
-    if (File(pathJoin(workDir, 'package.json')).existsSync())
-      return '$npm test';
-    if (File(pathJoin(workDir, 'Cargo.toml')).existsSync())
-      return '$cargo test';
-    if (File(pathJoin(workDir, 'pyproject.toml')).existsSync() ||
-        Directory(pathJoin(workDir, 'test')).existsSync() ||
-        Directory(pathJoin(workDir, 'tests')).existsSync())
-      return '$python -m pytest';
     final py = primarySourceFile(['.py'],
         preferredNames: ['main.py'], baseRelativeDirectory: workRel);
     if (py != null) return '$python ${quoteShellArg(py)}';
@@ -10390,6 +11511,258 @@ $stack
     return resolveProjectPath(project.path, value);
   }
 
+  Future<String> defineTaskGoal(Map<String, dynamic> args) async {
+    final state = activeTaskGoal;
+    if (state == null) return 'TASK_GOAL_NOT_INITIALIZED';
+    final expectedResult = args['expected_result']?.toString().trim() ?? '';
+    final rawSubtasks = args['subtasks'];
+    if (expectedResult.isEmpty || rawSubtasks is! List) {
+      return 'TASK_GOAL_INVALID: expected_result and subtasks are required';
+    }
+    final nodes = <TaskNode>[];
+    final usedIds = <String>{};
+    for (final raw in rawSubtasks.whereType<Map>().take(60)) {
+      final item = raw.map((key, value) => MapEntry(key.toString(), value));
+      final title = item['title']?.toString().trim() ?? '';
+      final expected = item['expected_result']?.toString().trim() ?? '';
+      if (title.isEmpty || expected.isEmpty) continue;
+      var id = _taskNodeId(item['id']?.toString() ?? title);
+      while (!usedIds.add(id)) {
+        id = '${id}_${usedIds.length + 1}';
+      }
+      nodes.add(TaskNode(
+        id: id,
+        title: title,
+        expectedResult: expected,
+        kind: _taskNodeKind(item['kind']),
+        status: TaskNodeStatus.pending,
+        result: '',
+        evidence: const [],
+        artifacts: const [],
+        attempts: 0,
+        nextAction: '',
+        children: const [],
+        updatedAt: DateTime.now(),
+      ));
+    }
+    if (nodes.isEmpty) {
+      return 'TASK_GOAL_INVALID: at least one complete subtask is required';
+    }
+    activeTaskGoal = state.defineGoal(
+      expectedResult: expectedResult,
+      subtasks: nodes,
+    );
+    taskProgressRevision++;
+    await persistTaskExecutionState();
+    await updateTaskCheckpoint(
+      AgentRunStatus.running,
+      plan: nodes
+          .map((node) =>
+              '- ${node.id}: ${node.title}\n  expected: ${node.expectedResult}')
+          .join('\n'),
+    );
+    return 'TASK_GOAL_DEFINED\n$activeTaskInvariant';
+  }
+
+  Future<String> addTaskSubtask(Map<String, dynamic> args) async {
+    final state = activeTaskGoal;
+    if (state == null) return 'TASK_GOAL_NOT_INITIALIZED';
+    if (state.nodeCount >= 240) {
+      return 'TASK_SUBTASK_LIMIT_REACHED: simplify or complete existing steps';
+    }
+    final parentId = args['parent_id']?.toString().trim() ?? 'root';
+    if (parentId != 'root' && state.findNode(parentId) == null) {
+      return 'TASK_PARENT_NOT_FOUND: $parentId';
+    }
+    final title = args['title']?.toString().trim() ?? '';
+    final expected = args['expected_result']?.toString().trim() ?? '';
+    if (title.isEmpty || expected.isEmpty) {
+      return 'TASK_SUBTASK_INVALID: title and expected_result are required';
+    }
+    var id = _taskNodeId(args['id']?.toString() ?? title);
+    if (state.findNode(id) != null) {
+      id = '${id}_${DateTime.now().microsecondsSinceEpoch}';
+    }
+    activeTaskGoal = state.addSubtask(
+      parentId: parentId,
+      node: TaskNode(
+        id: id,
+        title: title,
+        expectedResult: expected,
+        kind: _taskNodeKind(args['kind']),
+        status: TaskNodeStatus.pending,
+        result: '',
+        evidence: const [],
+        artifacts: const [],
+        attempts: 0,
+        nextAction: '',
+        children: const [],
+        updatedAt: DateTime.now(),
+      ),
+    );
+    taskProgressRevision++;
+    await persistTaskExecutionState();
+    return 'TASK_SUBTASK_ADDED: id=$id; parent=$parentId\n$activeTaskInvariant';
+  }
+
+  Future<String> updateTaskSubtask(Map<String, dynamic> args) async {
+    final state = activeTaskGoal;
+    if (state == null) return 'TASK_GOAL_NOT_INITIALIZED';
+    final id = args['id']?.toString().trim() ?? '';
+    final node = state.findNode(id);
+    if (node == null) return 'TASK_SUBTASK_NOT_FOUND: $id';
+    final statusName = args['status']?.toString().trim() ?? '';
+    final nodeStatus = TaskNodeStatus.values.where((item) {
+      return item.name.toLowerCase() == statusName.toLowerCase();
+    }).firstOrNull;
+    if (nodeStatus == null) return 'TASK_SUBTASK_STATUS_INVALID: $statusName';
+    final result = args['result']?.toString().trim() ?? '';
+    final evidence = _toolStringList(args['evidence']);
+    final artifacts = _toolStringList(args['artifacts']);
+    if (nodeStatus == TaskNodeStatus.completed && result.isEmpty) {
+      return 'TASK_SUBTASK_COMPLETION_REJECTED: result is required';
+    }
+    if (nodeStatus == TaskNodeStatus.completed &&
+        node.children.any((child) => !child.isDone)) {
+      return 'TASK_SUBTASK_COMPLETION_REJECTED: complete or skip all child '
+          'subtasks first';
+    }
+    if (nodeStatus == TaskNodeStatus.completed &&
+        node.kind == TaskNodeKind.verification &&
+        evidence.isEmpty &&
+        !taskEvidenceLedger.hasPassingVerification) {
+      return 'TASK_SUBTASK_COMPLETION_REJECTED: verification evidence is required';
+    }
+    activeTaskGoal = state.updateSubtask(
+      nodeId: id,
+      nodeStatus: nodeStatus,
+      result: result,
+      evidence: evidence,
+      artifacts: artifacts,
+      nextAction: args['next_action']?.toString() ?? '',
+    );
+    taskProgressRevision++;
+    await persistTaskExecutionState();
+    return 'TASK_SUBTASK_UPDATED: id=$id; status=${nodeStatus.name}\n'
+        '$activeTaskInvariant';
+  }
+
+  Future<String> recordTaskContext(Map<String, dynamic> args) async {
+    final state = activeTaskGoal;
+    if (state == null) return 'TASK_GOAL_NOT_INITIALIZED';
+    final kind = args['kind']?.toString().trim() ?? 'context';
+    final key = args['key']?.toString().trim() ?? '';
+    final value = args['value']?.toString().trim() ?? '';
+    final source = args['source']?.toString().trim() ?? 'agent';
+    if (key.isEmpty || value.isEmpty) {
+      return 'TASK_CONTEXT_INVALID: key and value are required';
+    }
+    final requestedVerified = args['verified'] == true ||
+        parseBoolString(args['verified']?.toString() ?? 'false');
+    final grounded = source.toLowerCase() == 'user' ||
+        taskEvidenceLedger.hasPassingVerification ||
+        const {'file', 'document', 'attachment', 'selected_location'}
+            .contains(kind.toLowerCase());
+    final verified = requestedVerified && grounded;
+    activeTaskGoal = state.rememberFact(TaskContextFact(
+      kind: kind,
+      key: key,
+      value: value,
+      source: source,
+      verified: verified,
+      updatedAt: DateTime.now(),
+    ));
+    await persistTaskExecutionState();
+    final reusable = args['reusable_globally'] == true ||
+        parseBoolString(args['reusable_globally']?.toString() ?? 'false');
+    if (reusable && verified) {
+      try {
+        await localMemory?.remember(
+          type: kind.toLowerCase().contains('command')
+              ? AgentMemoryType.procedure
+              : AgentMemoryType.fact,
+          key: '$kind:$key',
+          title: key,
+          content: value,
+          scope: 'global',
+          source: source,
+          provenance: 'task-context-grounded',
+          confidence: 0.9,
+          verified: true,
+          verification: taskEvidenceLedger.groundedVerificationSummary,
+          tags: ['task-context', kind],
+        );
+      } catch (error) {
+        log('GLOBAL TASK CONTEXT MEMORY ERROR: $error');
+      }
+    }
+    return 'TASK_CONTEXT_RECORDED: $kind/$key; verified=$verified; '
+        'global=${reusable && verified}';
+  }
+
+  Future<String> packageProjectRelease(Map<String, dynamic> args) async {
+    final project = currentProject;
+    if (project == null) return 'No project';
+    if (lastCommandExitCode != 0 ||
+        !taskEvidenceLedger.hasPassingVerification) {
+      return 'PROJECT_RELEASE_REJECTED: a successful build/test/runtime '
+          'verification must be recorded before packaging';
+    }
+    final result = await projectReleasePackager.package(
+      projectRoot: Directory(project.path),
+      request: ProjectReleaseRequest(
+        programName: args['program']?.toString() ?? project.name,
+        version: args['version']?.toString() ?? '',
+        platform: args['platform']?.toString() ?? Platform.operatingSystem,
+        architecture: args['architecture']?.toString() ?? hostArchSegment,
+        artifactPaths: _toolStringList(args['artifact_paths']),
+        changeEnglish: args['change_en']?.toString() ?? '',
+        changeRussian: args['change_ru']?.toString() ?? '',
+        readmeEnglish: args['readme_en']?.toString() ?? '',
+        readmeRussian: args['readme_ru']?.toString() ?? '',
+      ),
+    );
+    taskFileMutations += result.files.length;
+    taskProgressRevision++;
+    activeTaskGoal = activeTaskGoal?.rememberFact(TaskContextFact(
+      kind: 'release',
+      key: result.directory.path,
+      value: result.files.join('\n'),
+      source: 'package_project_release',
+      verified: true,
+      updatedAt: DateTime.now(),
+    ));
+    await persistTaskExecutionState();
+    return result.toAgentText();
+  }
+
+  TaskNodeKind _taskNodeKind(Object? value) => TaskNodeKind.values.firstWhere(
+        (item) => item.name == value?.toString().trim(),
+        orElse: () => TaskNodeKind.custom,
+      );
+
+  String _taskNodeId(String value) {
+    final id = value
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9а-яё_.-]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    return id.isEmpty ? 'step_${DateTime.now().microsecondsSinceEpoch}' : id;
+  }
+
+  List<String> _toolStringList(Object? value) {
+    final raw = value is List
+        ? value
+        : value?.toString().split(RegExp(r'[\r\n]+')).toList(growable: false);
+    if (raw == null) return const [];
+    return raw
+        .map((item) => item.toString().trim())
+        .where((item) => item.isNotEmpty)
+        .take(300)
+        .toList(growable: false);
+  }
+
   Future<String> setTaskPlan(String plan) async {
     final project = currentProject;
     if (project == null) return 'No project';
@@ -10421,6 +11794,43 @@ $stack
       detail: safePlan,
       successful: true,
     );
+    final canonical = activeTaskGoal;
+    if (canonical != null && !canonical.goalDefined) {
+      final lines = safePlan
+          .split(RegExp(r'[\r\n]+'))
+          .map((line) =>
+              line.replaceFirst(RegExp(r'^\s*(?:[-*]|\d+[.)])\s*'), '').trim())
+          .where((line) => line.isNotEmpty)
+          .take(50)
+          .toList(growable: false);
+      if (lines.isNotEmpty) {
+        final now = DateTime.now();
+        activeTaskGoal = canonical.defineGoal(
+          expectedResult: canonical.expectedResult,
+          subtasks: [
+            for (var index = 0; index < lines.length; index++)
+              TaskNode(
+                id: 'plan_${index + 1}',
+                title: lines[index],
+                expectedResult:
+                    'Получен и проверен результат шага: ${lines[index]}',
+                kind: index == lines.length - 1
+                    ? TaskNodeKind.verification
+                    : TaskNodeKind.custom,
+                status: TaskNodeStatus.pending,
+                result: '',
+                evidence: const [],
+                artifacts: const [],
+                attempts: 0,
+                nextAction: '',
+                children: const [],
+                updatedAt: now,
+              ),
+          ],
+        );
+        await persistTaskExecutionState();
+      }
+    }
     await updateTaskCheckpoint(AgentRunStatus.running, plan: safePlan);
     logAction('task_plan_set',
         {'plan': truncateMiddle(safePlan, 12000), 'file': file.path});
@@ -10562,7 +11972,11 @@ $stack
       .where((item) => item.isNotEmpty)
       .toList(growable: false);
 
-  Future<String> memoryRecall(String query, {int maxResults = 8}) async {
+  Future<String> memoryRecall(
+    String query, {
+    int maxResults = 8,
+    String scope = 'current_and_global',
+  }) async {
     if (query.trim().isEmpty) return 'query is required';
     final memory = localMemory;
     if (memory == null) return 'MEMORY_NOT_INITIALIZED';
@@ -10570,6 +11984,7 @@ $stack
       query,
       maxResults: maxResults,
       projectPath: currentProject?.path ?? '',
+      scope: AgentMemorySearchScopeParsing.parse(scope),
     );
   }
 
