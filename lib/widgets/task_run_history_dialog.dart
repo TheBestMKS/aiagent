@@ -197,6 +197,7 @@ class _TaskRunHistoryDialogState extends State<TaskRunHistoryDialog> {
   IconData _iconFor(AgentRunStatus status) => switch (status) {
         AgentRunStatus.completed => Icons.check_circle_outline,
         AgentRunStatus.cancelled => Icons.stop_circle_outlined,
+        AgentRunStatus.awaitingUser => Icons.help_outline,
         AgentRunStatus.stalled => Icons.repeat_on_outlined,
         AgentRunStatus.failed => Icons.error_outline,
         AgentRunStatus.interrupted => Icons.restore,

@@ -7,6 +7,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/app_constants.dart';
+import '../agent_core/planning/project_task_mode.dart';
+import '../agent_core/prompts/agent_prompt_templates.dart';
 import '../controllers/agent_controller.dart';
 import '../core/models.dart';
 import '../plugins/plugin_models.dart';
@@ -2442,6 +2444,144 @@ class _IndexingSettingsDialogState extends State<IndexingSettingsDialog> {
   }
 }
 
+class ReferenceLibraryDialog extends StatefulWidget {
+  const ReferenceLibraryDialog({super.key, required this.controller});
+
+  final AgentController controller;
+
+  @override
+  State<ReferenceLibraryDialog> createState() => _ReferenceLibraryDialogState();
+}
+
+class _ReferenceLibraryDialogState extends State<ReferenceLibraryDialog> {
+  final TextEditingController queryController = TextEditingController();
+  String output = 'Чтение библиотеки...';
+  bool busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_showFiles());
+  }
+
+  @override
+  void dispose() {
+    queryController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _run(Future<String> Function() operation) async {
+    if (busy) return;
+    setState(() => busy = true);
+    try {
+      final result = await operation();
+      if (mounted) setState(() => output = result);
+    } catch (error) {
+      if (mounted) setState(() => output = 'Ошибка библиотеки: $error');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _showFiles() =>
+      _run(() => widget.controller.literatureList(maxItems: 500));
+
+  Future<void> _search() async {
+    final query = queryController.text.trim();
+    if (query.isEmpty) return;
+    await _run(() => widget.controller.searchContextArchive(
+          query,
+          scope: 'literature',
+          maxResults: 12,
+        ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    return AlertDialog(
+      title: const Text('Библиотека документов'),
+      content: SizedBox(
+        width: (screen.width - 48).clamp(300.0, 900.0).toDouble(),
+        height: (screen.height - 210).clamp(320.0, 680.0).toDouble(),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.folder_outlined),
+                const SizedBox(width: 8),
+                Expanded(
+                    child:
+                        SelectableText(widget.controller.documentsRoot.path)),
+                IconButton(
+                  tooltip: 'Открыть папку',
+                  onPressed: () async {
+                    await showDialog<void>(
+                      context: context,
+                      builder: (_) => ProgramFilesDialog(
+                        controller: widget.controller,
+                        initialDirectory: widget.controller.documentsRoot.path,
+                      ),
+                    );
+                    await _showFiles();
+                  },
+                  icon: const Icon(Icons.folder_open),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: queryController,
+              enabled: !busy,
+              onSubmitted: (_) => _search(),
+              decoration: InputDecoration(
+                labelText: 'Поиск по книгам, документации и примерам',
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  tooltip: 'Найти',
+                  onPressed: busy ? null : _search,
+                  icon: const Icon(Icons.search),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            if (busy) const LinearProgressIndicator(),
+            Expanded(
+              child: Scrollbar(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: SelectableText(output),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        IconButton(
+          tooltip: 'Обновить список',
+          onPressed: busy ? null : _showFiles,
+          icon: const Icon(Icons.refresh),
+        ),
+        OutlinedButton.icon(
+          onPressed: busy
+              ? null
+              : () => _run(
+                    () => widget.controller.rebuildContextArchive(force: true),
+                  ),
+          icon: const Icon(Icons.manage_search),
+          label: const Text('Переиндексировать'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Закрыть'),
+        ),
+      ],
+    );
+  }
+}
+
 class CustomToolsDialog extends StatefulWidget {
   const CustomToolsDialog({super.key, required this.controller});
   final AgentController controller;
@@ -3380,6 +3520,255 @@ class ScheduledRunsDialog extends StatelessWidget {
   }
 }
 
+class AgentPromptsDialog extends StatefulWidget {
+  const AgentPromptsDialog({
+    super.key,
+    required this.controller,
+  });
+
+  final AgentController controller;
+
+  @override
+  State<AgentPromptsDialog> createState() => _AgentPromptsDialogState();
+}
+
+class _AgentPromptsDialogState extends State<AgentPromptsDialog> {
+  late String selectedKey;
+  late final TextEditingController promptController;
+  late final TextEditingController sampleController;
+  ProjectTaskMode previewMode = ProjectTaskMode.automatic;
+  String preview = '';
+
+  AgentPromptTemplateSpec get selectedSpec =>
+      AgentPromptLibrary.specs.firstWhere((item) => item.key == selectedKey);
+
+  @override
+  void initState() {
+    super.initState();
+    selectedKey = AgentPromptLibrary.specs.first.key;
+    promptController = TextEditingController(
+      text: widget.controller.promptLibrary.value(selectedKey),
+    );
+    sampleController = TextEditingController(
+      text: 'Исправить проект, выполнить тесты и собрать готовый релиз.',
+    );
+    previewMode = widget.controller.currentProjectConfiguration.taskMode;
+  }
+
+  @override
+  void dispose() {
+    promptController.dispose();
+    sampleController.dispose();
+    super.dispose();
+  }
+
+  void selectTemplate(String key) {
+    setState(() {
+      selectedKey = key;
+      promptController.text = widget.controller.promptLibrary.value(key);
+      preview = '';
+    });
+  }
+
+  Future<void> saveSelected() async {
+    await widget.controller.updateAgentPrompt(
+      selectedKey,
+      promptController.text,
+    );
+    if (!mounted) return;
+    setState(() {
+      preview = widget.controller.previewAgentPrompts(
+        mode: previewMode,
+        task: sampleController.text,
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    return AlertDialog(
+      title: const Text('Промты выполнения задач'),
+      content: SizedBox(
+        width: (screen.width - 48).clamp(320.0, 960.0).toDouble(),
+        height: (screen.height - 170).clamp(420.0, 760.0).toDouble(),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            DropdownButtonFormField<String>(
+              initialValue: selectedKey,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Добавочный промт',
+                border: OutlineInputBorder(),
+              ),
+              items: AgentPromptLibrary.specs
+                  .map((spec) => DropdownMenuItem(
+                        value: spec.key,
+                        child: Text(
+                          '${spec.title} (${spec.key})',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ))
+                  .toList(growable: false),
+              onChanged: (value) {
+                if (value != null) selectTemplate(value);
+              },
+            ),
+            const SizedBox(height: 6),
+            Text(selectedSpec.description),
+            const SizedBox(height: 8),
+            Expanded(
+              flex: 3,
+              child: TextField(
+                controller: promptController,
+                expands: true,
+                minLines: null,
+                maxLines: null,
+                textAlignVertical: TextAlignVertical.top,
+                decoration: const InputDecoration(
+                  labelText: 'Текст промта',
+                  alignLabelWithHint: true,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                FilledButton.icon(
+                  onPressed: saveSelected,
+                  icon: const Icon(Icons.save_outlined),
+                  label: const Text('Сохранить промт'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await widget.controller.resetAgentPrompt(selectedKey);
+                    if (!mounted) return;
+                    setState(() {
+                      promptController.text =
+                          widget.controller.promptLibrary.value(selectedKey);
+                      preview = '';
+                    });
+                  },
+                  icon: const Icon(Icons.restore),
+                  label: const Text('Сбросить выбранный'),
+                ),
+                TextButton.icon(
+                  onPressed: () async {
+                    await widget.controller.resetAllAgentPrompts();
+                    if (!mounted) return;
+                    setState(() {
+                      promptController.text =
+                          widget.controller.promptLibrary.value(selectedKey);
+                      preview = '';
+                    });
+                  },
+                  icon: const Icon(Icons.restart_alt),
+                  label: const Text('Сбросить все'),
+                ),
+              ],
+            ),
+            const Divider(),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final narrow = constraints.maxWidth < 680;
+                final sampleWidth = narrow
+                    ? constraints.maxWidth
+                    : (constraints.maxWidth - 230) * 0.64;
+                final modeWidth = narrow
+                    ? math.max(220.0, constraints.maxWidth - 56)
+                    : constraints.maxWidth - sampleWidth - 64;
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: sampleWidth,
+                      child: TextField(
+                        controller: sampleController,
+                        decoration: const InputDecoration(
+                          labelText: 'Пример задачи для проверки',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: modeWidth,
+                      child: DropdownButtonFormField<ProjectTaskMode>(
+                        initialValue: previewMode,
+                        isExpanded: true,
+                        decoration: const InputDecoration(
+                          labelText: 'Режим',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        items: ProjectTaskMode.values
+                            .map((mode) => DropdownMenuItem(
+                                  value: mode,
+                                  child: Text(
+                                    mode.label,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ))
+                            .toList(growable: false),
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() => previewMode = value);
+                          }
+                        },
+                      ),
+                    ),
+                    IconButton.outlined(
+                      tooltip: 'Собрать и показать итоговый контекст',
+                      onPressed: () {
+                        setState(() {
+                          preview = widget.controller.previewAgentPrompts(
+                            mode: previewMode,
+                            task: sampleController.text,
+                          );
+                        });
+                      },
+                      icon: const Icon(Icons.preview_outlined),
+                    ),
+                  ],
+                );
+              },
+            ),
+            if (preview.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Expanded(
+                flex: 2,
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Theme.of(context).dividerColor),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(preview),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        FilledButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Закрыть'),
+        ),
+      ],
+    );
+  }
+}
+
 class ProgramSettingsDialog extends StatefulWidget {
   const ProgramSettingsDialog(
       {super.key, required this.controller, required this.onChanged});
@@ -3615,6 +4004,43 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
                 widget.onChanged();
               },
             ),
+            SwitchListTile(
+              value: widget.controller.guidedExecutionEnabled,
+              title: const Text('Пошаговое ведение слабых моделей'),
+              subtitle: const Text(
+                  'Программа определяет один следующий проверяемый шаг и передаёт модели только подходящие для него инструменты.'),
+              onChanged: (value) async {
+                setState(
+                    () => widget.controller.guidedExecutionEnabled = value);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.crossProjectMemoryEnabled,
+              title: const Text('Искать решения в других проектах'),
+              subtitle: const Text(
+                  'В поиск памяти включаются прошлые диалоги, команды, ошибки и успешные проверки остальных проектов.'),
+              onChanged: (value) async {
+                setState(
+                    () => widget.controller.crossProjectMemoryEnabled = value);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
+            SwitchListTile(
+              value: widget.controller.literatureAutoIndexEnabled,
+              title:
+                  const Text('Использовать библиотеку documents автоматически'),
+              subtitle: const Text(
+                  'Перед задачей агент ищет релевантные фрагменты в пользовательской документации. Ручной поиск остаётся доступен всегда.'),
+              onChanged: (value) async {
+                setState(
+                    () => widget.controller.literatureAutoIndexEnabled = value);
+                await widget.controller.saveAppSettings();
+                widget.onChanged();
+              },
+            ),
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -3664,6 +4090,19 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
                   icon: const Icon(Icons.history),
                   label: const Text('История запусков'),
                 ),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await showDialog<void>(
+                      context: context,
+                      builder: (_) => AgentPromptsDialog(
+                        controller: widget.controller,
+                      ),
+                    );
+                    setState(() {});
+                  },
+                  icon: const Icon(Icons.tune),
+                  label: const Text('Промты агента'),
+                ),
               ],
             ),
             const Divider(),
@@ -3693,11 +4132,13 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
             ),
             SwitchListTile(
               value: widget.controller.toolOutputCompactionEnabled,
-              title: const Text('Сжимать большие результаты инструментов в контексте'),
+              title: const Text(
+                  'Сжимать большие результаты инструментов в контексте'),
               subtitle: const Text(
                   'Полный вывод остаётся в логах, а модели передаются важные строки, начало и конец результата.'),
               onChanged: (v) async {
-                setState(() => widget.controller.toolOutputCompactionEnabled = v);
+                setState(
+                    () => widget.controller.toolOutputCompactionEnabled = v);
                 await widget.controller.saveAppSettings();
                 widget.onChanged();
               },
@@ -3706,12 +4147,14 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
               onPressed: () async {
                 await showDialog<void>(
                   context: context,
-                  builder: (_) => PluginManagerDialog(controller: widget.controller),
+                  builder: (_) =>
+                      PluginManagerDialog(controller: widget.controller),
                 );
                 setState(() {});
               },
               icon: const Icon(Icons.extension),
-              label: Text('Менеджер плагинов: ${widget.controller.plugins.length}'),
+              label: Text(
+                  'Менеджер плагинов: ${widget.controller.plugins.length}'),
             ),
             SwitchListTile(
               value: !widget.controller.closeToTrayOnClose,
@@ -3774,6 +4217,20 @@ class _ProgramSettingsDialogState extends State<ProgramSettingsDialog> {
               },
               icon: const Icon(Icons.library_books),
               label: const Text('База знаний агента'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () async {
+                await showDialog<void>(
+                  context: context,
+                  builder: (_) => ReferenceLibraryDialog(
+                    controller: widget.controller,
+                  ),
+                );
+                setState(() {});
+              },
+              icon: const Icon(Icons.menu_book_outlined),
+              label: const Text('Библиотека документов'),
             ),
             Wrap(
               spacing: 8,
@@ -4383,7 +4840,6 @@ class _ProgramFilesDialogState extends State<ProgramFilesDialog> {
   }
 }
 
-
 class PluginUpdateSelectionDialog extends StatefulWidget {
   const PluginUpdateSelectionDialog({super.key, required this.updates});
 
@@ -4420,7 +4876,8 @@ class _PluginUpdateSelectionDialogState
               CheckboxListTile(
                 value: selected.contains(update.pluginId),
                 title: Text(update.name),
-                subtitle: Text('${update.installedShort} → ${update.latestShort}'),
+                subtitle:
+                    Text('${update.installedShort} → ${update.latestShort}'),
                 onChanged: (value) => setState(() {
                   if (value == true) {
                     selected.add(update.pluginId);
@@ -4477,7 +4934,8 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
     }
   }
 
-  String _permissionLabel(AgentPluginPermission permission) => switch (permission) {
+  String _permissionLabel(AgentPluginPermission permission) =>
+      switch (permission) {
         AgentPluginPermission.network => 'сеть',
         AgentPluginPermission.process => 'процессы',
         AgentPluginPermission.projectFiles => 'файлы проекта',
@@ -4491,8 +4949,12 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
     return AlertDialog(
       title: const Text('Менеджер плагинов'),
       content: SizedBox(
-        width: math.min(MediaQuery.of(context).size.width * 0.94, 900.0).toDouble(),
-        height: math.min(MediaQuery.of(context).size.height * 0.80, 760.0).toDouble(),
+        width: math
+            .min(MediaQuery.of(context).size.width * 0.94, 900.0)
+            .toDouble(),
+        height: math
+            .min(MediaQuery.of(context).size.height * 0.80, 760.0)
+            .toDouble(),
         child: Column(
           children: [
             Row(
@@ -4527,7 +4989,8 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: SelectableText(message,
-                    style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                    style:
+                        TextStyle(color: Theme.of(context).colorScheme.error)),
               ),
             const SizedBox(height: 8),
             Expanded(
@@ -4536,9 +4999,8 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
                 separatorBuilder: (_, __) => const Divider(height: 1),
                 itemBuilder: (context, index) {
                   final plugin = controller.plugins[index];
-                  final permissions = plugin.permissions
-                      .map(_permissionLabel)
-                      .join(', ');
+                  final permissions =
+                      plugin.permissions.map(_permissionLabel).join(', ');
                   return Card(
                     margin: const EdgeInsets.symmetric(vertical: 5),
                     child: Padding(
@@ -4555,7 +5017,8 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
                               ),
                               if (plugin.sensitive)
                                 const Tooltip(
-                                  message: 'Чувствительный инструмент: всегда требует явного разрешения',
+                                  message:
+                                      'Чувствительный инструмент: всегда требует явного разрешения',
                                   child: Icon(Icons.warning_amber, size: 20),
                                 ),
                               Switch(
@@ -4569,18 +5032,23 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
                           ),
                           Text(plugin.description),
                           const SizedBox(height: 5),
-                          Text('GitHub: ${plugin.repository} • ветка ${plugin.defaultBranch}'),
-                          Text('Тип: ${plugin.kind.name} • разрешения: $permissions'),
+                          Text(
+                              'GitHub: ${plugin.repository} • ветка ${plugin.defaultBranch}'),
+                          Text(
+                              'Тип: ${plugin.kind.name} • разрешения: $permissions'),
                           Text(plugin.sourceInstalled
                               ? 'Исходники синхронизированы: ${plugin.installedCommit.length > 8 ? plugin.installedCommit.substring(0, 8) : plugin.installedCommit}'
                               : 'Используется встроенный адаптер; исходники ещё не синхронизированы'),
                           if (plugin.updateAvailable)
-                            Text('Доступно обновление: ${plugin.latestCommit.substring(0, 8)}',
-                                style: const TextStyle(fontWeight: FontWeight.bold)),
+                            Text(
+                                'Доступно обновление: ${plugin.latestCommit.substring(0, 8)}',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold)),
                           if (plugin.lastError.isNotEmpty)
                             Text('Ошибка: ${plugin.lastError}',
                                 style: TextStyle(
-                                    color: Theme.of(context).colorScheme.error)),
+                                    color:
+                                        Theme.of(context).colorScheme.error)),
                           const SizedBox(height: 6),
                           Wrap(
                             spacing: 8,
@@ -4600,7 +5068,8 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
                               if (plugin.kind == AgentPluginKind.reference)
                                 OutlinedButton.icon(
                                   onPressed: () async {
-                                    final queryController = TextEditingController();
+                                    final queryController =
+                                        TextEditingController();
                                     final query = await showDialog<String>(
                                       context: context,
                                       builder: (_) => AlertDialog(
@@ -4615,19 +5084,23 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
                                         ),
                                         actions: [
                                           TextButton(
-                                              onPressed: () => Navigator.pop(context),
+                                              onPressed: () =>
+                                                  Navigator.pop(context),
                                               child: const Text('Отмена')),
                                           FilledButton(
                                               onPressed: () => Navigator.pop(
-                                                  context, queryController.text),
+                                                  context,
+                                                  queryController.text),
                                               child: const Text('Найти')),
                                         ],
                                       ),
                                     );
                                     queryController.dispose();
-                                    if (query == null || query.trim().isEmpty || !mounted) return;
-                                    final result = await controller.runPluginTool(
-                                        plugin.toolName, query);
+                                    if (query == null ||
+                                        query.trim().isEmpty ||
+                                        !mounted) return;
+                                    final result = await controller
+                                        .runPluginTool(plugin.toolName, query);
                                     if (!mounted) return;
                                     await showDialog<void>(
                                       context: context,
@@ -4641,7 +5114,8 @@ class _PluginManagerDialogState extends State<PluginManagerDialog> {
                                         ),
                                         actions: [
                                           TextButton(
-                                              onPressed: () => Navigator.pop(context),
+                                              onPressed: () =>
+                                                  Navigator.pop(context),
                                               child: const Text('Закрыть')),
                                         ],
                                       ),

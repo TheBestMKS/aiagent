@@ -1,12 +1,20 @@
 # AI Agent
 
-> Version 1.59.1 separates explicit Stop requests from internal loop protection and always reports a structured task result when execution ends.
+> Version 1.61 adds guided execution for small models, automatic project build recipes, full-context retrieval across projects, and a shared user document library.
 
 AI Agent is a cross-platform Flutter application for local and OpenAI-compatible models, projects, files, console sessions, office documents, and local tools.
 
 ## Version
 
-Current version: `1.59.1+66`.
+Current version: `1.61.0+68`.
+
+## What's new in v1.61
+
+- Small and unknown local models receive one observable next step and only the tool schemas needed for the current inspect, retrieve, implement, diagnose, verify, package, or delivery stage.
+- The compact small-model context preserves canonical task state while output budgeting also accounts for tool-schema tokens, leaving room for code and build output in smaller context windows.
+- The agent detects native build workflows for Flutter/Dart, Node.js, Python, CMake, Rust, Go, .NET, Java, and other ecosystems. Default verification also performs a real build when the project defines one.
+- An incremental local archive indexes complete session, task, run, and terminal histories across projects. Search results include stable source IDs for progressive full-source reading.
+- The `documents` folder beside the desktop executable is a shared library for books, standards, documentation, examples, office files, and PDFs. Settings provides browsing, search, and reindexing controls.
 
 `pubspec.yaml` is the single version source. The release builder uses the semantic version before `+` in artifact names and the numeric suffix as the Android build number.
 
@@ -39,15 +47,22 @@ BAT launchers:
 The complete release is written to:
 
 ```text
-N:\Codex\AIAgent\dist\AIAgent_v.1.59.1\
-  AIAgent_v.1.59.1_win.zip
-  AIAgent_v.1.59.1_web.zip
-  AIAgent_v.1.59.1_android.apk
+N:\Codex\AIAgent\dist\AIAgent_v.1.61.0\
+  AIAgent_v.1.61.0_win.zip
+  AIAgent_v.1.61.0_web.zip
+  AIAgent_v.1.61.0_android.apk
 ```
 
 The Web target uses a separate browser-safe entry point. Desktop modules that depend on `dart:io`, process execution, and Windows WebView are not compiled into the Web application.
 
-## Agent capabilities in v1.59
+## Agent capabilities in v1.61
+
+- Every project stores one of six task modes under `.cppagent/project_settings.json`. Automatic mode classifies the request first; explicit modes keep planning and tools focused on software, documents, file-system work, remote systems, or authorized pentesting.
+- Each user task gets an observable final goal and a recursive subtask tree in `.cppagent/tasks/<task_id>`. The exact bounded `handoff.md` state is included in every model request and survives context compression.
+- The model can define/update nested goals, record important paths and terminal sessions, reuse verified commands, and inspect its current goal. Repeated blocked approaches pause as `awaitingUser`; the next user answer resumes the same run.
+- Settings includes an editor for every additive execution/mode/stage prompt and a preview of the compiled prompt for a sample task.
+- Windows can list WSL distributions and open a persistent WSL PTY session in the shared Console, including project-path translation to `/mnt/<drive>/...`.
+- Programming tasks can use `package_project_release` after a passing verification. It writes bilingual README/change notes, a source ZIP, version/platform/architecture-tagged artifacts, and SHA-256 checksums.
 
 - Multi-domain intent analysis keeps software, documents, mail, device search, web research, remote administration, and authorized security assessment in one task without replacing the user's prompt.
 - The adaptive run budget extends while measurable progress continues. Checkpoints and the attempt journal retain successful steps, failed approaches, commands, and result signals across context compression and later tasks.
@@ -57,6 +72,8 @@ The Web target uses a separate browser-safe entry point. Desktop modules that de
 - Android stores project/config data in the application-support directory and initializes Flutter bindings before platform plugins.
 
 Supported application targets are Windows x64, Android arm64/x64 (according to the Flutter build target), Web, and Linux when the Linux Flutter runner/toolchain is available.
+
+Implementation notes and official upstream references are documented in [docs/AGENT_ARCHITECTURE_V1_60_RU.md](docs/AGENT_ARCHITECTURE_V1_60_RU.md) and [docs/WEAK_MODEL_MEMORY_V1_61_RU.md](docs/WEAK_MODEL_MEMORY_V1_61_RU.md). The current reproducible verification report is in [docs/VALIDATION_V1_61_RU.md](docs/VALIDATION_V1_61_RU.md).
 
 
 ## Reliability in v1.55

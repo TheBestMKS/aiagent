@@ -1,3 +1,29 @@
+## 1.61.0+68 - 2026-08-06
+
+- Added deterministic guided execution for small and unknown local models. The controller supplies one observable next objective and exposes only the tools relevant to the current inspect, retrieve, implement, diagnose, verify, package, or delivery stage.
+- Added project build-recipe detection for Flutter/Dart, Node.js, Python, CMake, Rust, Go, .NET, Maven, Gradle, Meson, Make, Zig, Swift, Ruby, PHP, C, C++, and Java. `run_tests` now uses project-native checks and performs a real build when the ecosystem defines one.
+- Added guarded build progression for weak models: inspect the project first, write a complete nearest unit, run the detected check/build, read compiler-implicated code before editing, retrieve prior solutions after repeated failures, and package only grounded artifacts.
+- Added a compact small-model system context, stage-scoped plugin/tool schemas, schema-aware output-token budgeting, and tighter tool-result compaction. Diagnostic success can no longer substitute for passing build evidence, and completed tasks route directly to delivery instead of repeating checks.
+- Added an incremental full-context archive over `.cppagent/sessions`, `tasks`, `runs`, and `terminal` histories from the current and other projects, plus typed global memory. Search results retain a stable source ID for progressive full-source reading.
+- Added `context_search`, `context_read`, `context_reindex`, extended `memory_recall` scopes, and cross-project retrieval settings. Unchanged sources reuse cached chunks; secrets are redacted before indexing.
+- Added the shared `documents` library beside the desktop application (and in Android application storage) for books, standards, documentation, source examples, office files, and PDFs. Added in-app browsing, search, forced reindexing, `literature_list`, and `literature_search`.
+- Desktop release data now resolves from the `AIAgent` executable directory even when a shortcut supplies another working directory; development and test runs retain their current workspace behavior.
+- Added regression tests for build recipes, weak-model stage routing, cross-project memory scopes, literature retrieval, source reading, and tool-schema routing.
+- Fixed the repository ignore rule so the required `lib/agent_core/build/` source package is tracked while only the root Flutter `/build/` output remains ignored.
+
+## 1.60.0+67 - 2026-07-31
+
+- Added six persistent project task modes: automatic, software, documents, file-system work, remote systems/networking, and authorized pentesting. Explicit modes control the primary domain while automatic mode classifies the request before acting.
+- Added a recursive, evidence-aware task goal model with observable final results, nested subtasks, per-step status/results/evidence/artifacts, blockers, completion percentage, and dedicated model tools for goal maintenance.
+- Added durable per-task state under `.cppagent/tasks/<task_id>/state.json` and an exact bounded `handoff.md` block that is re-injected after context compaction instead of being regenerated from model memory.
+- Added project/global retention of relevant files, selected locations, terminal sessions, compiler paths, command output, failed attempts, and verified build/test commands. Grounded reusable procedures are available to other projects.
+- Replaced repeated-failure misclassification with the resumable `awaitingUser` lifecycle. After several blocked approaches the agent asks one focused question; the next answer resumes the same run and goal rather than starting over or reporting a user cancellation.
+- Added editable additive agent prompts for classification, goal definition, recursive decomposition, execution, verification, recovery, compaction handoff, release packaging, all task modes, and blocker questions, including a compiled-context preview in Settings.
+- Added native WSL discovery and PTY startup (`wsl_list`, `terminal_open backend=wsl`) with distribution selection and Windows-to-`/mnt/<drive>` working-directory translation.
+- Added `package_project_release`, which requires successful verification and creates `release/<program>_<version>` with bilingual README/change files, `source_<version>.zip`, platform/architecture/version-tagged artifacts, and verified `SHA256SUMS.txt`.
+- Added tests for explicit/automatic routing, project configuration persistence, recursive handoff recovery, prompt overrides, WSL paths, waiting-for-user checkpoints, OpenAI tool definitions, release ZIP contents, and SHA-256 validation.
+- Integrated design lessons from the current official Codex and OpenCode repositories and the documented Claude Code memory/subagent workflow without copying closed-source Claude Code internals. See `docs/AGENT_ARCHITECTURE_V1_60_RU.md`.
+
 ## 1.59.1+66 - 2026-07-19
 
 - Fixed an internal repetition/circuit-breaker stop being reported as "stopped by user" even when the Stop button was never pressed.

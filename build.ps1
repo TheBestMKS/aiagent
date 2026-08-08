@@ -93,10 +93,20 @@ function Assert-RequiredSourceFiles {
     'lib\agent_core\build\build_working_directory_resolver.dart',
     'lib\agent_core\build\cmake_command_resolver.dart',
     'lib\agent_core\build\cpp_build_command_builder.dart',
+    'lib\agent_core\build\project_build_recipe.dart',
     'lib\agent_core\dependencies\cpp_dependency_preflight.dart',
+    'lib\agent_core\memory\context_archive_service.dart',
+    'lib\agent_core\memory\local_memory_service.dart',
+    'lib\agent_core\planning\guided_execution_coach.dart',
+    'lib\agent_core\planning\project_agent_configuration.dart',
+    'lib\agent_core\planning\project_task_mode.dart',
+    'lib\agent_core\planning\task_execution_state.dart',
+    'lib\agent_core\prompts\agent_prompt_templates.dart',
+    'lib\agent_core\release\project_release_packager.dart',
     'lib\agent_core\safety\tool_call_contract.dart',
     'lib\agent_core\safety\tool_call_json_repair.dart',
-    'lib\agent_core\safety\unsupported_success_claim_guard.dart'
+    'lib\agent_core\safety\unsupported_success_claim_guard.dart',
+    'documents\README_RU.txt'
   )
 
   $MissingFiles = @()
@@ -593,6 +603,12 @@ function Build-Windows {
   }
   New-Item -ItemType Directory -Path $Stage -Force | Out-Null
   Copy-Item -Path (Join-Path $SourceDirectory '*') -Destination $Stage -Recurse -Force
+  $DocumentsSource = Join-Path $script:ProjectRoot 'documents'
+  if (Test-Path -LiteralPath $DocumentsSource -PathType Container) {
+    $DocumentsDestination = Join-Path $Stage 'documents'
+    New-Item -ItemType Directory -Path $DocumentsDestination -Force | Out-Null
+    Copy-Item -Path (Join-Path $DocumentsSource '*') -Destination $DocumentsDestination -Recurse -Force
+  }
 
   $ExpectedExe = Join-Path $Stage 'AIAgent.exe'
   if (-not (Test-Path -LiteralPath $ExpectedExe)) {

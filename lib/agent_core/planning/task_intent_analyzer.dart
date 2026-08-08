@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'project_task_mode.dart';
+
 enum TaskDomain {
   software,
   documents,
@@ -36,6 +38,8 @@ enum TaskAction {
 class TaskIntentProfile {
   const TaskIntentProfile({
     required this.originalPrompt,
+    required this.projectMode,
+    required this.automaticallyDetected,
     required this.primaryDomain,
     required this.domains,
     required this.actions,
@@ -49,6 +53,8 @@ class TaskIntentProfile {
   });
 
   final String originalPrompt;
+  final ProjectTaskMode projectMode;
+  final bool automaticallyDetected;
   final TaskDomain primaryDomain;
   final Set<TaskDomain> domains;
   final Set<TaskAction> actions;
@@ -80,6 +86,8 @@ class TaskIntentProfile {
       }.contains);
 
   Map<String, Object?> toJson() => {
+        'project_task_mode': projectMode.name,
+        'automatically_detected': automaticallyDetected,
         'primary_domain': primaryDomain.name,
         'domains': domains.map((value) => value.name).toList(growable: false),
         'actions': actions.map((value) => value.name).toList(growable: false),
@@ -125,7 +133,10 @@ Operating rules:
 class TaskIntentAnalyzer {
   const TaskIntentAnalyzer();
 
-  TaskIntentProfile analyze(String prompt) {
+  TaskIntentProfile analyze(
+    String prompt, {
+    ProjectTaskMode projectMode = ProjectTaskMode.automatic,
+  }) {
     final normalized = _normalize(prompt);
     final scores = <TaskDomain, int>{};
 
@@ -241,6 +252,14 @@ class TaskIntentAnalyzer {
     score(TaskDomain.software, 3, const [
       'напиши программ',
       'создай программ',
+      'собери программ',
+      'сборка программ',
+      'собери существующ',
+      'выполни сборк',
+      'запусти сборк',
+      'напиши приложени',
+      'создай приложени',
+      'разработай приложени',
       'код',
       'исходник',
       'flutter',
@@ -248,10 +267,13 @@ class TaskIntentAnalyzer {
       'c++',
       'javascript',
       'typescript',
+      'скрипт',
+      'сценари',
       'java',
       'kotlin',
       'rust',
       'скомпил',
+      'компиляц',
       'собери проект',
       'реализуй функц',
       'исправь проект',
@@ -279,6 +301,9 @@ class TaskIntentAnalyzer {
         .map((entry) => entry.key)
         .toSet();
     if (domains.isEmpty) domains.add(ranked.first.key);
+    domains.addAll(_domainsForProjectMode(projectMode));
+    final primaryDomain =
+        _primaryDomainForProjectMode(projectMode) ?? ranked.first.key;
 
     final actions = _detectActions(normalized);
     if (actions.isEmpty) actions.add(TaskAction.analyze);
@@ -314,7 +339,9 @@ class TaskIntentAnalyzer {
 
     return TaskIntentProfile(
       originalPrompt: prompt,
-      primaryDomain: ranked.first.key,
+      projectMode: projectMode,
+      automaticallyDetected: projectMode == ProjectTaskMode.automatic,
+      primaryDomain: primaryDomain,
       domains: domains,
       actions: actions,
       capabilities: capabilities,
@@ -326,6 +353,35 @@ class TaskIntentAnalyzer {
       highImpact: highImpact,
     );
   }
+
+  Set<TaskDomain> _domainsForProjectMode(ProjectTaskMode mode) =>
+      switch (mode) {
+        ProjectTaskMode.automatic => const <TaskDomain>{},
+        ProjectTaskMode.software => const {TaskDomain.software},
+        ProjectTaskMode.documents => const {TaskDomain.documents},
+        ProjectTaskMode.fileSystem => const {
+            TaskDomain.fileOperations,
+            TaskDomain.deviceSearch,
+          },
+        ProjectTaskMode.remoteSystems => const {
+            TaskDomain.remoteAccess,
+            TaskDomain.systemAdministration,
+          },
+        ProjectTaskMode.pentesting => const {
+            TaskDomain.securityAssessment,
+            TaskDomain.remoteAccess,
+          },
+      };
+
+  TaskDomain? _primaryDomainForProjectMode(ProjectTaskMode mode) =>
+      switch (mode) {
+        ProjectTaskMode.automatic => null,
+        ProjectTaskMode.software => TaskDomain.software,
+        ProjectTaskMode.documents => TaskDomain.documents,
+        ProjectTaskMode.fileSystem => TaskDomain.fileOperations,
+        ProjectTaskMode.remoteSystems => TaskDomain.remoteAccess,
+        ProjectTaskMode.pentesting => TaskDomain.securityAssessment,
+      };
 
   Set<TaskAction> _detectActions(String text) {
     final result = <TaskAction>{};
@@ -447,7 +503,12 @@ class TaskIntentAnalyzer {
       TaskDomain.systemAdministration,
       TaskDomain.securityAssessment,
     }).isNotEmpty) {
-      addAll(const ['terminal_open', 'terminal_write', 'terminal_read']);
+      addAll(const [
+        'wsl_list',
+        'terminal_open',
+        'terminal_write',
+        'terminal_read'
+      ]);
     }
     if (domains.contains(TaskDomain.webResearch)) {
       addAll(const ['web_research', 'web_fetch']);

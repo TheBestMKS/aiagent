@@ -4,7 +4,7 @@
 .flutter-plugins-dependencies
 android/.gradle/
 android/.kotlin/
-build/
+/build/
 build_logs/
 dist/
 .idea/

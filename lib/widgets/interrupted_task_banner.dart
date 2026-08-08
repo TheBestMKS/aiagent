@@ -22,9 +22,11 @@ class InterruptedTaskBanner extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Найдена незавершённая задача',
-          style: theme.textTheme.titleSmall
-              ?.copyWith(fontWeight: FontWeight.bold),
+          checkpoint.status.name == 'awaitingUser'
+              ? 'Агенту нужен ваш ответ'
+              : 'Найдена незавершённая задача',
+          style:
+              theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 4),
         Text(
@@ -32,6 +34,15 @@ class InterruptedTaskBanner extends StatelessWidget {
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
         ),
+        if (checkpoint.status.name == 'awaitingUser' &&
+            checkpoint.lastError.trim().isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text(
+            checkpoint.lastError,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
         const SizedBox(height: 4),
         Text(
           'Запуск ${checkpoint.runId} · '

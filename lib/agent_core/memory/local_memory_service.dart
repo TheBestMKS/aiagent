@@ -21,6 +21,25 @@ enum AgentMemoryType {
   procedure,
 }
 
+enum AgentMemorySearchScope {
+  currentAndGlobal,
+  currentProject,
+  otherProjects,
+  allProjects,
+  globalOnly,
+}
+
+extension AgentMemorySearchScopeParsing on AgentMemorySearchScope {
+  static AgentMemorySearchScope parse(String value) =>
+      switch (value.trim().toLowerCase()) {
+        'current' || 'current_project' => AgentMemorySearchScope.currentProject,
+        'other' || 'other_projects' => AgentMemorySearchScope.otherProjects,
+        'all' || 'all_projects' => AgentMemorySearchScope.allProjects,
+        'global' || 'global_only' => AgentMemorySearchScope.globalOnly,
+        _ => AgentMemorySearchScope.currentAndGlobal,
+      };
+}
+
 class AgentMemoryRecord {
   const AgentMemoryRecord({
     required this.id,
@@ -136,11 +155,13 @@ class LocalMemoryService {
 
   Directory get memoryRoot => Directory(pathJoin(configRoot.path, 'memory'));
   File get ledgerFile => File(pathJoin(memoryRoot.path, 'records.jsonl'));
-  File get migrationMarker => File(pathJoin(memoryRoot.path, '.legacy_migrated'));
+  File get migrationMarker =>
+      File(pathJoin(memoryRoot.path, '.legacy_migrated'));
 
   Future<void> initialize() async {
     await memoryRoot.create(recursive: true);
-    if (!await ledgerFile.exists()) await ledgerFile.writeAsString('', encoding: utf8);
+    if (!await ledgerFile.exists())
+      await ledgerFile.writeAsString('', encoding: utf8);
   }
 
   Future<AgentMemoryRecord> remember({
@@ -200,7 +221,8 @@ class LocalMemoryService {
     final active = await readActiveRecords();
     AgentMemoryRecord? previous;
     for (final item in active.reversed) {
-      if (item.key == normalizedKey && item.scope == scope &&
+      if (item.key == normalizedKey &&
+          item.scope == scope &&
           item.projectPath == projectPath) {
         previous = item;
         break;
@@ -262,7 +284,8 @@ class LocalMemoryService {
         .where((item) => item.isNotEmpty)
         .toList(growable: false);
     if (failures.isEmpty) {
-      throw StateError('At least one ruled-out approach is required before promotion');
+      throw StateError(
+          'At least one ruled-out approach is required before promotion');
     }
     return remember(
       type: AgentMemoryType.procedure,
@@ -309,11 +332,22 @@ class LocalMemoryService {
     int maxResults = 8,
     String projectPath = '',
     Set<AgentMemoryType>? types,
+    AgentMemorySearchScope scope = AgentMemorySearchScope.currentAndGlobal,
   }) async {
     final records = (await readActiveRecords()).where((record) {
       if (types != null && !types.contains(record.type)) return false;
-      if (projectPath.isEmpty) return true;
-      return record.projectPath.isEmpty || record.projectPath == projectPath;
+      final sameProject = projectPath.isNotEmpty &&
+          normalizePathForCompare(record.projectPath) ==
+              normalizePathForCompare(projectPath);
+      final hasProject = record.projectPath.trim().isNotEmpty;
+      return switch (scope) {
+        AgentMemorySearchScope.currentAndGlobal =>
+          projectPath.isEmpty || !hasProject || sameProject,
+        AgentMemorySearchScope.currentProject => sameProject,
+        AgentMemorySearchScope.otherProjects => hasProject && !sameProject,
+        AgentMemorySearchScope.allProjects => true,
+        AgentMemorySearchScope.globalOnly => !hasProject,
+      };
     }).toList(growable: false);
     final documents = records
         .map((record) => HybridDocument(
@@ -336,14 +370,16 @@ class LocalMemoryService {
       final recency = 1.0 / (1.0 + ageDays.clamp(0.0, 3650.0) / 45.0);
       final verificationBonus = record.verified ? 0.9 : 0.0;
       final confidenceBonus = record.confidence * 0.7;
-      final projectBonus = projectPath.isNotEmpty && record.projectPath == projectPath
-          ? 0.45
-          : 0.0;
+      final projectBonus =
+          projectPath.isNotEmpty && record.projectPath == projectPath
+              ? 0.45
+              : 0.0;
       final temporalWeight = switch (record.type) {
         AgentMemoryType.preference ||
         AgentMemoryType.goal ||
         AgentMemoryType.commitment ||
-        AgentMemoryType.event => 0.8,
+        AgentMemoryType.event =>
+          0.8,
         _ => 0.35,
       };
       return MapEntry(
@@ -383,23 +419,33 @@ class LocalMemoryService {
     return conflicts;
   }
 
-  Future<String> formatSearchResults(String query,
-      {int maxResults = 8, String projectPath = ''}) async {
+  Future<String> formatSearchResults(
+    String query, {
+    int maxResults = 8,
+    String projectPath = '',
+    AgentMemorySearchScope scope = AgentMemorySearchScope.currentAndGlobal,
+  }) async {
     final results = await search(query,
-        maxResults: maxResults, projectPath: projectPath);
+        maxResults: maxResults, projectPath: projectPath, scope: scope);
     if (results.isEmpty) return 'MEMORY_NO_RESULTS: $query';
-    final buffer = StringBuffer('MEMORY_RESULTS for "$query"\n');
+    final buffer =
+        StringBuffer('MEMORY_RESULTS for "$query"; scope=${scope.name}\n');
     for (final record in results) {
-      buffer.writeln('\n--- ${record.type.name.toUpperCase()}: ${record.title} ---');
+      buffer.writeln(
+          '\n--- ${record.type.name.toUpperCase()}: ${record.title} ---');
       buffer.writeln('ID: ${record.id}');
-      buffer.writeln('SCOPE: ${record.scope}${record.projectPath.isEmpty ? '' : ' • ${record.projectPath}'}');
-      buffer.writeln('PROVENANCE: ${record.provenance}; CONFIDENCE: ${(record.confidence * 100).round()}%; VERIFIED: ${record.verified}');
+      buffer.writeln(
+          'SCOPE: ${record.scope}${record.projectPath.isEmpty ? '' : ' • ${record.projectPath}'}');
+      buffer.writeln(
+          'PROVENANCE: ${record.provenance}; CONFIDENCE: ${(record.confidence * 100).round()}%; VERIFIED: ${record.verified}');
       if (record.source.isNotEmpty) buffer.writeln('SOURCE: ${record.source}');
-      if (record.verification.isNotEmpty) buffer.writeln('VERIFICATION: ${record.verification}');
+      if (record.verification.isNotEmpty)
+        buffer.writeln('VERIFICATION: ${record.verification}');
       if (record.failedApproaches.isNotEmpty) {
         buffer.writeln('RULED_OUT: ${record.failedApproaches.join(' | ')}');
       }
-      if (record.tags.isNotEmpty) buffer.writeln('TAGS: ${record.tags.join(', ')}');
+      if (record.tags.isNotEmpty)
+        buffer.writeln('TAGS: ${record.tags.join(', ')}');
       buffer.writeln(record.content);
     }
     return buffer.toString().trimRight();
@@ -410,9 +456,11 @@ class LocalMemoryService {
     if (found.isEmpty) return 'MEMORY_CONFLICTS_NONE';
     final buffer = StringBuffer('MEMORY_CONFLICTS: ${found.length}\n');
     for (final group in found) {
-      buffer.writeln('\n=== ${group.first.conflictGroup.isEmpty ? group.first.key : group.first.conflictGroup}: ${group.first.key} ===');
+      buffer.writeln(
+          '\n=== ${group.first.conflictGroup.isEmpty ? group.first.key : group.first.conflictGroup}: ${group.first.key} ===');
       for (final record in group) {
-        buffer.writeln('- ${record.updatedAt.toIso8601String()} [${record.provenance}; ${(record.confidence * 100).round()}%] ${record.content}');
+        buffer.writeln(
+            '- ${record.updatedAt.toIso8601String()} [${record.provenance}; ${(record.confidence * 100).round()}%] ${record.content}');
       }
     }
     return buffer.toString().trimRight();
@@ -429,7 +477,8 @@ class LocalMemoryService {
         try {
           final decoded = jsonDecode(line);
           if (decoded is! Map) continue;
-          final data = decoded.map((key, value) => MapEntry(key.toString(), value));
+          final data =
+              decoded.map((key, value) => MapEntry(key.toString(), value));
           final title = data['topic']?.toString() ?? '';
           final content = data['content']?.toString() ?? '';
           if (title.trim().isEmpty || content.trim().isEmpty) continue;
@@ -450,7 +499,8 @@ class LocalMemoryService {
         try {
           final decoded = jsonDecode(line);
           if (decoded is! Map) continue;
-          final data = decoded.map((key, value) => MapEntry(key.toString(), value));
+          final data =
+              decoded.map((key, value) => MapEntry(key.toString(), value));
           final problem = data['problem']?.toString() ?? '';
           final solution = data['solution']?.toString() ?? '';
           if (problem.trim().isEmpty || solution.trim().isEmpty) continue;
@@ -466,7 +516,8 @@ class LocalMemoryService {
         } catch (_) {}
       }
     }
-    await migrationMarker.writeAsString(DateTime.now().toIso8601String(), encoding: utf8);
+    await migrationMarker.writeAsString(DateTime.now().toIso8601String(),
+        encoding: utf8);
   }
 
   Future<List<AgentMemoryRecord>> _readAllRecords() async {
@@ -504,8 +555,9 @@ class LocalMemoryService {
       .replaceAll(RegExp(r'_+'), '_')
       .replaceAll(RegExp(r'^_|_$'), '');
 
-
-
-  String _normalizeText(String value) =>
-      value.toLowerCase().replaceAll('ё', 'е').replaceAll(RegExp(r'\s+'), ' ').trim();
+  String _normalizeText(String value) => value
+      .toLowerCase()
+      .replaceAll('ё', 'е')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
 }

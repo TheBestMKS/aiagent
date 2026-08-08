@@ -4,6 +4,7 @@ enum AgentTerminationCause {
   none,
   userRequest,
   safetyGuard,
+  userGuidanceRequired,
 }
 
 class AgentTerminationState {
@@ -15,6 +16,7 @@ class AgentTerminationState {
   bool get shouldStop => _cause != AgentTerminationCause.none;
   bool get userRequested => _cause == AgentTerminationCause.userRequest;
   bool get safetyStopped => _cause == AgentTerminationCause.safetyGuard;
+  bool get awaitingUser => _cause == AgentTerminationCause.userGuidanceRequired;
 
   void reset() {
     _cause = AgentTerminationCause.none;
@@ -31,6 +33,12 @@ class AgentTerminationState {
   void requestSafetyStop(String reason) {
     if (userRequested) return;
     _cause = AgentTerminationCause.safetyGuard;
+    _reason = _normalizeSafetyReason(reason);
+  }
+
+  void requestUserGuidance(String reason) {
+    if (userRequested) return;
+    _cause = AgentTerminationCause.userGuidanceRequired;
     _reason = _normalizeSafetyReason(reason);
   }
 
@@ -71,6 +79,12 @@ class AgentLoopResult {
         reason: reason,
       );
 
+  factory AgentLoopResult.awaitingUser(String reason) => AgentLoopResult(
+        status: AgentRunStatus.awaitingUser,
+        outcome: 'Ожидается ответ пользователя',
+        reason: reason,
+      );
+
   factory AgentLoopResult.failed(String reason) => AgentLoopResult(
         status: AgentRunStatus.failed,
         outcome: 'Не выполнено',
@@ -78,8 +92,8 @@ class AgentLoopResult {
       );
 
   factory AgentLoopResult.paused(String reason) => AgentLoopResult(
-        status: AgentRunStatus.failed,
-        outcome: 'Приостановлено с сохранением прогресса',
+        status: AgentRunStatus.awaitingUser,
+        outcome: 'Приостановлено, ожидается ответ пользователя',
         reason: reason,
       );
 }

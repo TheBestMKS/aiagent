@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:ii_agent/agent_core/planning/project_task_mode.dart';
 import 'package:ii_agent/agent_core/planning/task_intent_analyzer.dart';
 
 void main() {
@@ -43,5 +44,20 @@ void main() {
     expect(intent.capabilities, contains('persistent-terminal'));
     expect(intent.capabilities, contains('scope-and-authorization'));
     expect(intent.recommendedInitialTools, contains('terminal_open'));
+    expect(intent.recommendedInitialTools, contains('wsl_list'));
+  });
+
+  test('explicit project mode controls the primary domain without losing hints',
+      () {
+    final intent = analyzer.analyze(
+      'Найди описание формата и затем создай скрипт',
+      projectMode: ProjectTaskMode.documents,
+    );
+
+    expect(intent.projectMode, ProjectTaskMode.documents);
+    expect(intent.automaticallyDetected, isFalse);
+    expect(intent.primaryDomain, TaskDomain.documents);
+    expect(intent.domains, contains(TaskDomain.documents));
+    expect(intent.domains, contains(TaskDomain.software));
   });
 }

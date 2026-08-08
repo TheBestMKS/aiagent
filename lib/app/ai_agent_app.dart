@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../core/app_constants.dart';
+import '../agent_core/planning/project_task_mode.dart';
 import '../controllers/agent_controller.dart';
 import '../plugins/plugin_models.dart';
 import '../core/models.dart';
@@ -448,7 +449,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 if (mounted) setState(() {});
               },
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 child: Row(
                   children: [
                     if (controller.pluginOperationStatus.active) ...[
@@ -741,6 +743,7 @@ class _ProjectEditDialogState extends State<ProjectEditDialog> {
   late final TextEditingController nameController;
   late final TextEditingController pathController;
   bool projectIndexingEnabled = false;
+  ProjectTaskMode projectTaskMode = ProjectTaskMode.automatic;
 
   @override
   void initState() {
@@ -751,6 +754,17 @@ class _ProjectEditDialogState extends State<ProjectEditDialog> {
     pathController = TextEditingController(
         text: project?.path ??
             pathJoin(widget.controller.projectsRoot.path, name));
+    if (project != null) unawaited(loadProjectConfiguration(project));
+  }
+
+  Future<void> loadProjectConfiguration(ProjectInfo project) async {
+    final configuration =
+        await widget.controller.loadProjectAgentConfiguration(project);
+    if (!mounted) return;
+    setState(() {
+      projectTaskMode = configuration.taskMode;
+      projectIndexingEnabled = configuration.indexContents;
+    });
   }
 
   @override
@@ -816,6 +830,28 @@ class _ProjectEditDialogState extends State<ProjectEditDialog> {
               ],
             ),
             const SizedBox(height: 10),
+            DropdownButtonFormField<ProjectTaskMode>(
+              key: ValueKey(projectTaskMode),
+              initialValue: projectTaskMode,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Тип задач проекта',
+                border: OutlineInputBorder(),
+              ),
+              items: ProjectTaskMode.values
+                  .map((mode) => DropdownMenuItem(
+                        value: mode,
+                        child: Text(
+                          mode.label,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ))
+                  .toList(growable: false),
+              onChanged: (value) {
+                if (value != null) setState(() => projectTaskMode = value);
+              },
+            ),
+            const SizedBox(height: 10),
             SwitchListTile(
               value: projectIndexingEnabled,
               onChanged: (value) =>
@@ -875,6 +911,11 @@ class _ProjectEditDialogState extends State<ProjectEditDialog> {
             final targetPath = pathController.text.trim();
             if (editing) {
               final project = widget.project!;
+              await widget.controller.saveProjectAgentConfiguration(
+                project,
+                taskMode: projectTaskMode,
+                indexContents: projectIndexingEnabled,
+              );
               if (name.isNotEmpty && name != project.name) {
                 await widget.controller.renameProject(project, name);
               }
@@ -884,7 +925,12 @@ class _ProjectEditDialogState extends State<ProjectEditDialog> {
                     widget.controller.currentProject ?? project, targetPath);
               }
             } else {
-              await widget.controller.createProjectAt(name, targetPath);
+              await widget.controller.createProjectAt(
+                name,
+                targetPath,
+                taskMode: projectTaskMode,
+                indexContents: projectIndexingEnabled,
+              );
             }
             widget.onChanged();
             if (context.mounted) Navigator.pop(context);
